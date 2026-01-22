@@ -1,0 +1,68 @@
+#----------------------------------------------------
+# 1. Python-specific ignores
+#----------------------------------------------------
+# Virtual environments
+# This is a very common name for virtual environments,
+# and it should always be ignored.
+.venv/
+venv/
+env/
+.env
+
+# Byte-compiled and temporary files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Temporary files created by popular editors and IDEs
+*.swp
+*.bak
+*~
+.idea/
+.vscode/
+
+# Package distributions and build artifacts
+dist/
+build/
+*.egg-info/
+*.whl
+
+# Log files and database files
+*.log
+*.sqlite3
+
+#----------------------------------------------------
+# 2. Operating System-specific ignores
+#----------------------------------------------------
+# macOS-specific files
+.DS_Store
+.Trashes
+
+# Windows-specific files
+Thumbs.db
+
+#----------------------------------------------------
+# 3. Docker-specific ignores
+#----------------------------------------------------
+# This is important to prevent local Docker build context
+# from including the environment itself.
+.docker/
+
+
+#----------------------------------------------------
+# 4. Environment variables and secrets
+#----------------------------------------------------
+# Sensitive information, such as API keys and credentials,
+# should never be committed. It's common to use a file
+# like .env for this.
+.env
+
+#----------------------------------------------------
+# 5. Testing and coverage ignores
+#----------------------------------------------------
+# pytest cache
+.pytest_cache/
+
+# Test coverage reports
+.coverage
+htmlcov/
