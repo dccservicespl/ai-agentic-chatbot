@@ -1,6 +1,8 @@
 from fastapi import FastAPI
 from ai_agentic_chatbot.controller.chat import router
 from dotenv import load_dotenv
+import uvicorn
+
 load_dotenv()
 
 app = FastAPI(
@@ -14,3 +16,7 @@ app.include_router(router)
 @app.get("/health", tags=["Health"])
 def health_check():
     return {"status": "UP"}
+
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8000)
