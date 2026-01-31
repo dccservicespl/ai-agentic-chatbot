@@ -38,8 +38,7 @@ datasources:
       database: "ai_chatbot_db"
       username: "aichatbotDB"
       password: "StrongPassword_123"
-      ssl_mode: "REQUIRED"
-      ssl_ca:
+      ssl_ca: "/opt/DigiCertGlobalRootG2.crt.pem"
       pool_size: 5
       max_overflow: 10
       pool_timeout: 30

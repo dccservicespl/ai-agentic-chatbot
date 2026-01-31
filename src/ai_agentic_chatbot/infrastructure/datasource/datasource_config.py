@@ -68,7 +68,7 @@ class MySQLConfig(BaseDatasourceConfig):
             if self.ssl_key:
                 ssl_params += f"&ssl_key={self.ssl_key}"
 
-        return f"mysql+pymysql://{self.username}:{self.password}@{self.host}:{self.port}/{self.database}{ssl_params}"
+        return f"mysql+pymysql://{self.username}:{self.password}@{self.host}:{self.port}/{self.database}"
 
     def get_engine_kwargs(self) -> Dict[str, Any]:
         """Get MySQL engine initialization arguments."""

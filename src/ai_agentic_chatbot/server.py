@@ -2,6 +2,7 @@ from fastapi import FastAPI, Depends, HTTPException
 from contextlib import asynccontextmanager
 from ai_agentic_chatbot.controller.chat import router
 from dotenv import load_dotenv
+from sqlalchemy.orm import Session
 import uvicorn
 
 from ai_agentic_chatbot.infrastructure.datasource.factory import get_datasource_factory
@@ -60,9 +61,9 @@ def health_check():
 
 
 @app.get("/db-health")
-async def db_health(db = Depends(get_db_session)):
+def db_health(db: Session = Depends(get_db_session)):
     try:
-        await db.execute(text("SELECT 1"))
+        db.execute(text("SELECT 1"))
         return {"database": "UP"}
     except Exception as exc:
         raise HTTPException(status_code=503, detail=str(exc))
