@@ -2,8 +2,9 @@ from pathlib import Path
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import PydanticOutputParser
 from ai_agentic_chatbot.agent.schema import IntentResult
-from ai_agentic_chatbot.infrastructure.llm import get_azure_llm
+from ai_agentic_chatbot.infrastructure.llm import get_llm
 from ai_agentic_chatbot.agent.registry import IntentType
+from ai_agentic_chatbot.infrastructure.llm.types import LLMProvider, ModelType
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 PROMPT_PATH = BASE_DIR / "prompts" / "custom_prompts.md"
@@ -11,7 +12,7 @@ PROMPT_PATH = BASE_DIR / "prompts" / "custom_prompts.md"
 
 class IntentClassifier:
     def __init__(self):
-        self.llm = get_azure_llm()
+        self.llm = get_llm(provider=LLMProvider.AZURE_OPENAI, model=ModelType.FAST)
         self.domain_context = PROMPT_PATH.read_text()
         self.parser = PydanticOutputParser(pydantic_object=IntentResult)
 
@@ -43,11 +44,7 @@ Business context:
         )
 
     def classify(self, question: str) -> IntentResult:
-        chain = (
-                self.prompt
-                | self.llm
-                | self.parser
-        )
+        chain = self.prompt | self.llm | self.parser
 
         return chain.invoke(
             {
@@ -57,3 +54,8 @@ Business context:
                 "format_instructions": self.parser.get_format_instructions(),
             }
         )
+
+
+if __name__ == "__main__":
+    intent_classifier = IntentClassifier()
+    print(intent_classifier.classify("What is the capital of France?"))

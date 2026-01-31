@@ -12,12 +12,24 @@ dependencies = [
     "uvicorn (>=0.40.0,<0.41.0)",
     "langchain (>=1.2.6,<2.0.0)",
     "langchain-community (>=0.4.1,<0.5.0)",
-    "langchain-openai (>=1.1.7,<2.0.0)"
+    "langchain-openai (>=1.1.7,<2.0.0)",
+    "pydantic (>=2.0.0,<3.0.0)",
+    "pyyaml (>=6.0.0,<7.0.0)",
+    "python-dotenv (>=1.0.0,<2.0.0)",
+    "sqlalchemy (>=2.0.46,<3.0.0)",
+    "pymysql (>=1.1.2,<2.0.0)",
+    "aiomysql (>=0.3.2,<0.4.0)",
+    "cryptography (>=46.0.4,<47.0.0)",
+    "python-json-logger (>=4.0.0,<5.0.0)"
 ]
 
 [tool.poetry]
 packages = [{include = "ai_agentic_chatbot", from = "src"}]
 
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^9.0.2"
+pytest-asyncio = "^1.3.0"
 
 [build-system]
 requires = ["poetry-core>=2.0.0,<3.0.0"]
