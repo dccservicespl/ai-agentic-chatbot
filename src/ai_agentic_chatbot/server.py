@@ -5,9 +5,9 @@ from dotenv import load_dotenv
 import uvicorn
 
 from ai_agentic_chatbot.infrastructure.datasource.factory import get_datasource_factory
+from ai_agentic_chatbot.infrastructure.db_depency import get_db_session
 from ai_agentic_chatbot.logging_config import setup_logging, get_logger
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from ai_agentic_chatbot.infrastructure.datasource.datasource_init import (
     initialize_datasources,
@@ -59,12 +59,8 @@ def health_check():
     return {"status": "UP"}
 
 
-def get_db():
-    pass
-
-
 @app.get("/db-health")
-async def db_health(db: AsyncSession = Depends(get_db)):
+async def db_health(db = Depends(get_db_session)):
     try:
         await db.execute(text("SELECT 1"))
         return {"database": "UP"}
