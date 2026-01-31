@@ -9,6 +9,6 @@ orchestrator = ChatOrchestrator()
 class ChatRequest(BaseModel):
     question: str
 
-@router.post("/chat/query")
+@router.post("/chat/query", tags=["Chat API"])
 def chat_query(request: ChatRequest):
     return orchestrator.process(request.question)
