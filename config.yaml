@@ -28,3 +28,66 @@ llm:
       presence_penalty: 0.0
       timeout: 120
       max_retries: 3
+
+datasources:
+  default: mysql.primary
+
+  mysql:
+    primary:
+      host: "your-azure-mysql-host.mysql.database.azure.com"
+      port: 3306
+      database: "your_database_name"
+      username: "your_username"
+      password: "your_password"
+      ssl_mode: "REQUIRED"
+      pool_size: 5
+      max_overflow: 10
+      pool_timeout: 30
+      pool_recycle: 3600
+      connect_timeout: 10
+      charset: "utf8mb4"
+
+    analytics:
+      host: "your-analytics-mysql-host.mysql.database.azure.com"
+      port: 3306
+      database: "analytics_db"
+      username: "analytics_user"
+      password: "analytics_password"
+      ssl_mode: "REQUIRED"
+      pool_size: 3
+      max_overflow: 5
+
+  postgresql:
+    backup:
+      host: "your-postgres-host.postgres.database.azure.com"
+      port: 5432
+      database: "backup_db"
+      username: "backup_user"
+      password: "backup_password"
+      sslmode: "require"
+      pool_size: 2
+      max_overflow: 3
+
+  aws_rds_mysql:
+    logging:
+      host: "your-rds-instance.region.rds.amazonaws.com"
+      port: 3306
+      database: "logs_db"
+      username: "logs_user"
+      password: "logs_password"
+      ssl_mode: "REQUIRED"
+      pool_size: 2
+      max_overflow: 2
+
+logging:
+  level: "INFO" # DEBUG, INFO, WARNING, ERROR, CRITICAL
+  console_level: "INFO"
+  file_level: "DEBUG"
+
+  max_file_size: 10485760 # 10MB
+  backup_count: 5
+
+  loggers:
+    sqlalchemy.engine: "WARNING"
+    sqlalchemy.pool: "WARNING"
+    ai_agentic_chatbot.datasource: "DEBUG"

@@ -40,5 +40,4 @@ class ModelType(Enum):
         return [model_type.value for model_type in cls]
 
 
-# Registry for dynamic provider configuration classes
 PROVIDER_CONFIG_REGISTRY: Dict[LLMProvider, Type[Any]] = {}

@@ -3,11 +3,11 @@
 import os
 import yaml
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
-from pydantic import BaseModel, Field, field_validator
+from typing import Any, Dict, Optional
+from pydantic import BaseModel, Field
 
-from .types import LLMProvider, ModelType
-from .config import ProviderConfig, get_provider_config_class
+from src.ai_agentic_chatbot.infrastructure.llm.types import LLMProvider, ModelType
+from src.ai_agentic_chatbot.infrastructure.llm.config import ProviderConfig, get_provider_config_class
 
 
 class ModelConfiguration(BaseModel):

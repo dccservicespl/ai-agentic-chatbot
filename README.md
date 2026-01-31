@@ -354,6 +354,221 @@ When adding new providers:
 4. Include configuration examples
 5. Update this README
 
+## Datasource Configuration
+
+The system supports multiple database providers with connection pooling and environment variable overrides.
+
+### Supported Datasources
+
+- **MySQL**: Including Azure Cloud SQL for MySQL
+- **PostgreSQL**: Including Azure Database for PostgreSQL
+- **Azure SQL Database**: Microsoft SQL Server on Azure
+- **AWS RDS**: Both MySQL and PostgreSQL variants
+- **SQLite**: For local development and testing
+
+### Basic Datasource Usage
+
+```python
+from ai_agentic_chatbot.datasource_init import initialize_datasources
+from ai_agentic_chatbot.infrastructure.datasource import get_engine, get_session
+
+# Initialize all datasources from config
+initialize_datasources()
+
+# Get SQLAlchemy engine
+engine = get_engine("primary")
+with engine.connect() as conn:
+    result = conn.execute("SELECT * FROM users")
+
+# Get SQLAlchemy session
+session = get_session("primary")
+try:
+    users = session.execute("SELECT * FROM users").fetchall()
+finally:
+    session.close()
+```
+
+### Datasource Configuration
+
+Add datasource configurations to your `config.yaml`:
+
+```yaml
+datasources:
+  default: mysql.primary # provider.datasource format
+
+  mysql:
+    primary:
+      host: "your-azure-mysql-host.mysql.database.azure.com"
+      port: 3306
+      database: "your_database_name"
+      username: "your_username"
+      password: "your_password"
+      ssl_mode: "REQUIRED"
+      pool_size: 5
+      max_overflow: 10
+      pool_timeout: 30
+      pool_recycle: 3600
+      connect_timeout: 10
+      charset: "utf8mb4"
+
+    analytics:
+      host: "analytics-host.mysql.database.azure.com"
+      database: "analytics_db"
+      # ... other config
+```
+
+### Environment Variables for Datasources
+
+Set these environment variables for secure credential management:
+
+```bash
+# MySQL (Azure Cloud SQL)
+export MYSQL_HOST="your-azure-mysql-host.mysql.database.azure.com"
+export MYSQL_PORT="3306"
+export MYSQL_DATABASE="your_database_name"
+export MYSQL_USERNAME="your_username"
+export MYSQL_PASSWORD="your_password"
+
+# PostgreSQL
+export POSTGRES_HOST="your-postgres-host.postgres.database.azure.com"
+export POSTGRES_PORT="5432"
+export POSTGRES_DB="your_database_name"
+export POSTGRES_USER="your_username"
+export POSTGRES_PASSWORD="your_password"
+
+# AWS RDS
+export AWS_RDS_HOST="your-rds-instance.region.rds.amazonaws.com"
+export AWS_RDS_DATABASE="your_database_name"
+export AWS_RDS_USERNAME="your_username"
+export AWS_RDS_PASSWORD="your_password"
+
+# Azure SQL
+export AZURE_SQL_HOST="your-azure-sql-server.database.windows.net"
+export AZURE_SQL_DATABASE="your_database_name"
+export AZURE_SQL_USERNAME="your_username"
+export AZURE_SQL_PASSWORD="your_password"
+```
+
+### Adding New Datasource Providers
+
+#### Step 1: Define Provider Enum
+
+Add your provider to `src/ai_agentic_chatbot/datasource_types.py`:
+
+```python
+class DataSourceProvider(Enum):
+    MYSQL = "mysql"
+    POSTGRESQL = "postgresql"
+    MONGODB = "mongodb"  # New provider
+    # ... existing providers
+```
+
+#### Step 2: Create Configuration Class
+
+Add a configuration class in `src/ai_agentic_chatbot/datasource_config.py`:
+
+```python
+class MongoDBConfig(BaseDatasourceConfig):
+    """Configuration for MongoDB databases."""
+
+    # Override fields that don't apply to MongoDB
+    port: int = Field(default=27017, description="MongoDB port")
+
+    # MongoDB-specific fields
+    auth_source: str = Field(default="admin", description="Authentication database")
+    replica_set: Optional[str] = Field(default=None, description="Replica set name")
+
+    def get_connection_string(self) -> str:
+        """Get MongoDB connection string."""
+        auth = f"{self.username}:{self.password}@" if self.username else ""
+        replica = f"?replicaSet={self.replica_set}" if self.replica_set else ""
+        return f"mongodb://{auth}{self.host}:{self.port}/{self.database}{replica}"
+
+    def get_engine_kwargs(self) -> Dict[str, Any]:
+        """Get MongoDB engine initialization arguments."""
+        return {
+            "maxPoolSize": self.pool_size,
+            "connectTimeoutMS": self.connect_timeout * 1000,
+        }
+
+# Register the configuration class
+DATASOURCE_CONFIG_REGISTRY[DataSourceProvider.MONGODB] = MongoDBConfig
+```
+
+#### Step 3: Add Factory Support
+
+Update the factory to handle the new provider as needed for your specific database client.
+
+### Datasource Types
+
+The system supports these datasource types:
+
+- `PRIMARY`: Main application database
+- `ANALYTICS`: Analytics and reporting database
+- `CACHE`: Caching layer database
+- `LOGGING`: Logging and audit database
+- `BACKUP`: Backup and archival database
+
+### Programmatic Registration
+
+You can also register datasources programmatically:
+
+```python
+from ai_agentic_chatbot.infrastructure.datasource import (
+    register_mysql_datasource,
+    register_postgresql_datasource
+)
+from ai_agentic_chatbot.datasource_types import DataSourceType
+
+# Register MySQL datasource
+register_mysql_datasource(
+    name="user_db",
+    host="localhost",
+    database="users",
+    username="app_user",
+    password="secure_password",
+    ds_type=DataSourceType.PRIMARY
+)
+
+# Register PostgreSQL datasource
+register_postgresql_datasource(
+    name="analytics_db",
+    host="analytics-server.com",
+    database="analytics",
+    username="analytics_user",
+    password="analytics_password",
+    ds_type=DataSourceType.ANALYTICS
+)
+```
+
+### Connection Pooling
+
+All datasources support connection pooling with configurable parameters:
+
+- `pool_size`: Number of connections to maintain in the pool
+- `max_overflow`: Maximum number of connections beyond pool_size
+- `pool_timeout`: Timeout for getting connection from pool
+- `pool_recycle`: Time after which connections are recycled
+
+### Dependencies for Datasources
+
+```bash
+# Core dependencies
+pip install sqlalchemy pydantic pyyaml
+
+# MySQL
+pip install pymysql
+
+# PostgreSQL
+pip install psycopg2-binary
+
+# Azure SQL / SQL Server
+pip install pyodbc
+
+# SQLite (included with Python)
+# No additional dependencies needed
+```
+
 ## License
 
 [Your License Here]

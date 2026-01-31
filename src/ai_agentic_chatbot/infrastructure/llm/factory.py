@@ -5,15 +5,9 @@ from threading import Lock
 from langchain_core.language_models import BaseChatModel
 from langchain_openai import AzureChatOpenAI, ChatOpenAI
 
-from ai_agentic_chatbot.settings import get_settings, ModelConfiguration
-from ai_agentic_chatbot.types import LLMProvider, ModelType
-from ai_agentic_chatbot.config import (
-    AzureOpenAIConfig,
-    OpenAIConfig,
-    AnthropicConfig,
-    AWSBedrockConfig,
-)
-
+from .config import AzureOpenAIConfig
+from .settings import get_settings, ModelConfiguration
+from .types import LLMProvider, ModelType
 
 LangChainLLM = BaseChatModel
 
@@ -57,25 +51,20 @@ class LLMFactory:
         Raises:
             ValueError: If the provider/model combination is not found.
         """
-        # Use defaults if not specified
         if provider is None and model is None:
             model_key = self._settings.default_model
         else:
-            # Build model key from model type only (provider is handled in config)
             if model is None:
-                model = ModelType.FAST  # Default model type
+                model = ModelType.FAST
 
             model_key = model.value
 
-        # Return cached client if available
         if model_key in self._clients:
             return self._clients[model_key]
 
-        # Get model configuration and create client
         model_config = self._settings.get_model_config(model_key)
         client = self._create_client(model_config)
 
-        # Cache and return
         self._clients[model_key] = client
         return client
 
@@ -86,18 +75,12 @@ class LLMFactory:
 
         if provider == LLMProvider.AZURE_OPENAI:
             return self._create_azure_openai_client(config)
-        elif provider == LLMProvider.OPENAI:
-            return self._create_openai_client(config)
         else:
             raise ValueError(f"Unsupported provider: {provider}")
 
     def _create_azure_openai_client(self, config: AzureOpenAIConfig) -> AzureChatOpenAI:
         """Create Azure OpenAI LangChain client."""
         return AzureChatOpenAI(**config.get_client_kwargs())
-
-    def _create_openai_client(self, config: OpenAIConfig) -> ChatOpenAI:
-        """Create OpenAI LangChain client."""
-        return ChatOpenAI(**config.get_client_kwargs())
 
     def get_available_models(self) -> list[str]:
         """Get list of available model keys."""
@@ -122,7 +105,7 @@ class LLMFactory:
 
     def reload_settings(self):
         """Reload settings and clear cache."""
-        from ai_agentic_chatbot.settings import reload_settings
+        from .settings import reload_settings
 
         self._settings = reload_settings()
         self.clear_cache()
@@ -152,11 +135,5 @@ def get_llm(
 
     Returns:
         LangChainLLM: LangChain-compatible chat model instance.
-
-    Example:
-        >>> from ai_agentic_chatbot.types import LLMProvider, ModelType
-        >>> llm = get_llm(LLMProvider.AZURE_OPENAI, ModelType.FAST)
-        >>> llm = get_llm()  # Get default model
-        >>> response = llm.invoke("Hello, world!")
     """
     return get_llm_factory().get_llm(provider, model)
