@@ -3,7 +3,10 @@
 from abc import ABC, abstractmethod
 from typing import Optional, Dict, Any, Union
 from pydantic import BaseModel, Field, field_validator
-from src.ai_agentic_chatbot.infrastructure.llm.types import LLMProvider, PROVIDER_CONFIG_REGISTRY
+from ai_agentic_chatbot.infrastructure.llm.types import (
+    LLMProvider,
+    PROVIDER_CONFIG_REGISTRY,
+)
 
 
 class BaseLLMConfig(BaseModel, ABC):
@@ -71,13 +74,10 @@ class AzureOpenAIConfig(BaseLLMConfig):
 
 PROVIDER_CONFIG_REGISTRY[LLMProvider.AZURE_OPENAI] = AzureOpenAIConfig
 
-ProviderConfig = Union[
-    AzureOpenAIConfig
-]
+ProviderConfig = Union[AzureOpenAIConfig]
 
 
 def get_provider_config_class(provider: LLMProvider):
     if provider not in PROVIDER_CONFIG_REGISTRY:
         raise ValueError(f"No configuration class registered for provider: {provider}")
     return PROVIDER_CONFIG_REGISTRY[provider]
-

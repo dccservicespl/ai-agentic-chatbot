@@ -4,7 +4,7 @@ from langchain_core.output_parsers import PydanticOutputParser
 from ai_agentic_chatbot.agent.schema import IntentResult
 from ai_agentic_chatbot.infrastructure.llm import get_llm
 from ai_agentic_chatbot.agent.registry import IntentType
-from ai_agentic_chatbot.types import LLMProvider, ModelType
+from ai_agentic_chatbot.infrastructure.llm.types import LLMProvider, ModelType
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 PROMPT_PATH = BASE_DIR / "prompts" / "custom_prompts.md"

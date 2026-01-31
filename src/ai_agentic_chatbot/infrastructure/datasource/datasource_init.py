@@ -1,8 +1,8 @@
 """Initialize datasources from configuration."""
 
 from .datasource_settings import get_datasource_settings
-from src.ai_agentic_chatbot.infrastructure.datasource.factory import get_datasource_factory
-from src.ai_agentic_chatbot.logging_config import get_logger
+from ai_agentic_chatbot.infrastructure.datasource.factory import get_datasource_factory
+from ai_agentic_chatbot.logging_config import get_logger
 
 logger = get_logger(__name__)
 

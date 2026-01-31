@@ -4,11 +4,14 @@ from ai_agentic_chatbot.controller.chat import router
 from dotenv import load_dotenv
 import uvicorn
 
-from ai_agentic_chatbot.datasource_init import initialize_datasources
 from ai_agentic_chatbot.infrastructure.datasource.factory import get_datasource_factory
 from ai_agentic_chatbot.logging_config import setup_logging, get_logger
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
+
+from ai_agentic_chatbot.infrastructure.datasource.datasource_init import (
+    initialize_datasources,
+)
 
 load_dotenv()
 
@@ -58,6 +61,7 @@ def health_check():
 
 def get_db():
     pass
+
 
 @app.get("/db-health")
 async def db_health(db: AsyncSession = Depends(get_db)):

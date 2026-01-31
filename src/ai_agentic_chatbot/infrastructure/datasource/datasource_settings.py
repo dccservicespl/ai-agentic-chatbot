@@ -8,23 +8,25 @@ from pydantic import BaseModel
 
 from .datasource_types import DataSourceProvider, DataSourceType
 from .datasource_config import get_datasource_config_class, BaseDatasourceConfig
-from src.ai_agentic_chatbot.infrastructure.datasource.factory import DataSourceConfiguration
+from ai_agentic_chatbot.infrastructure.datasource.factory import DataSourceConfiguration
 
 
 class DataSourceSettings(BaseModel):
     """Settings for datasource configurations."""
-    
+
     default_datasource: str
     datasources: Dict[str, DataSourceConfiguration]
-    
+
     class Config:
         arbitrary_types_allowed = True
 
     @classmethod
-    def from_config_file(cls, config_path: Optional[Path] = None) -> "DataSourceSettings":
+    def from_config_file(
+        cls, config_path: Optional[Path] = None
+    ) -> "DataSourceSettings":
         """Load datasource settings from config.yaml file with environment variable overrides."""
         if config_path is None:
-            project_root = Path(__file__).resolve().parent.parent.parent
+            project_root = Path(__file__).resolve().parent.parent.parent.parent.parent
             config_path = project_root / "config.yaml"
 
         if config_path.exists():
@@ -51,7 +53,7 @@ class DataSourceSettings(BaseModel):
         for provider_name, provider_config in datasource_config.items():
             if provider_name == "default":
                 continue
-                
+
             try:
                 provider = DataSourceProvider.from_string(provider_name)
             except ValueError:
@@ -75,19 +77,18 @@ class DataSourceSettings(BaseModel):
                         datasources[ds_name] = DataSourceConfiguration(
                             provider=provider,
                             ds_type=ds_type,
-                            config=provider_ds_config
+                            config=provider_ds_config,
                         )
 
-        return cls(
-            default_datasource=default_datasource,
-            datasources=datasources
-        )
+        return cls(default_datasource=default_datasource, datasources=datasources)
 
     @staticmethod
-    def _apply_env_overrides(ds_data: Dict[str, Any], provider: DataSourceProvider) -> Dict[str, Any]:
+    def _apply_env_overrides(
+        ds_data: Dict[str, Any], provider: DataSourceProvider
+    ) -> Dict[str, Any]:
         """Apply environment variable overrides to datasource configuration."""
         ds_data = ds_data.copy()
-        
+
         if provider == DataSourceProvider.MYSQL:
             if "MYSQL_HOST" in os.environ:
                 ds_data["host"] = os.environ["MYSQL_HOST"]
@@ -99,7 +100,7 @@ class DataSourceSettings(BaseModel):
                 ds_data["username"] = os.environ["MYSQL_USERNAME"]
             if "MYSQL_PASSWORD" in os.environ:
                 ds_data["password"] = os.environ["MYSQL_PASSWORD"]
-                
+
         elif provider == DataSourceProvider.POSTGRESQL:
             if "POSTGRES_HOST" in os.environ:
                 ds_data["host"] = os.environ["POSTGRES_HOST"]
@@ -111,7 +112,7 @@ class DataSourceSettings(BaseModel):
                 ds_data["username"] = os.environ["POSTGRES_USER"]
             if "POSTGRES_PASSWORD" in os.environ:
                 ds_data["password"] = os.environ["POSTGRES_PASSWORD"]
-                
+
         elif provider == DataSourceProvider.AZURE_SQL:
             if "AZURE_SQL_HOST" in os.environ:
                 ds_data["host"] = os.environ["AZURE_SQL_HOST"]
@@ -121,8 +122,11 @@ class DataSourceSettings(BaseModel):
                 ds_data["username"] = os.environ["AZURE_SQL_USERNAME"]
             if "AZURE_SQL_PASSWORD" in os.environ:
                 ds_data["password"] = os.environ["AZURE_SQL_PASSWORD"]
-                
-        elif provider in [DataSourceProvider.AWS_RDS_MYSQL, DataSourceProvider.AWS_RDS_POSTGRESQL]:
+
+        elif provider in [
+            DataSourceProvider.AWS_RDS_MYSQL,
+            DataSourceProvider.AWS_RDS_POSTGRESQL,
+        ]:
             if "AWS_RDS_HOST" in os.environ:
                 ds_data["host"] = os.environ["AWS_RDS_HOST"]
             if "AWS_RDS_PORT" in os.environ:
@@ -146,7 +150,9 @@ class DataSourceSettings(BaseModel):
 
         return DataSourceType.PRIMARY
 
-    def get_datasource_config(self, ds_name: Optional[str] = None) -> DataSourceConfiguration:
+    def get_datasource_config(
+        self, ds_name: Optional[str] = None
+    ) -> DataSourceConfiguration:
         """
         Get datasource configuration by name.
 
@@ -164,7 +170,9 @@ class DataSourceSettings(BaseModel):
 
         if ds_name not in self.datasources:
             available = list(self.datasources.keys())
-            raise ValueError(f"Datasource '{ds_name}' not found. Available: {available}")
+            raise ValueError(
+                f"Datasource '{ds_name}' not found. Available: {available}"
+            )
 
         return self.datasources[ds_name]
 

@@ -31,14 +31,13 @@ llm:
 
 datasources:
   default: mysql.primary
-
   mysql:
     primary:
-      host: "your-azure-mysql-host.mysql.database.azure.com"
+      host: "dcc-azure-mysql.mysql.database.azure.com"
       port: 3306
-      database: "your_database_name"
-      username: "your_username"
-      password: "your_password"
+      database: "ai_chatbot_db"
+      username: "aichatbotDB"
+      password: "StrongPassword_123"
       ssl_mode: "REQUIRED"
       pool_size: 5
       max_overflow: 10
@@ -47,37 +46,6 @@ datasources:
       connect_timeout: 10
       charset: "utf8mb4"
 
-    analytics:
-      host: "your-analytics-mysql-host.mysql.database.azure.com"
-      port: 3306
-      database: "analytics_db"
-      username: "analytics_user"
-      password: "analytics_password"
-      ssl_mode: "REQUIRED"
-      pool_size: 3
-      max_overflow: 5
-
-  postgresql:
-    backup:
-      host: "your-postgres-host.postgres.database.azure.com"
-      port: 5432
-      database: "backup_db"
-      username: "backup_user"
-      password: "backup_password"
-      sslmode: "require"
-      pool_size: 2
-      max_overflow: 3
-
-  aws_rds_mysql:
-    logging:
-      host: "your-rds-instance.region.rds.amazonaws.com"
-      port: 3306
-      database: "logs_db"
-      username: "logs_user"
-      password: "logs_password"
-      ssl_mode: "REQUIRED"
-      pool_size: 2
-      max_overflow: 2
 
 logging:
   level: "INFO" # DEBUG, INFO, WARNING, ERROR, CRITICAL

@@ -5,7 +5,7 @@ from threading import Lock
 from sqlalchemy import create_engine, Engine
 from sqlalchemy.orm import sessionmaker, Session
 
-from ai_agentic_chatbot.datasource_config import (
+from .datasource_config import (
     BaseDatasourceConfig,
     MySQLConfig,
     PostgreSQLConfig,
@@ -13,13 +13,18 @@ from ai_agentic_chatbot.datasource_config import (
     SQLiteConfig,
     get_datasource_config_class,
 )
-from ai_agentic_chatbot.datasource_types import DataSourceProvider, DataSourceType
+from .datasource_types import DataSourceProvider, DataSourceType
 
 
 class DataSourceConfiguration:
     """Container for datasource configuration and metadata."""
-    
-    def __init__(self, provider: DataSourceProvider, ds_type: DataSourceType, config: BaseDatasourceConfig):
+
+    def __init__(
+        self,
+        provider: DataSourceProvider,
+        ds_type: DataSourceType,
+        config: BaseDatasourceConfig,
+    ):
         self.provider = provider
         self.ds_type = ds_type
         self.config = config
@@ -53,7 +58,7 @@ class DataSourceFactory:
         name: str,
         provider: DataSourceProvider,
         ds_type: DataSourceType,
-        config: BaseDatasourceConfig
+        config: BaseDatasourceConfig,
     ) -> None:
         """
         Register a datasource configuration.
@@ -90,13 +95,10 @@ class DataSourceFactory:
         engine_kwargs = config_obj.config.get_engine_kwargs()
 
         engine = create_engine(connection_string, **engine_kwargs)
-        
-        # Cache engine
+
         self._engines[datasource_name] = engine
-        
-        # Create session maker
         self._session_makers[datasource_name] = sessionmaker(bind=engine)
-        
+
         return engine
 
     def get_session(self, datasource_name: str) -> Session:
@@ -152,17 +154,23 @@ class DataSourceFactory:
         """Get list of registered datasource names."""
         return list(self._configurations.keys())
 
-    def get_datasources_by_type(self, ds_type: DataSourceType) -> Dict[str, DataSourceConfiguration]:
+    def get_datasources_by_type(
+        self, ds_type: DataSourceType
+    ) -> Dict[str, DataSourceConfiguration]:
         """Get all datasources of a specific type."""
         return {
-            name: config for name, config in self._configurations.items()
+            name: config
+            for name, config in self._configurations.items()
             if config.ds_type == ds_type
         }
 
-    def get_datasources_by_provider(self, provider: DataSourceProvider) -> Dict[str, DataSourceConfiguration]:
+    def get_datasources_by_provider(
+        self, provider: DataSourceProvider
+    ) -> Dict[str, DataSourceConfiguration]:
         """Get all datasources of a specific provider."""
         return {
-            name: config for name, config in self._configurations.items()
+            name: config
+            for name, config in self._configurations.items()
             if config.provider == provider
         }
 
@@ -170,7 +178,7 @@ class DataSourceFactory:
         """Close all database connections and clear cache."""
         for engine in self._engines.values():
             engine.dispose()
-        
+
         self._engines.clear()
         self._session_makers.clear()
 
@@ -249,7 +257,7 @@ def register_mysql_datasource(
     password: str,
     port: int = 3306,
     ds_type: DataSourceType = DataSourceType.PRIMARY,
-    **kwargs
+    **kwargs,
 ) -> None:
     """
     Convenience function to register a MySQL datasource.
@@ -270,14 +278,11 @@ def register_mysql_datasource(
         database=database,
         username=username,
         password=password,
-        **kwargs
+        **kwargs,
     )
-    
+
     get_datasource_factory().register_datasource(
-        name=name,
-        provider=DataSourceProvider.MYSQL,
-        ds_type=ds_type,
-        config=config
+        name=name, provider=DataSourceProvider.MYSQL, ds_type=ds_type, config=config
     )
 
 
@@ -289,7 +294,7 @@ def register_postgresql_datasource(
     password: str,
     port: int = 5432,
     ds_type: DataSourceType = DataSourceType.PRIMARY,
-    **kwargs
+    **kwargs,
 ) -> None:
     """
     Convenience function to register a PostgreSQL datasource.
@@ -310,12 +315,12 @@ def register_postgresql_datasource(
         database=database,
         username=username,
         password=password,
-        **kwargs
+        **kwargs,
     )
-    
+
     get_datasource_factory().register_datasource(
         name=name,
         provider=DataSourceProvider.POSTGRESQL,
         ds_type=ds_type,
-        config=config
+        config=config,
     )

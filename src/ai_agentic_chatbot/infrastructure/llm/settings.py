@@ -6,8 +6,11 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 from pydantic import BaseModel, Field
 
-from src.ai_agentic_chatbot.infrastructure.llm.types import LLMProvider, ModelType
-from src.ai_agentic_chatbot.infrastructure.llm.config import ProviderConfig, get_provider_config_class
+from ai_agentic_chatbot.infrastructure.llm.types import LLMProvider, ModelType
+from ai_agentic_chatbot.infrastructure.llm.config import (
+    ProviderConfig,
+    get_provider_config_class,
+)
 
 
 class ModelConfiguration(BaseModel):
@@ -71,7 +74,7 @@ class Settings(BaseModel):
     def from_config_file(cls, config_path: Optional[Path] = None) -> "Settings":
         """Load settings from config.yaml file with environment variable overrides."""
         if config_path is None:
-            project_root = Path(__file__).resolve().parent.parent.parent
+            project_root = Path(__file__).resolve().parent.parent.parent.parent.parent
             config_path = project_root / "config.yaml"
 
         config_data: Dict[str, Any] = {}

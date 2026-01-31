@@ -1,5 +1,5 @@
-from enum import Enum
 from typing import Dict, Type, Any
+from enum import Enum
 
 
 class LLMProvider(Enum):
