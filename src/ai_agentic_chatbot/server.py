@@ -1,4 +1,4 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Depends, HTTPException
 from contextlib import asynccontextmanager
 from ai_agentic_chatbot.controller.chat import router
 from dotenv import load_dotenv
@@ -7,6 +7,8 @@ import uvicorn
 from ai_agentic_chatbot.datasource_init import initialize_datasources
 from ai_agentic_chatbot.infrastructure.datasource.factory import get_datasource_factory
 from ai_agentic_chatbot.logging_config import setup_logging, get_logger
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession
 
 load_dotenv()
 
@@ -52,6 +54,18 @@ app.include_router(router)
 @app.get("/health", tags=["Health"])
 def health_check():
     return {"status": "UP"}
+
+
+def get_db():
+    pass
+
+@app.get("/db-health")
+async def db_health(db: AsyncSession = Depends(get_db)):
+    try:
+        await db.execute(text("SELECT 1"))
+        return {"database": "UP"}
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
 
 
 if __name__ == "__main__":
