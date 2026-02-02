@@ -66,5 +66,6 @@ Thumbs.db
 # Test coverage reports
 .coverage
 htmlcov/
+config.yaml
 
 temp/
