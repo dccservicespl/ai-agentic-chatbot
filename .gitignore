@@ -66,3 +66,5 @@ Thumbs.db
 # Test coverage reports
 .coverage
 htmlcov/
+
+temp/
