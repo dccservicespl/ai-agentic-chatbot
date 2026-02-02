@@ -3,29 +3,23 @@ from contextlib import asynccontextmanager
 import uvicorn
 from dotenv import load_dotenv
 from fastapi import FastAPI, Depends, HTTPException
-from httpx import Request
 from langchain_core.messages import HumanMessage
-from sqlalchemy import text
+from sqlalchemy import text, Engine
 from sqlalchemy.orm import Session
 from starlette.responses import StreamingResponse
 
 from ai_agentic_chatbot.agent.graph import build_graph
+from ai_agentic_chatbot.agent.schema import StreamRequest
 from ai_agentic_chatbot.infrastructure.datasource.datasource_init import (
     initialize_datasources,
 )
-from ai_agentic_chatbot.infrastructure.datasource.factory import get_datasource_factory
-from ai_agentic_chatbot.agent.schema import StreamRequest
 from ai_agentic_chatbot.infrastructure.datasource.factory import get_datasource_factory, get_engine
 from ai_agentic_chatbot.infrastructure.db_depency import get_db_session
 from ai_agentic_chatbot.logging_config import setup_logging, get_logger
-from sqlalchemy import text, Engine
-
-from ai_agentic_chatbot.infrastructure.datasource.datasource_init import (
-    initialize_datasources,
-)
 from ai_agentic_chatbot.schema_extractor.SaveSchemaJson import save_schema_temp_file
 from ai_agentic_chatbot.schema_extractor.SchemaExtractionConfig import SchemaExtractionConfig
 from ai_agentic_chatbot.schema_extractor.SchemaExtractor import SchemaExtractor
+from ai_agentic_chatbot.schema_extractor.transform_schema_to_text import transform_schema_to_text
 
 load_dotenv()
 
@@ -97,6 +91,16 @@ def schema_json(db_engine: Engine = Depends(get_engine)):
         raise HTTPException(status_code=503, detail=str(exc))
 
 
+@app.get("/schemaText", tags=["SchemaExtractor"])
+def schema_text():
+    try:
+        transform_schema_to_text()
+
+        return {"Schema to text conversion completed"}
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+
+
 @app.post("/stream")
 async def stream_endpoint(stream_request: StreamRequest):
     """Streams agent responses using Server-Sent Events."""
@@ -117,7 +121,7 @@ async def stream_endpoint(stream_request: StreamRequest):
         async def event_generator():
             try:
                 async for event in graph.astream_events(
-                    inputs, config=config, version="v2"
+                        inputs, config=config, version="v2"
                 ):
                     if event["event"] == "on_chat_model_stream":
                         chunk = event["data"]["chunk"]
