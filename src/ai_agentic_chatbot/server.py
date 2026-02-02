@@ -1,18 +1,22 @@
-from fastapi import FastAPI, Depends, HTTPException
 from contextlib import asynccontextmanager
-from ai_agentic_chatbot.controller.chat import router
-from dotenv import load_dotenv
-from sqlalchemy.orm import Session
+
 import uvicorn
-
-from ai_agentic_chatbot.infrastructure.datasource.factory import get_datasource_factory
-from ai_agentic_chatbot.infrastructure.db_depency import get_db_session
-from ai_agentic_chatbot.logging_config import setup_logging, get_logger
+from dotenv import load_dotenv
+from fastapi import FastAPI, Depends, HTTPException
+from httpx import Request
+from langchain_core.messages import HumanMessage
 from sqlalchemy import text
+from sqlalchemy.orm import Session
+from starlette.responses import StreamingResponse
 
+from ai_agentic_chatbot.agent.graph import build_graph
 from ai_agentic_chatbot.infrastructure.datasource.datasource_init import (
     initialize_datasources,
 )
+from ai_agentic_chatbot.infrastructure.datasource.factory import get_datasource_factory
+from ai_agentic_chatbot.agent.schema import StreamRequest
+from ai_agentic_chatbot.infrastructure.db_depency import get_db_session
+from ai_agentic_chatbot.logging_config import setup_logging, get_logger
 
 load_dotenv()
 
@@ -52,7 +56,6 @@ app = FastAPI(
     description="Agent enabled AI ChatBot application",
     lifespan=lifespan,
 )
-app.include_router(router)
 
 
 @app.get("/health", tags=["Health"])
@@ -67,6 +70,46 @@ def db_health(db: Session = Depends(get_db_session)):
         return {"database": "UP"}
     except Exception as exc:
         raise HTTPException(status_code=503, detail=str(exc))
+
+
+@app.post("/stream")
+async def stream_endpoint(stream_request: StreamRequest):
+    """Streams agent responses using Server-Sent Events."""
+    try:
+        thread_id = stream_request.thread_id
+        messages = stream_request.messages
+
+        if not messages:
+            raise HTTPException(status_code=400, detail="messages cannot be empty")
+
+        last_msg = messages[-1].content
+
+        graph = build_graph()
+
+        config = {"configurable": {"thread_id": thread_id}}
+        inputs = {"messages": [HumanMessage(content=last_msg)]}
+
+        async def event_generator():
+            try:
+                async for event in graph.astream_events(
+                    inputs, config=config, version="v2"
+                ):
+                    if event["event"] == "on_chat_model_stream":
+                        chunk = event["data"]["chunk"]
+                        if chunk.content:
+                            yield chunk.content.encode("utf-8")
+
+            except Exception as e:
+                print(f"[STREAM ERROR] {e}")
+                yield b"[Error: Stream interrupted]"
+
+        return StreamingResponse(event_generator(), media_type="text/plain")
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[API ERROR] {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 if __name__ == "__main__":

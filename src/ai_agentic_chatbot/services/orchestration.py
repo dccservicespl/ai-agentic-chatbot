@@ -1,4 +1,4 @@
-from ai_agentic_chatbot.agent.intent_agent import IntentClassifier
+from ai_agentic_chatbot.agent.router import IntentClassifier
 
 
 class ChatOrchestrator:

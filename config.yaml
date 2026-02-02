@@ -6,9 +6,9 @@ llm:
   azure_openai:
     fast:
       model_name: "gpt-4o-mini"
-      api_key: "your-azure-openai-api-key"
-      endpoint: "https://dcc-azure-openai.cognitiveservices.azure.com"
-      api_version: "2024-02-15-preview"
+      api_key: ""
+      endpoint: ""
+      api_version: ""
       temperature: 0.0
       max_tokens: 4000
       top_p: 1.0
@@ -18,9 +18,9 @@ llm:
       max_retries: 3
     smart:
       model_name: "gpt-4o"
-      api_key: "your-azure-openai-api-key"
-      endpoint: "https://dcc-azure-openai.cognitiveservices.azure.com"
-      api_version: "2024-02-15-preview"
+      api_key: ""
+      endpoint: ""
+      api_version: ""
       temperature: 0.1
       max_tokens: 8000
       top_p: 1.0
@@ -33,12 +33,12 @@ datasources:
   default: mysql.primary
   mysql:
     primary:
-      host: "dcc-azure-mysql.mysql.database.azure.com"
+      host: ""
       port: 3306
-      database: "ai_chatbot_db"
-      username: "aichatbotDB"
-      password: "StrongPassword_123"
-      ssl_ca: "/opt/DigiCertGlobalRootG2.crt.pem"
+      database: ""
+      username: ""
+      password: ""
+      ssl_ca: ""
       pool_size: 5
       max_overflow: 10
       pool_timeout: 30
