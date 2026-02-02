@@ -8,6 +8,7 @@ from langchain_core.messages import HumanMessage
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 from starlette.responses import StreamingResponse
+from langchain_core.messages import AIMessage
 
 from ai_agentic_chatbot.agent.graph import build_graph
 from ai_agentic_chatbot.infrastructure.datasource.datasource_init import (
@@ -72,6 +73,9 @@ def db_health(db: Session = Depends(get_db_session)):
         raise HTTPException(status_code=503, detail=str(exc))
 
 
+graph = build_graph()
+
+
 @app.post("/stream")
 async def stream_endpoint(stream_request: StreamRequest):
     """Streams agent responses using Server-Sent Events."""
@@ -82,33 +86,42 @@ async def stream_endpoint(stream_request: StreamRequest):
         if not messages:
             raise HTTPException(status_code=400, detail="messages cannot be empty")
 
-        last_msg = messages[-1].content
-
-        graph = build_graph()
-
         config = {"configurable": {"thread_id": thread_id}}
-        inputs = {"messages": [HumanMessage(content=last_msg)]}
+        inputs = {"messages": [HumanMessage(content=messages[-1].content)]}
+
+        state_snapshot = graph.get_state(config)
+
+        if state_snapshot and state_snapshot.values:
+            existing_messages = state_snapshot.values.get("messages", [])
+            print(
+                f"[CHECKPOINT DEBUG] Thread {thread_id} has {len(existing_messages)} messages:"
+            )
+            for i, msg in enumerate(existing_messages):
+                print(f"  [{i}] {type(msg).__name__}: {msg.content[:50]}")
+        else:
+            print(f"[CHECKPOINT DEBUG] Thread {thread_id} has NO previous state")
 
         async def event_generator():
             try:
-                async for event in graph.astream_events(
-                    inputs, config=config, version="v2"
+                async for chunk in graph.astream(
+                    inputs, config=config, stream_mode="values"
                 ):
-                    if event["event"] == "on_chat_model_stream":
-                        chunk = event["data"]["chunk"]
-                        if chunk.content:
-                            yield chunk.content.encode("utf-8")
+                    if "messages" in chunk and chunk["messages"]:
+                        last_message = chunk["messages"][-1]
+
+                        if isinstance(last_message, AIMessage):
+                            content = last_message.content
+                            if content:
+                                yield f"{content}".encode("utf-8")
 
             except Exception as e:
-                print(f"[STREAM ERROR] {e}")
-                yield b"[Error: Stream interrupted]"
+                logger.error(f"[STREAM ERROR] {e}")
+                yield f"data: Error: {str(e)}\n\n".encode("utf-8")
 
-        return StreamingResponse(event_generator(), media_type="text/plain")
+        return StreamingResponse(event_generator(), media_type="text/event-stream")
 
-    except HTTPException:
-        raise
     except Exception as e:
-        print(f"[API ERROR] {e}")
+        logger.error(f"[API ERROR] {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
