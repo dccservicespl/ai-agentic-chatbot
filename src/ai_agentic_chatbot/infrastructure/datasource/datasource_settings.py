@@ -42,14 +42,12 @@ class DataSourceSettings(BaseModel):
         """Parse configuration data into DataSourceSettings object."""
         datasource_config = config_data.get("datasources", {})
 
-        default_datasource = datasource_config.get("default", "primary")
+        default_datasource = datasource_config.get("default", "mysql.primary")
         if "." in default_datasource:
-            # Extract datasource part from "provider.datasource" format
             default_datasource = default_datasource.split(".", 1)[1]
 
         datasources = {}
 
-        # Parse datasource configurations
         for provider_name, provider_config in datasource_config.items():
             if provider_name == "default":
                 continue
@@ -57,7 +55,6 @@ class DataSourceSettings(BaseModel):
             try:
                 provider = DataSourceProvider.from_string(provider_name)
             except ValueError:
-                # Skip unknown providers for forward compatibility
                 continue
 
             config_class = get_datasource_config_class(provider)
@@ -65,16 +62,12 @@ class DataSourceSettings(BaseModel):
             if isinstance(provider_config, dict):
                 for ds_name, ds_data in provider_config.items():
                     if isinstance(ds_data, dict):
-                        # Apply environment variable overrides
                         ds_data = cls._apply_env_overrides(ds_data, provider)
-
-                        # Create provider-specific config
                         provider_ds_config = config_class(**ds_data)
-
-                        # Determine datasource type from name or config
                         ds_type = cls._determine_datasource_type(ds_name)
 
-                        datasources[ds_name] = DataSourceConfiguration(
+                        full_ds_name = f"{provider_name}.{ds_name}"
+                        datasources[full_ds_name] = DataSourceConfiguration(
                             provider=provider,
                             ds_type=ds_type,
                             config=provider_ds_config,
