@@ -5,7 +5,7 @@ llm:
 
   azure_openai:
     fast:
-      model_name: "gpt-4o-mini"
+      model_name: "gpt-4o"
       api_key: "your-azure-openai-api-key"
       endpoint: "https://dcc-azure-openai.cognitiveservices.azure.com"
       api_version: "2024-02-15-preview"
@@ -36,8 +36,8 @@ datasources:
       host: "dcc-azure-mysql.mysql.database.azure.com"
       port: 3306
       database: "ai_chatbot_db"
-      username: "aichatbotDB"
-      password: "StrongPassword_123"
+      username: "username"
+      password: "StrongPassword"
       ssl_ca: "D:\\ai_azure_cert_file\\DigiCertGlobalRootG2.crt.pem"
       pool_size: 5
       max_overflow: 10
