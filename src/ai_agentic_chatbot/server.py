@@ -22,7 +22,7 @@ from ai_agentic_chatbot.schema_extractor.SchemaExtractionConfig import (
     SchemaExtractionConfig,
 )
 from ai_agentic_chatbot.schema_extractor.SchemaExtractor import SchemaExtractor
-from ai_agentic_chatbot.schema_extractor.transform_schema_to_text import transform_schema_to_text
+from ai_agentic_chatbot.application.transform_schema_to_text import transform_schema_to_text
 
 load_dotenv()
 
