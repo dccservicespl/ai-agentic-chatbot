@@ -13,8 +13,8 @@ class BaseLLMConfig(BaseModel, ABC):
     """Base configuration class for all LLM providers."""
 
     model_name: str = Field(..., description="Model deployment/name")
-    temperature: float = Field(
-        default=0.7, ge=0.0, le=2.0, description="Model temperature"
+    temperature: Optional[float] = Field(
+        default=None, description="Model temperature"
     )
     max_tokens: Optional[int] = Field(
         default=None, description="Maximum tokens in response"
