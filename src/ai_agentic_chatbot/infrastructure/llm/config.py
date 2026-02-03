@@ -72,6 +72,39 @@ class AzureOpenAIConfig(BaseLLMConfig):
         }
 
 
+class AzureOpenAIEmbeddingConfig(BaseModel):
+    """Configuration for Azure OpenAI embedding models."""
+
+    model_name: str = Field(..., description="Embedding model deployment/name")
+    api_key: str = Field(..., description="Azure OpenAI API key")
+    endpoint: str = Field(..., description="Azure OpenAI endpoint")
+    api_version: str = Field(
+        default="2024-02-15-preview", description="Azure OpenAI API version"
+    )
+    timeout: int = Field(default=30, description="Request timeout in seconds")
+    max_retries: int = Field(default=3, description="Maximum number of retries")
+
+    @field_validator("endpoint")
+    def validate_endpoint(cls, v):
+        if not v.startswith(("http://", "https://")):
+            raise ValueError("Endpoint must be a valid URL")
+        return v.rstrip("/")
+
+    def get_client_kwargs(self) -> Dict[str, Any]:
+        return {
+            "azure_deployment": self.model_name,
+            "azure_endpoint": self.endpoint,
+            "api_key": self.api_key,
+            "api_version": self.api_version,
+            "timeout": self.timeout,
+            "max_retries": self.max_retries,
+        }
+
+    class Config:
+        frozen = True
+        extra = "forbid"
+
+
 PROVIDER_CONFIG_REGISTRY[LLMProvider.AZURE_OPENAI] = AzureOpenAIConfig
 
 ProviderConfig = Union[AzureOpenAIConfig]
