@@ -65,10 +65,11 @@ def health_check():
 
 
 @app.get("/db-health")
-def db_health(db: Session = Depends(get_db_session)):
+def db_health(db: dict = Depends(get_db_session)):
     try:
-        db.execute(text("SELECT 1"))
-        return {"database": "UP"}
+        db["mysql"].execute(text("SELECT 1"))
+        db["postgresql"].execute(text("SELECT 1"))
+        return {"databases": "UP"}
     except Exception as exc:
         raise HTTPException(status_code=503, detail=str(exc))
 
