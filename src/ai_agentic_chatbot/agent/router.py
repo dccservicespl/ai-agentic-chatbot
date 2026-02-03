@@ -1,6 +1,8 @@
+import os
 from pathlib import Path
 from typing import Literal, Optional
 
+from ai_agentic_chatbot.logging_config import get_logger
 from langchain_core.messages import AIMessage, SystemMessage
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import PydanticOutputParser
@@ -31,10 +33,10 @@ class ClarificationDecision(BaseModel):
 class RouterDecision(BaseModel):
     """Router classification schema with strict validation."""
 
-    next_step: Literal["greeting", "actionable", "idiotic"] = Field(
+    next_step: Literal["greeting", "sql_query", "idiotic"] = Field(
         description=(
             "greeting: User is saying hi/hello or introducing themselves. "
-            "actionable: User wants data, charts, analysis, or specific help. "
+            "sql_query: User wants data, charts, analysis, or specific help. That can be achieved by running a SQL query."
             "idiotic: Input is gibberish, spam, offensive, or completely irrelevant."
         )
     )
@@ -46,30 +48,27 @@ class RouterDecision(BaseModel):
     )
 
 
+logger = get_logger(__name__)
+
+
 class RouterNode:
     def __init__(self, state: AgentState):
         self.state: AgentState = state
         self.llm = get_llm()
 
     def classify(self) -> dict:
-        print(f"[ROUTER DEBUG] Sees {len(self.state['messages'])} messages")
+        logger.debug(f"[ROUTER DEBUG] Sees {len(self.state['messages'])} messages")
         for i, msg in enumerate(self.state["messages"]):
-            print(f"  [{i}] {type(msg).__name__}: {msg.content[:50]}")
+            logger.debug(f"  [{i}] {type(msg).__name__}: {msg.content[:50]}")
+
         structured_llm = self.llm.with_structured_output(RouterDecision, strict=True)
         msgs = self.state["messages"]
-        prompt = SystemMessage(
-            content=(
-                "You are an intent classifier for a SQL Data Assistant."
-                "1. If user wants data/charts (e.g. 'Show sales', 'growth rate'), classify as 'sql_query'."
-                "2. If user greets ('hi', 'thanks'), classify as 'greeting'."
-                "3. If nonsense/unrelated, classify as 'idiotic'."
-                "CRITICAL: If 'sql_query', check for ambiguity."
-                "- 'Sales' -> Ambiguous (needs year/product)."
-                "- 'Sales 2024' -> Not Ambiguous."
-                "If Ambiguous, set is_ambiguous=True and write a polite clarification_question."
-            )
-        )
+
+        with open(os.environ["ROUTER_PROMPT_PATH"], "r") as f:
+            prompt_text = f.read()
+        prompt = SystemMessage(content=(prompt_text))
         decision = structured_llm.invoke([prompt] + msgs)
+
         if decision.clarification and decision.clarification.is_ambiguous:
             return {
                 "next_step": "ask_clarification",

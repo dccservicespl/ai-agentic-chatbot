@@ -35,6 +35,10 @@ def clarification_node(state: AgentState) -> dict:
     return {}
 
 
+def sql_query_node(state: AgentState) -> dict:
+    return {}
+
+
 _checkpointer = MemorySaver()
 
 
@@ -45,6 +49,7 @@ def build_graph():
     workflow.add_node("greeting_node", greeting_node)
     workflow.add_node("fallback_node", fallback_node)
     workflow.add_node("clarification_node", clarification_node)
+    workflow.add_node("sql_query_node", sql_query_node)
 
     workflow.add_edge(START, "router_node")
 
@@ -56,6 +61,7 @@ def build_graph():
         routing_policy,
         {
             "greeting": "greeting_node",
+            "sql_query": "sql_query_node",
             "idiotic": "fallback_node",
             "ask_clarification": "clarification_node",
         },
@@ -64,5 +70,6 @@ def build_graph():
     workflow.add_edge("greeting_node", END)
     workflow.add_edge("fallback_node", END)
     workflow.add_edge("clarification_node", END)
+    workflow.add_edge("sql_query_node", END)
 
     return workflow.compile(checkpointer=_checkpointer)
