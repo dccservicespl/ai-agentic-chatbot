@@ -11,6 +11,7 @@ from starlette.responses import StreamingResponse
 
 from ai_agentic_chatbot.agent.graph import build_graph
 from ai_agentic_chatbot.agent.schema import StreamRequest
+from ai_agentic_chatbot.application.ingest_vector_schema import ingest_schema, SCHEMA_TO_TEXT_PATH
 from ai_agentic_chatbot.infrastructure.datasource.datasource_init import (
     initialize_datasources,
 )
@@ -22,7 +23,8 @@ from ai_agentic_chatbot.schema_extractor.SchemaExtractionConfig import (
     SchemaExtractionConfig,
 )
 from ai_agentic_chatbot.schema_extractor.SchemaExtractor import SchemaExtractor
-from ai_agentic_chatbot.schema_extractor.transform_schema_to_text import transform_schema_to_text
+from ai_agentic_chatbot.application.transform_schema_to_text import transform_schema_to_text
+from ai_agentic_chatbot.utils.utils import get_db_connection_string
 
 load_dotenv()
 
@@ -80,6 +82,8 @@ def db_health(db: Session = Depends(get_db_session)):
 
 
 graph = build_graph()
+
+
 @app.get("/schemaJson", tags=["SchemaExtractor"])
 def schema_json(db_engine: Engine = Depends(get_engine)):
     try:
@@ -104,6 +108,18 @@ def schema_text():
         return {"Schema to text conversion completed"}
     except Exception as exc:
         raise HTTPException(status_code=503, detail=str(exc))
+
+
+@app.get("/ingest")
+def schema_text():
+    try:
+        ingest_schema(
+            schema_path=SCHEMA_TO_TEXT_PATH,
+            pg_conn_str=get_db_connection_string(),
+        )
+        return {"Schema to text conversion completed"}
+    except Exception as exc:
+        raise exc
 
 
 @app.post("/stream")
@@ -134,7 +150,7 @@ async def stream_endpoint(stream_request: StreamRequest):
         async def event_generator():
             try:
                 async for chunk in graph.astream(
-                    inputs, config=config, stream_mode="values"
+                        inputs, config=config, stream_mode="values"
                 ):
                     if "messages" in chunk and chunk["messages"]:
                         last_message = chunk["messages"][-1]
