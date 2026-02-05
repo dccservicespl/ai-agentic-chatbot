@@ -30,3 +30,13 @@ def load_file_content(file_path: str | Path) -> str:
         raise ValueError(f"File is empty: {path.resolve()}")
 
     return content
+
+
+def get_system_prompt() -> str:
+    import os
+    import datetime
+
+    now = datetime.datetime.now()
+    formatted_date = now.strftime("%A, %B %d, %Y")
+    prompt_text = load_file_content(os.environ["SYSTEM_PROMPT_PATH"])
+    return prompt_text.format(formatted_date=formatted_date)

@@ -13,12 +13,6 @@ class BaseLLMConfig(BaseModel, ABC):
     """Base configuration class for all LLM providers."""
 
     model_name: str = Field(..., description="Model deployment/name")
-    temperature: float = Field(
-        default=0.7, ge=0.0, le=2.0, description="Model temperature"
-    )
-    max_tokens: Optional[int] = Field(
-        default=None, description="Maximum tokens in response"
-    )
     timeout: int = Field(default=30, description="Request timeout in seconds")
     max_retries: int = Field(default=3, description="Maximum number of retries")
 
@@ -48,6 +42,12 @@ class AzureOpenAIConfig(BaseLLMConfig):
     )
     presence_penalty: float = Field(
         default=0.0, ge=-2.0, le=2.0, description="Presence penalty"
+    )
+    temperature: float = Field(
+        default=0.7, ge=0.0, le=2.0, description="Model temperature"
+    )
+    max_tokens: Optional[int] = Field(
+        default=None, description="Maximum tokens in response"
     )
 
     @field_validator("endpoint")
