@@ -11,11 +11,17 @@ from starlette.responses import StreamingResponse
 
 from ai_agentic_chatbot.agent.graph import build_graph
 from ai_agentic_chatbot.agent.schema import StreamRequest
-from ai_agentic_chatbot.application.ingest_vector_schema import ingest_schema, SCHEMA_TO_TEXT_PATH
+from ai_agentic_chatbot.application.ingest_vector_schema import (
+    ingest_schema,
+    SCHEMA_TO_TEXT_PATH,
+)
 from ai_agentic_chatbot.infrastructure.datasource.datasource_init import (
     initialize_datasources,
 )
-from ai_agentic_chatbot.infrastructure.datasource.factory import get_datasource_factory, get_engine
+from ai_agentic_chatbot.infrastructure.datasource.factory import (
+    get_datasource_factory,
+    get_engine,
+)
 from ai_agentic_chatbot.infrastructure.db_depency import get_db_session
 from ai_agentic_chatbot.logging_config import setup_logging, get_logger
 from ai_agentic_chatbot.schema_extractor.SaveSchemaJson import save_schema_temp_file
@@ -23,7 +29,9 @@ from ai_agentic_chatbot.schema_extractor.SchemaExtractionConfig import (
     SchemaExtractionConfig,
 )
 from ai_agentic_chatbot.schema_extractor.SchemaExtractor import SchemaExtractor
-from ai_agentic_chatbot.application.transform_schema_to_text import transform_schema_to_text
+from ai_agentic_chatbot.application.transform_schema_to_text import (
+    transform_schema_to_text,
+)
 from ai_agentic_chatbot.utils.utils import get_db_connection_string
 
 load_dotenv()
@@ -149,16 +157,31 @@ async def stream_endpoint(stream_request: StreamRequest):
 
         async def event_generator():
             try:
+                # Track accumulated state for visualization data
+                accumulated_state = {}
+
                 async for chunk in graph.astream(
-                        inputs, config=config, stream_mode="values"
+                    inputs, config=config, stream_mode="values"
                 ):
+                    # Update accumulated state with new chunk data
+                    accumulated_state.update(chunk)
+
                     if "messages" in chunk and chunk["messages"]:
                         last_message = chunk["messages"][-1]
 
                         if isinstance(last_message, AIMessage):
                             content = last_message.content
                             if content:
-                                yield f"{content}".encode("utf-8")
+                                response_data = {
+                                    "content": content,
+                                    "visualization": accumulated_state.get(
+                                        "visualization"
+                                    ),
+                                }
+
+                                import json
+
+                                yield json.dumps(response_data).encode("utf-8")
 
             except Exception as e:
                 logger.error(f"[STREAM ERROR] {e}")

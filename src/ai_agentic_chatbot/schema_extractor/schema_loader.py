@@ -29,7 +29,7 @@ class SchemaLoader:
 
     def load_schema_documentation(self) -> Dict:
         """Load the processed schema documentation YAML."""
-        doc_path = self.temp_dir / "schema_documentation.yaml"
+        doc_path = Path(os.environ["SCHEMA_PATH"])
 
         if not doc_path.exists():
             raise FileNotFoundError(f"Schema documentation not found at {doc_path}")
@@ -53,57 +53,69 @@ class SchemaLoader:
     def get_table_docs_for_search(self) -> List[Dict]:
         """
         Get table documents formatted for semantic search.
-        Uses pre-processed schema data instead of real-time extraction.
+        Uses pre-processed schema data with rich business context.
         """
         try:
-            # Load processed schema documentation
             schema_doc = self.load_schema_documentation()
 
             table_docs = []
             for table in schema_doc.get("tables", []):
-                # Create searchable text from documentation
                 search_text_parts = [
                     f"Table: {table.get('table_name', '')}",
-                    f"Purpose: {table.get('business_purpose', '')}",
-                    f"Description: {table.get('description', '')}",
+                    f"Business Purpose: {table.get('business_purpose', '')}",
+                    f"Primary Identifier: {table.get('primary_identifier', '')}",
                 ]
 
-                # Add column information
-                for col in table.get("columns", []):
-                    col_desc = (
-                        f"Column {col.get('name', '')} ({col.get('data_type', '')})"
-                    )
-                    if col.get("description"):
-                        col_desc += f": {col.get('description')}"
-                    search_text_parts.append(col_desc)
+                for field in table.get("key_fields", []):
+                    field_desc = f"Field {field.get('field_name', '')}: {field.get('meaning', '')}"
+                    search_text_parts.append(field_desc)
 
-                # Add example questions
+                for date_field in table.get("important_dates", []):
+                    date_desc = f"Date {date_field.get('field_name', '')}: {date_field.get('meaning', '')}"
+                    search_text_parts.append(date_desc)
+
+                relationships = table.get("relationships")
+                if relationships:
+                    for rel in relationships:
+                        rel_desc = f"Related to {rel.get('related_table', '')}: {rel.get('explanation', '')}"
+                        search_text_parts.append(rel_desc)
+
+                if table.get("operational_notes"):
+                    search_text_parts.append(f"Notes: {table.get('operational_notes')}")
+
                 for question in table.get("example_questions", []):
-                    search_text_parts.append(f"Example: {question}")
+                    search_text_parts.append(f"Example Query: {question}")
 
-                # Generate DDL from raw schema
-                ddl = self._generate_ddl_from_doc(table)
+                ddl = self._generate_ddl_from_your_format(table)
+
+                columns = []
+                for field in table.get("key_fields", []):
+                    columns.append(field.get("field_name", ""))
+                for date_field in table.get("important_dates", []):
+                    columns.append(date_field.get("field_name", ""))
 
                 table_docs.append(
                     {
                         "name": table.get("table_name", ""),
-                        "schema": table.get("schema_name", "public"),
+                        "schema": "public",
                         "ddl": ddl,
                         "search_text": " ".join(search_text_parts),
-                        "columns": [
-                            col.get("name", "") for col in table.get("columns", [])
-                        ],
+                        "columns": columns,
                         "business_purpose": table.get("business_purpose", ""),
                         "example_questions": table.get("example_questions", []),
+                        "key_fields": table.get("key_fields", []),
+                        "relationships": table.get("relationships", []),
+                        "operational_notes": table.get("operational_notes", ""),
                     }
                 )
 
-            logger.info(f"Loaded {len(table_docs)} table documents from cache")
+            logger.info(
+                f"Loaded {len(table_docs)} table documents from preprocessed schema"
+            )
             return table_docs
 
         except Exception as e:
-            logger.error(f"Failed to load cached schema data: {e}")
-            # Fallback to raw schema JSON if documentation is not available
+            logger.error(f"Failed to load preprocessed schema data: {e}")
             return self._fallback_to_raw_schema()
 
     def _fallback_to_raw_schema(self) -> List[Dict]:
@@ -113,13 +125,11 @@ class SchemaLoader:
 
             table_docs = []
             for table in schema_json.get("tables", []):
-                # Create basic search text from raw schema
                 search_text_parts = [
                     f"Table: {table.get('table_name', '')}",
                     f"Schema: {table.get('schema_name', 'public')}",
                 ]
 
-                # Add column information
                 for col in table.get("columns", []):
                     col_desc = (
                         f"Column {col.get('name', '')} ({col.get('data_type', '')})"
@@ -128,7 +138,6 @@ class SchemaLoader:
                         col_desc += " NOT NULL"
                     search_text_parts.append(col_desc)
 
-                # Add foreign key relationships
                 for fk in table.get("foreign_keys", []):
                     search_text_parts.append(
                         f"Foreign key {fk.get('column', '')} references "
@@ -160,14 +169,76 @@ class SchemaLoader:
             logger.error(f"Failed to load raw schema data: {e}")
             return []
 
+    def _generate_ddl_from_your_format(self, table: Dict) -> str:
+        """Generate DDL from your preprocessed schema format."""
+        table_name = table.get("table_name", "")
+
+        lines = [f"CREATE TABLE {table_name} ("]
+
+        col_lines = []
+
+        for field in table.get("key_fields", []):
+            field_name = field.get("field_name", "")
+            data_type = self._infer_data_type(field_name, field.get("meaning", ""))
+            col_line = f"  {field_name} {data_type}"
+            col_lines.append(col_line)
+
+        for date_field in table.get("important_dates", []):
+            field_name = date_field.get("field_name", "")
+            col_line = f"  {field_name} TIMESTAMP"
+            col_lines.append(col_line)
+
+        primary_identifier = table.get("primary_identifier", "")
+        if "id" in primary_identifier.lower():
+            col_lines.append("  PRIMARY KEY (id)")
+
+        lines.append(",\n".join(col_lines))
+        lines.append(");")
+
+        return "\n".join(lines)
+
+    def _infer_data_type(self, field_name: str, meaning: str) -> str:
+        """Infer SQL data type from field name and meaning."""
+        field_lower = field_name.lower()
+        meaning_lower = meaning.lower()
+
+        if field_lower == "id" or field_lower.endswith("_id"):
+            return "INTEGER"
+
+        if "code" in field_lower:
+            return "VARCHAR(50)"
+
+        if "status" in field_lower or "is_" in field_lower:
+            return "VARCHAR(20)"
+
+        if any(
+            word in field_lower
+            for word in ["cost", "price", "total", "limit", "amount"]
+        ):
+            return "DECIMAL(10,2)"
+
+        if "quantity" in field_lower or "on_hand" in field_lower:
+            return "INTEGER"
+
+        if "name" in field_lower:
+            return "VARCHAR(255)"
+
+        if (
+            "date" in field_lower
+            or "created_at" in field_lower
+            or "updated_at" in field_lower
+        ):
+            return "TIMESTAMP"
+
+        return "VARCHAR(255)"
+
     def _generate_ddl_from_doc(self, table: Dict) -> str:
-        """Generate DDL from processed documentation."""
+        """Generate DDL from processed documentation (legacy method)."""
         table_name = table.get("table_name", "")
         schema_name = table.get("schema_name", "public")
 
         lines = [f"CREATE TABLE {schema_name}.{table_name} ("]
 
-        # Add columns
         col_lines = []
         for col in table.get("columns", []):
             col_line = f"  {col.get('name', '')} {col.get('data_type', '')}"
@@ -177,13 +248,11 @@ class SchemaLoader:
                 col_line += f" DEFAULT {col.get('default')}"
             col_lines.append(col_line)
 
-        # Add primary key
         primary_keys = table.get("primary_keys", [])
         if primary_keys:
             pk_cols = ", ".join(primary_keys)
             col_lines.append(f"  PRIMARY KEY ({pk_cols})")
 
-        # Add foreign keys
         for fk in table.get("foreign_keys", []):
             fk_line = (
                 f"  FOREIGN KEY ({fk.get('column', '')}) "
@@ -203,7 +272,6 @@ class SchemaLoader:
 
         lines = [f"CREATE TABLE {schema_name}.{table_name} ("]
 
-        # Add columns
         col_lines = []
         for col in table.get("columns", []):
             col_line = f"  {col.get('name', '')} {col.get('data_type', '')}"
@@ -213,13 +281,11 @@ class SchemaLoader:
                 col_line += f" DEFAULT {col.get('default')}"
             col_lines.append(col_line)
 
-        # Add primary key
         primary_keys = table.get("primary_keys", [])
         if primary_keys:
             pk_cols = ", ".join(primary_keys)
             col_lines.append(f"  PRIMARY KEY ({pk_cols})")
 
-        # Add foreign keys
         for fk in table.get("foreign_keys", []):
             fk_line = (
                 f"  FOREIGN KEY ({fk.get('column', '')}) "

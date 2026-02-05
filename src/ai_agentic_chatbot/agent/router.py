@@ -3,9 +3,7 @@ from pathlib import Path
 from typing import Literal, Optional
 
 from ai_agentic_chatbot.logging_config import get_logger
-from ai_agentic_chatbot.schema_extractor.transform_schema_to_text import (
-    load_schema_summary,
-)
+from ai_agentic_chatbot.schema_extractor.schema_loader import SchemaLoader
 from ai_agentic_chatbot.utils.prompt_loader import get_system_prompt
 from langchain_core.messages import AIMessage, SystemMessage
 from langchain_core.prompts import ChatPromptTemplate
@@ -73,7 +71,8 @@ class RouterNode:
 
         with open(os.environ["ROUTER_PROMPT_PATH"], "r") as f:
             prompt_text = f.read()
-        schema_summary = load_schema_summary()
+        schema_loader = SchemaLoader()
+        schema_summary = schema_loader.load_schema_summary()
         schema_summary_text = "\n".join(
             [f"- {table}: {desc}" for table, desc in schema_summary.items()]
         )

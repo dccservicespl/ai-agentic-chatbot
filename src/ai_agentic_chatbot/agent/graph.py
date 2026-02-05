@@ -8,6 +8,7 @@ from ai_agentic_chatbot.agent.state import AgentState
 from ai_agentic_chatbot.infrastructure.llm import get_llm
 from ai_agentic_chatbot.infrastructure.llm.types import LLMProvider, ModelType
 from ai_agentic_chatbot.agent.subgraphs.sql_query.graph import sql_subgraph
+from ai_agentic_chatbot.agent.nodes.visualizer import visualizer_node
 
 fast_llm = get_llm(provider=LLMProvider.AZURE_OPENAI, model=ModelType.FAST)
 
@@ -86,10 +87,21 @@ def sql_query_node(state: AgentState) -> dict:
                 "next_step": "end",
             }
 
-        # Format success response
-        response = format_sql_response(subgraph_result)
+        # Add visualization analysis to the state
+        state.update(subgraph_result)
 
-        return {"messages": [AIMessage(content=response)], "next_step": "end"}
+        # Generate visualization configuration
+        viz_result = visualizer_node(state)
+
+        # Create structured response data
+        visualization = viz_result.get("visualization", {})
+        content = _generate_brief_content(visualization)
+
+        return {
+            "messages": [AIMessage(content=content)],
+            "visualization": visualization,
+            "next_step": "end",
+        }
 
     except Exception as e:
         logger.error(f"SQL subgraph failed: {e}", exc_info=True)
@@ -101,13 +113,52 @@ def sql_query_node(state: AgentState) -> dict:
         }
 
 
-def format_sql_response(subgraph_result: dict) -> str:
-    """Format the final user-facing response."""
-    sql = subgraph_result.get("generated_sql", "")
+def create_clean_json_response(subgraph_result: dict, viz_result: dict) -> str:
+    """Create a clean JSON response for frontend consumption."""
+    import json
+
+    visualization = viz_result.get("visualization", {})
+
+    # Create clean response structure
+    response_data = {
+        "content": _generate_brief_content(visualization),
+        "visualization": visualization,
+    }
+
+    return json.dumps(response_data, indent=2)
+
+
+def _generate_brief_content(visualization: dict) -> str:
+    """Generate brief, contextual content based on visualization type."""
+    viz_type = visualization.get("type", "")
+    title = visualization.get("title", "")
+
+    if viz_type == "kpi":
+        return f"Here's the {title.lower()}:"
+    elif viz_type == "bar_chart":
+        return f"Here's the {title.lower()} comparison:"
+    elif viz_type == "line_chart":
+        return f"Here's the {title.lower()} trend:"
+    elif viz_type == "pie_chart":
+        return f"Here's the {title.lower()} distribution:"
+    elif viz_type == "table":
+        return f"Here are the query results:"
+    else:
+        return "Here's your data:"
+
+
+def format_sql_response_with_visualization(
+    subgraph_result: dict, viz_result: dict
+) -> str:
+    """Format the SQL query results with visualization data for frontend consumption."""
+    import json
+
     explanation = subgraph_result.get("explanation", "")
-    data = subgraph_result.get("query_result", [])
+    sql = subgraph_result.get("generated_sql", "")
     tables = subgraph_result.get("tables_used", [])
+    data = subgraph_result.get("query_result", [])
     execution_time = subgraph_result.get("execution_time", 0)
+    visualization = viz_result.get("visualization", {})
 
     # Format SQL with basic formatting (fallback if sqlparse not available)
     try:
@@ -115,9 +166,9 @@ def format_sql_response(subgraph_result: dict) -> str:
 
         formatted_sql = sqlparse.format(sql, reindent=True, keyword_case="upper")
     except ImportError:
-        # Fallback formatting
         formatted_sql = sql
 
+    # Create human-readable response
     response = f"""{explanation}
 
 **Tables Used:** {', '.join(tables)}
@@ -132,12 +183,216 @@ def format_sql_response(subgraph_result: dict) -> str:
     if execution_time > 0:
         response += f" (executed in {execution_time:.2f}s)"
 
-    if data:
+    # Add visualization insights
+    if visualization.get("summary"):
+        response += f"\n\n**Key Insights:** {visualization['summary']}"
+
+    # Add visualization type recommendation
+    if visualization.get("type"):
+        viz_type = visualization["type"].replace("_", " ").title()
+        response += f"\n\n**Recommended Visualization:** {viz_type}"
+
+    # Add formatted table for readability (limited rows)
+    if data and visualization.get("type") != "kpi":
         response += "\n\n" + format_as_markdown_table(data[:10])
         if len(data) > 10:
             response += f"\n\n_Showing 10 of {len(data)} rows_"
+    elif visualization.get("type") == "kpi" and visualization.get("config", {}).get(
+        "value"
+    ):
+        # For KPI, show the formatted value prominently
+        kpi_value = visualization["config"]["value"]
+        response += f"\n\n**{visualization.get('title', 'Result')}:** {kpi_value}"
+
+    # Embed structured data for frontend (as JSON comment)
+    frontend_data = {
+        "type": "sql_result",
+        "explanation": explanation,
+        "tables_used": tables,
+        "sql_query": formatted_sql,
+        "execution_time": execution_time,
+        "row_count": len(data),
+        "visualization": visualization,
+    }
+
+    response += f"\n\n<!-- FRONTEND_DATA: {json.dumps(frontend_data)} -->"
 
     return response
+
+
+def format_sql_response(subgraph_result: dict) -> str:
+    """Format the SQL query results for user display with enhanced frontend support."""
+    import json
+
+    explanation = subgraph_result.get("explanation", "")
+    sql = subgraph_result.get("generated_sql", "")
+    tables = subgraph_result.get("tables_used", [])
+    data = subgraph_result.get("query_result", [])
+    execution_time = subgraph_result.get("execution_time", 0)
+
+    # Format SQL with basic formatting (fallback if sqlparse not available)
+    try:
+        import sqlparse
+
+        formatted_sql = sqlparse.format(sql, reindent=True, keyword_case="upper")
+    except ImportError:
+        formatted_sql = sql
+
+    # Analyze data for visualization suggestions and formatting
+    viz_suggestions = _analyze_for_visualizations(data, sql)
+    formatted_data = _format_data_values(data)
+
+    # Create structured response for frontend
+    structured_response = {
+        "type": "sql_result",
+        "explanation": explanation,
+        "tables_used": tables,
+        "sql_query": formatted_sql,
+        "execution_time": execution_time,
+        "row_count": len(data),
+        "data": formatted_data[:100],  # Limit to 100 rows for performance
+        "has_more_data": len(data) > 100,
+        "visualization_suggestions": viz_suggestions,
+        "summary": _generate_data_summary(formatted_data, sql),
+    }
+
+    # Create human-readable response with embedded JSON for frontend
+    response = f"""{explanation}
+
+**Tables Used:** {', '.join(tables)}
+
+**SQL Query:**
+```sql
+{formatted_sql}
+```
+
+**Results:** {len(data)} rows"""
+
+    if execution_time > 0:
+        response += f" (executed in {execution_time:.2f}s)"
+
+    # Add summary insights
+    if structured_response["summary"]:
+        response += f"\n\n**Key Insights:**\n{structured_response['summary']}"
+
+    # Add visualization suggestions
+    if viz_suggestions:
+        response += f"\n\n**Recommended Visualizations:** {', '.join(viz_suggestions)}"
+
+    # Add table data (limited for readability)
+    if data:
+        response += "\n\n" + format_as_markdown_table(formatted_data[:10])
+        if len(data) > 10:
+            response += f"\n\n_Showing 10 of {len(data)} rows_"
+
+    # Embed structured data for frontend (hidden in HTML comment)
+    response += f"\n\n<!-- FRONTEND_DATA: {json.dumps(structured_response)} -->"
+
+    return response
+
+
+def _analyze_for_visualizations(data: list, sql: str) -> list:
+    """Analyze data and query to suggest appropriate visualizations."""
+    if not data:
+        return []
+
+    suggestions = []
+    sql_lower = sql.lower()
+
+    # Check if it's aggregated data (good for charts)
+    if any(
+        keyword in sql_lower
+        for keyword in ["sum(", "count(", "avg(", "max(", "min(", "group by"]
+    ):
+        suggestions.append("Bar Chart")
+        suggestions.append("Pie Chart")
+
+    # Check for time series data
+    if any(
+        keyword in sql_lower for keyword in ["date", "time", "year", "month", "day"]
+    ):
+        suggestions.append("Line Chart")
+        suggestions.append("Time Series")
+
+    # Check for numerical data
+    headers = list(data[0].keys()) if data else []
+    numeric_cols = []
+    for header in headers:
+        if data and isinstance(data[0].get(header), (int, float)):
+            numeric_cols.append(header)
+
+    if len(numeric_cols) >= 2:
+        suggestions.append("Scatter Plot")
+
+    # Always suggest table for detailed view
+    suggestions.append("Data Table")
+
+    return list(set(suggestions))  # Remove duplicates
+
+
+def _format_data_values(data: list) -> list:
+    """Format data values for better display (currency, percentages, etc.)."""
+    if not data:
+        return data
+
+    formatted_data = []
+    for row in data:
+        formatted_row = {}
+        for key, value in row.items():
+            if isinstance(value, float):
+                # Check if it looks like currency (large numbers)
+                if value > 1000 and any(
+                    keyword in key.lower()
+                    for keyword in [
+                        "sales",
+                        "revenue",
+                        "amount",
+                        "price",
+                        "cost",
+                        "total",
+                    ]
+                ):
+                    formatted_row[key] = f"${value:,.2f}"
+                # Check if it looks like a percentage
+                elif 0 <= value <= 1 and any(
+                    keyword in key.lower() for keyword in ["rate", "percent", "ratio"]
+                ):
+                    formatted_row[key] = f"{value:.2%}"
+                else:
+                    formatted_row[key] = round(value, 2)
+            else:
+                formatted_row[key] = value
+        formatted_data.append(formatted_row)
+
+    return formatted_data
+
+
+def _generate_data_summary(data: list, sql: str) -> str:
+    """Generate a summary of the data insights."""
+    if not data:
+        return "No data returned from query."
+
+    summary_parts = []
+
+    # Basic stats
+    row_count = len(data)
+    if row_count == 1:
+        summary_parts.append("Single result returned")
+    else:
+        summary_parts.append(f"{row_count} records found")
+
+    # Analyze first row for insights
+    if data:
+        first_row = data[0]
+        for key, value in first_row.items():
+            if isinstance(value, (int, float)) and value != 0:
+                if "total" in key.lower():
+                    if isinstance(value, str) and value.startswith("$"):
+                        summary_parts.append(f"Total value: {value}")
+                    elif isinstance(value, (int, float)):
+                        summary_parts.append(f"Total {key.lower()}: {value:,.2f}")
+
+    return " • ".join(summary_parts) if summary_parts else ""
 
 
 def format_as_markdown_table(data: list) -> str:
