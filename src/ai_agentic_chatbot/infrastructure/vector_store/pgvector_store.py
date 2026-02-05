@@ -16,9 +16,7 @@ class PgVectorSchemaStore:
 
     def __init__(
             self,
-            connection_string: str,
-            collection_name: str = "db_schema_vectors",
-            embedding_model: str = "text-embedding-3-small",
+            collection_name: str,
     ):
         # self._embedding = OpenAIEmbeddings(model=embedding_model)
         # self._embedding = get_embedding(provider=LLMProvider.AZURE_OPENAI,model=ModelType.EMBEDDING)

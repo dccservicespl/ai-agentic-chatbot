@@ -5,6 +5,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, Depends, HTTPException
 from langchain_core.messages import AIMessage
 from langchain_core.messages import HumanMessage
+from langchain_postgres import PGVector
 from sqlalchemy import text, Engine
 from sqlalchemy.orm import Session
 from starlette.responses import StreamingResponse
@@ -17,6 +18,8 @@ from ai_agentic_chatbot.infrastructure.datasource.datasource_init import (
 )
 from ai_agentic_chatbot.infrastructure.datasource.factory import get_datasource_factory, get_engine
 from ai_agentic_chatbot.infrastructure.db_depency import get_db_session
+from ai_agentic_chatbot.infrastructure.embedding.embedding_connection import get_azure_openai_embedding
+from ai_agentic_chatbot.infrastructure.vector_store.retriever import Retriever
 from ai_agentic_chatbot.logging_config import setup_logging, get_logger
 from ai_agentic_chatbot.schema_extractor.SaveSchemaJson import save_schema_temp_file
 from ai_agentic_chatbot.schema_extractor.SchemaExtractionConfig import (
@@ -25,6 +28,7 @@ from ai_agentic_chatbot.schema_extractor.SchemaExtractionConfig import (
 from ai_agentic_chatbot.schema_extractor.SchemaExtractor import SchemaExtractor
 from ai_agentic_chatbot.application.transform_schema_to_text import transform_schema_to_text
 from ai_agentic_chatbot.utils.utils import get_db_connection_string
+import os
 
 load_dotenv()
 
@@ -115,8 +119,35 @@ def schema_text():
     try:
         ingest_schema(
             schema_path=SCHEMA_TO_TEXT_PATH,
-            pg_conn_str=get_db_connection_string(),
         )
+        return {"Schema to text conversion completed"}
+    except Exception as exc:
+        raise exc
+
+
+@app.get("/retriever")
+def retriever():
+    try:
+        _engine = get_engine("postgresql.primary")
+        _embedding = get_azure_openai_embedding()
+        collection_name = os.getenv("VECTOR_COLLECTION_NAME"),
+
+        _vectorstore = PGVector(
+            connection=_engine,
+            collection_name=os.getenv("VECTOR_COLLECTION_NAME"),
+            embeddings=_embedding,
+        )
+        retriever = Retriever(vector_store=_vectorstore)
+
+        docs = retriever.retrieve(
+            context="Find total order value per customer last month",
+            collection_name=collection_name,
+            # metadata_filter={"db_name": "sales"},
+        )
+
+        for d in docs:
+            print(d.metadata, d.page_content)
+
         return {"Schema to text conversion completed"}
     except Exception as exc:
         raise exc
