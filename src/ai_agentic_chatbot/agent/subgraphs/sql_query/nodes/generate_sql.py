@@ -12,6 +12,7 @@ logger = get_logger(__name__)
 
 class SQLGeneration(BaseModel):
     """Structured LLM output for SQL generation."""
+
     query: str = Field(description="Generated SQL query")
     explanation: str = Field(description="Plain English explanation")
     confidence: float = Field(ge=0.0, le=1.0, description="Confidence score")
@@ -21,63 +22,57 @@ class SQLGeneration(BaseModel):
 
 def generate_sql_node(state: dict) -> dict:
     """
-    Node 2: Generate SQL query from retrieved schemas.
-    Single responsibility: LLM-based SQL generation.
+    Generate SQL query from retrieved schemas.
     """
     logger.info("[Generate SQL] Creating query")
-    
+
     retrieved_tables = state.get("retrieved_tables", [])
-    
-    # Check if we have schemas
+
     if not retrieved_tables:
-        return {
-            "validation_errors": ["Cannot generate SQL without table schemas"]
-        }
-    
-    # Format schemas for prompt
-    schema_text = "\n\n".join([
-        f"-- Table: {name} (Relevance: {score:.2f})\n{ddl}"
-        for name, ddl, score in retrieved_tables
-    ])
-    
+        return {"validation_errors": ["Cannot generate SQL without table schemas"]}
+
+    schema_text = "\n\n".join(
+        [
+            f"-- Table: {name} (Relevance: {score:.2f})\n{ddl}"
+            for name, ddl, score in retrieved_tables
+        ]
+    )
+
     user_query = state["user_query"]
-    
-    # Check if this is a retry attempt
+
     previous_error = state.get("execution_error")
     generation_attempts = state.get("generation_attempts", 0)
-    
+
     try:
-        # Get LLM with structured output
         llm = get_llm(LLMProvider.AZURE_OPENAI, ModelType.SMART)
         structured_llm = llm.with_structured_output(SQLGeneration, strict=True)
-        
-        # Create generation prompt
+
         prompt_content = _create_generation_prompt(
             schema_text=schema_text,
             user_query=user_query,
             previous_error=previous_error,
-            generation_attempts=generation_attempts
+            generation_attempts=generation_attempts,
         )
-        
+
         prompt = SystemMessage(content=prompt_content)
         result: SQLGeneration = structured_llm.invoke([prompt])
-        
-        logger.info(f"Generated SQL: {result.query[:100]}...")
+
+        logger.info(f"Generated SQL: {result.query}")
         logger.info(f"Confidence: {result.confidence}")
-        
+
         return {
             "generated_sql": result.query,
             "explanation": result.explanation,
             "confidence": result.confidence,
             "tables_used": result.tables_used,
-            "generation_attempts": generation_attempts + 1
+            "generation_attempts": generation_attempts + 1,
         }
-        
+
     except Exception as e:
         logger.error(f"SQL generation failed: {e}", exc_info=True)
         return {
             "validation_errors": [f"Generation error: {str(e)}"],
-            "generation_attempts": generation_attempts + 1
+            "generation_attempts": generation_attempts + 1,
         }
 
 
@@ -85,11 +80,11 @@ def _create_generation_prompt(
     schema_text: str,
     user_query: str,
     previous_error: Optional[str] = None,
-    generation_attempts: int = 0
+    generation_attempts: int = 0,
 ) -> str:
     """Create the SQL generation prompt."""
-    
-    base_prompt = f"""You are an expert SQL query generator. Generate a SQL query based on the user's request and the provided database schema.
+
+    base_prompt = f"""You are an expert SQL query generator (For a chatbot with more than one capability of representing the data to the user). Generate a SQL query based on the user's request and the provided database schema.
 
 DATABASE SCHEMA:
 {schema_text}
@@ -102,8 +97,9 @@ REQUIREMENTS:
 2. Use proper JOIN syntax when combining tables
 3. Include appropriate WHERE clauses for filtering
 4. Use GROUP BY and aggregate functions when needed
-5. Limit results to a reasonable number (max 1000 rows)
-6. Use PostgreSQL syntax and functions
+5. Limit results to a reasonable number (max 10 rows)
+6. Limit number of columns to a reasonable number for better visibility of the user.
+6. Use MySQL syntax and functions
 7. Be precise with column names and table references
 8. Handle NULL values appropriately
 

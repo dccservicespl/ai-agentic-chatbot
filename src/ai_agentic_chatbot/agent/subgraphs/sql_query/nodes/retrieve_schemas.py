@@ -38,11 +38,9 @@ def retrieve_schemas_node(state: dict, config: RunnableConfig) -> dict:
                 "validation_errors": ["No relevant tables found for query"],
             }
 
-        # Log retrieval results
         for table_name, _, score in retrieved:
             logger.info(f"  Retrieved: {table_name} (score: {score:.3f})")
 
-        # Optionally expand with foreign key related tables
         expanded = _expand_related_tables(table_docs, retrieved)
         if len(expanded) > len(retrieved):
             logger.info(f"Expanded to {len(expanded)} tables (including related)")
@@ -50,7 +48,7 @@ def retrieve_schemas_node(state: dict, config: RunnableConfig) -> dict:
 
         return {
             "retrieved_tables": retrieved,
-            "is_safe": True,  # Schema retrieval is always safe
+            "is_safe": True,
         }
 
     except Exception as e:
@@ -59,6 +57,27 @@ def retrieve_schemas_node(state: dict, config: RunnableConfig) -> dict:
             "retrieved_tables": [],
             "validation_errors": [f"Schema retrieval error: {str(e)}"],
         }
+
+
+# def _semantic_search(
+#     query: str,
+#     table_docs: List[Dict[str, Any]],
+#     router_hints: List[str],
+#     k: int = 5,
+#     score_threshold: float = 0.3,
+# ) -> List[Tuple[str, str, float]]:
+#     """Enhanced semantic search with intelligent query boosting
+
+#     Args:
+#         query (str): user query
+#         table_docs (List[Dict[str, Any]]): list of table documents
+#         router_hints (List[str]): list of router hints
+#         k (int, optional): number of tables to return. Defaults to 5.
+#         score_threshold (float, optional): minimum similarity score. Defaults to 0.3.
+
+#     Returns:
+#         List[Tuple[str, str, float]]: list of (table_name, table_description, similarity_score)
+#     """
 
 
 def _semantic_search(
