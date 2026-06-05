@@ -17,8 +17,8 @@ import os
 BASE_DIR = Path(__file__).resolve().parent.parent
 SCHEMA_TO_TEXT_PROMPT_PATH = BASE_DIR / "prompts" / "schema_to_text_prompts.md"
 USER_SCHEMA_TO_TEXT_PROMPT_PATH = BASE_DIR / "prompts" / "user_schema_to_text_prompt.md"
-DB_SCHEMA_JSON_PATH = BASE_DIR / "temp" / "db_schema.json"
-YAML_OUT_PATH = BASE_DIR / "temp"
+DB_SCHEMA_JSON_PATH = Path(__file__).resolve().parent.parent.parent.parent / "temp" / "db_schema.json"
+YAML_OUT_PATH = Path(__file__).resolve().parent.parent.parent.parent / "temp"
 
 
 def transform_schema_to_text() -> None:

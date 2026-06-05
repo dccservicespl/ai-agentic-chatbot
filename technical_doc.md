@@ -11,17 +11,19 @@
 3. [Repository Structure](#3-repository-structure)
 4. [Configuration & Environment](#4-configuration--environment)
 5. [Application Startup Sequence](#5-application-startup-sequence)
-6. [API Reference](#6-api-reference)
-7. [Agent Workflow — Main Graph](#7-agent-workflow--main-graph)
-8. [SQL Subgraph — Deep Dive](#8-sql-subgraph--deep-dive)
-9. [Infrastructure Layer](#9-infrastructure-layer)
-10. [Schema Intelligence](#10-schema-intelligence)
-11. [Visualization Engine](#11-visualization-engine)
-12. [Logging System](#12-logging-system)
-13. [Data Models Reference](#13-data-models-reference)
-14. [End-to-End Request Flow](#14-end-to-end-request-flow)
-15. [Dependencies](#15-dependencies)
-16. [Testing](#16-testing)
+6. [Running the Application](#6-running-the-application)
+7. [API Reference](#7-api-reference)
+8. [Agent Workflow — Main Graph](#8-agent-workflow--main-graph)
+9. [SQL Subgraph — Deep Dive](#9-sql-subgraph--deep-dive)
+10. [Infrastructure Layer](#10-infrastructure-layer)
+11. [Schema Intelligence](#11-schema-intelligence)
+12. [Visualization Engine](#12-visualization-engine)
+13. [Logging System](#13-logging-system)
+14. [Data Models Reference](#14-data-models-reference)
+15. [End-to-End Request Flow](#15-end-to-end-request-flow)
+16. [Dependencies](#16-dependencies)
+17. [Testing](#17-testing)
+18. [Change Log](#18-change-log)
 
 ---
 
@@ -284,7 +286,51 @@ logging:
 
 ---
 
-## 6. 🔌 API Reference
+## 6. ▶️ Running the Application
+
+### Prerequisites
+
+- Python `>=3.13`
+- [Poetry](https://python-poetry.org/) package manager
+- Network access to `postgres-chatbot-db.postgres.database.azure.com` (Azure PostgreSQL)
+
+### Install Dependencies
+
+```bash
+poetry install
+```
+
+> The `.venv` folder is created automatically inside the project directory.
+
+### Start the Server
+
+```bash
+poetry run uvicorn ai_agentic_chatbot.server:app --host 0.0.0.0 --port 8000 --reload
+```
+
+Or, if the virtualenv is already activated:
+
+```bash
+uvicorn ai_agentic_chatbot.server:app --host 0.0.0.0 --port 8000 --reload
+```
+
+### Access the Application
+
+| URL | Description |
+|---|---|
+| `http://localhost:8000/docs` | Swagger UI — interactive API explorer |
+| `http://localhost:8000/health` | Basic liveness check |
+| `http://localhost:8000/db-health` | Database connectivity check |
+
+### Notes
+
+- Database credentials are configured in `config.yaml` — no `.env` file is required unless you need to override values via environment variables.
+- The app connects to Azure PostgreSQL on startup. Ensure your machine has outbound access to port `5432` on the Azure host.
+- Use `--reload` during development only; omit it in production.
+
+---
+
+## 7. 🔌 API Reference
 
 ### `GET /health`
 > Basic server health probe.
@@ -356,7 +402,7 @@ logging:
 
 ---
 
-## 7. 🧠 Agent Workflow — Main Graph
+## 8. 🧠 Agent Workflow — Main Graph
 
 **File:** `src/ai_agentic_chatbot/agent/graph.py`
 
@@ -432,7 +478,7 @@ START
 
 ---
 
-## 8. 🗄️ SQL Subgraph — Deep Dive
+## 9. 🗄️ SQL Subgraph — Deep Dive
 
 **File:** `src/ai_agentic_chatbot/agent/subgraphs/sql_query/graph.py`
 
@@ -547,43 +593,209 @@ Performs two categories of validation:
 
 ---
 
-## 9. 🏭 Infrastructure Layer
+## 10. 🏭 Infrastructure Layer
 
-### 9.1 ⚡ LLM Factory
+### 9.1 ⚡ LLM Infrastructure — Technical Deep Dive
 
-**Files:** `infrastructure/llm/`
+**Package:** `src/ai_agentic_chatbot/infrastructure/llm/`
 
-```
-Settings (singleton)
-    · Loads config.yaml → LLMSettings
-    · Reads PROVIDER_CONFIG_REGISTRY
-    · Applies env var overrides
-         │
-         ▼
-LLMFactory (singleton)
-    · Lazy-creates LangChain clients on first use
-    · Caches by model key (provider.type)
-    · Supports: AzureChatOpenAI, ChatOpenAI, ChatAnthropic, BedrockChat
-    · For embeddings: AzureOpenAIEmbeddings, OpenAIEmbeddings
-```
+#### Package Structure
 
-**Supported Providers:**
-
-| Enum Value | LangChain Class |
+| File | Responsibility |
 |---|---|
-| `AZURE_OPENAI` | `AzureChatOpenAI` |
-| `OPENAI` | `ChatOpenAI` |
-| `ANTHROPIC` | `ChatAnthropic` |
-| `AWS_BEDROCK` | `BedrockChat` |
+| `types.py` | `LLMProvider` and `ModelType` enums; `PROVIDER_CONFIG_REGISTRY` dict |
+| `config.py` | Pydantic config models per provider; registers into `PROVIDER_CONFIG_REGISTRY` |
+| `settings.py` | `Settings` / `LLMSettings` — loads `config.yaml`, applies env overrides, singleton |
+| `factory.py` | `LLMFactory` — thread-safe singleton; lazy-creates and caches LangChain clients |
+| `llm.py` | Module-level convenience functions: `get_llm()`, `get_embedding()` |
 
-**Usage in nodes:**
+---
+
+#### Types (`types.py`)
+
 ```python
-from infrastructure.llm import get_llm, get_embedding
+class LLMProvider(Enum):
+    AZURE_OPENAI = "azure_openai"
+    OPENAI       = "openai"
+    ANTHROPIC    = "anthropic"
+    AWS_BEDROCK  = "aws_bedrock"
 
-llm = get_llm(ModelType.FAST)     # RouterNode
-llm = get_llm(ModelType.SMART)    # SQL generation
-emb = get_embedding()              # Schema vectorization
+class ModelType(Enum):
+    FAST      = "fast"       # Low-latency model — routing, cheap tasks
+    SMART     = "smart"      # High-capability model — SQL generation
+    EMBEDDING = "embedding"  # Embedding model — schema vectorisation
+    VISION    = "vision"     # Vision-capable model (reserved)
 ```
+
+`PROVIDER_CONFIG_REGISTRY` is a `Dict[LLMProvider, Type]` that maps each provider to its Pydantic config class. Entries are added by `config.py` at import time (open/closed principle — new providers register themselves).
+
+---
+
+#### Config Models (`config.py`)
+
+All config classes inherit from `BaseLLMConfig` (Pydantic, `frozen=True`, `extra="forbid"`):
+
+```
+BaseLLMConfig (ABC)
+    · model_name: str
+    · timeout: int          (default 30s)
+    · max_retries: int      (default 3)
+    · get_client_kwargs() → Dict   ← abstract, returns LangChain init args
+         │
+         ├── AzureOpenAIConfig
+         │     · api_key, endpoint (validated URL), api_version
+         │     · temperature, max_tokens, top_p
+         │     · frequency_penalty, presence_penalty
+         │     · get_client_kwargs() → { azure_deployment, azure_endpoint, ... }
+         │
+         └── AzureOpenAIEmbeddingConfig  (separate — not a chat model)
+               · api_key, endpoint, api_version
+               · timeout, max_retries
+               · get_client_kwargs() → { azure_deployment, azure_endpoint, ... }
+```
+
+`config.py` registers `AzureOpenAIConfig` into `PROVIDER_CONFIG_REGISTRY` at module load. Adding a new provider means: add an enum value in `types.py`, create a config class in `config.py`, and register it — no changes needed elsewhere.
+
+---
+
+#### Settings (`settings.py`) — Configuration Load & Parse Flow
+
+```
+Settings.from_config_file(config_path?)
+         │
+         ├─ 1. Resolve path → project_root/config.yaml
+         ├─ 2. yaml.safe_load() → raw dict
+         └─ 3. _parse_config(config_data)
+                    │
+                    ├─ Read llm.default → default_model_key
+                    │   (strips provider prefix: "azure_openai.fast" → "fast")
+                    │
+                    └─ For each provider block in llm.*:
+                           │
+                           ├─ LLMProvider.from_string(provider_name)
+                           ├─ get_provider_config_class(provider)  ← PROVIDER_CONFIG_REGISTRY lookup
+                           │
+                           └─ For each model key (fast / smart / embedding):
+                                  │
+                                  ├─ _apply_env_overrides(model_data, provider)
+                                  │     Azure:   AZURE_OPENAI_API_KEY / ENDPOINT / API_VERSION
+                                  │     OpenAI:  OPENAI_API_KEY / OPENAI_ORGANIZATION
+                                  │     Anthropic: ANTHROPIC_API_KEY
+                                  │     Bedrock: AWS_ACCESS_KEY_ID / SECRET / TOKEN / REGION
+                                  │
+                                  ├─ config_class(**model_data)  → ProviderConfig (validated)
+                                  ├─ _determine_model_type(key)  → ModelType (matched by key substring)
+                                  └─ ModelConfiguration(provider, model_type, config)
+                                         stored in LLMSettings.models["fast" | "smart" | "embedding"]
+```
+
+The global singleton is held in a module-level `_settings` variable, exposed via `get_settings()`. Call `reload_settings()` to force a re-read from disk (e.g. after rotating API keys without restarting the process).
+
+**`ModelConfiguration`** is the internal unit passed to the factory:
+
+```python
+class ModelConfiguration(BaseModel):
+    provider:    LLMProvider    # Which provider this model belongs to
+    model_type:  ModelType      # FAST / SMART / EMBEDDING / VISION
+    config:      ProviderConfig # Frozen Pydantic config with all connection params
+```
+
+---
+
+#### Factory (`factory.py`) — Client Creation & Caching Flow
+
+`LLMFactory` is a **thread-safe double-checked locking singleton** (uses `threading.Lock`):
+
+```
+First call to LLMFactory()
+    └─ __new__: acquires _lock, sets _instance
+    └─ __init__: _clients = {}, _embeddings = {}, loads get_settings()
+
+get_llm(provider?, model?)
+    │
+    ├─ Resolve model_key:
+    │     provider=None, model=None  → settings.default_model ("fast")
+    │     model only                 → model.value  ("fast" | "smart")
+    │
+    ├─ Cache hit?  →  return _clients[model_key]   ← no LLM call, instant
+    │
+    └─ Cache miss:
+           settings.get_model_config(model_key) → ModelConfiguration
+           _create_client(model_config)
+               └─ provider == AZURE_OPENAI:
+                      AzureChatOpenAI(**config.get_client_kwargs())
+               └─ other providers: raises ValueError (extensible)
+           _clients[model_key] = client
+           return client
+
+get_embedding(provider?, model?)
+    │
+    ├─ model must be ModelType.EMBEDDING (enforced)
+    ├─ Cache key: "{provider}.embedding"
+    ├─ Cache hit?  →  return _embeddings[key]
+    └─ Cache miss:
+           _get_embedding_config(provider)
+               └─ settings.get_model_config("embedding") → AzureOpenAIEmbeddingConfig
+           _create_embedding_client(provider, config)
+               └─ AzureOpenAIEmbeddings(**config.get_client_kwargs())
+           _embeddings[key] = client
+           return client
+```
+
+**Cache behaviour:** LangChain client objects are expensive to construct (HTTP connection setup, SDK initialisation). The factory holds them for the process lifetime. `clear_cache()` discards all cached clients; `reload_settings()` calls `clear_cache()` then re-reads the config file.
+
+---
+
+#### Public API (`llm.py` / `factory.py`)
+
+```python
+from ai_agentic_chatbot.infrastructure.llm import get_llm, get_embedding
+from ai_agentic_chatbot.infrastructure.llm.types import ModelType
+
+# Router node — low-latency classification
+llm = get_llm(model=ModelType.FAST)
+
+# SQL generation node — highest-capability model
+llm = get_llm(model=ModelType.SMART)
+
+# Schema embedding / vector search
+emb = get_embedding()   # defaults to AZURE_OPENAI + EMBEDDING
+
+# Structured output (LangChain pattern used in SQL node)
+structured_llm = llm.with_structured_output(SQLGeneration)
+```
+
+---
+
+#### Provider Support Matrix
+
+| Provider Enum | LangChain Client | Chat | Embedding | Status |
+|---|---|---|---|---|
+| `AZURE_OPENAI` | `AzureChatOpenAI` / `AzureOpenAIEmbeddings` | ✅ | ✅ | **Active** |
+| `OPENAI` | `ChatOpenAI` | ✅ | — | Enum defined, factory raises `ValueError` (not yet wired) |
+| `ANTHROPIC` | `ChatAnthropic` | ✅ | — | Enum defined, factory raises `ValueError` |
+| `AWS_BEDROCK` | `BedrockChat` | ✅ | — | Enum defined, factory raises `ValueError` |
+
+> Only `AZURE_OPENAI` is fully wired end-to-end. The other providers have enum values and env-override logic in `settings.py` but `_create_client()` in the factory will raise `ValueError` until their LangChain instantiation is added.
+
+---
+
+#### Environment Variable Override Reference
+
+| Variable | Provider | Overrides |
+|---|---|---|
+| `AZURE_OPENAI_API_KEY` | Azure OpenAI | `config.yaml llm.azure_openai.*.api_key` |
+| `AZURE_OPENAI_ENDPOINT` | Azure OpenAI | `config.yaml llm.azure_openai.*.endpoint` |
+| `AZURE_OPENAI_API_VERSION` | Azure OpenAI | `config.yaml llm.azure_openai.*.api_version` |
+| `OPENAI_API_KEY` | OpenAI | `llm.openai.*.api_key` |
+| `OPENAI_ORGANIZATION` | OpenAI | `llm.openai.*.organization` |
+| `ANTHROPIC_API_KEY` | Anthropic | `llm.anthropic.*.api_key` |
+| `AWS_ACCESS_KEY_ID` | AWS Bedrock | `llm.aws_bedrock.*.aws_access_key_id` |
+| `AWS_SECRET_ACCESS_KEY` | AWS Bedrock | `llm.aws_bedrock.*.aws_secret_access_key` |
+| `AWS_SESSION_TOKEN` | AWS Bedrock | `llm.aws_bedrock.*.aws_session_token` |
+| `AWS_DEFAULT_REGION` | AWS Bedrock | `llm.aws_bedrock.*.region_name` |
+
+> Env vars always win over `config.yaml` values. The override is applied in `Settings._apply_env_overrides()` before Pydantic validation.
 
 ---
 
@@ -658,7 +870,7 @@ pgvector table in ai_chatbot_db
 
 ---
 
-## 10. 📐 Schema Intelligence
+## 11. 📐 Schema Intelligence
 
 The `schema_extractor` package is the foundation of the system's ability to understand and query a database. It handles three concerns: **live DB introspection**, **LLM-driven semantic enrichment**, and **runtime schema access** for the SQL agent.
 
@@ -856,7 +1068,7 @@ After setup, the SQL agent uses `SchemaLoader.get_table_docs_for_search()` at qu
 
 ---
 
-## 11. 📊 Visualization Engine
+## 12. 📊 Visualization Engine
 
 **File:** `agent/nodes/visualizer.py` — `VisualizationNode`
 
@@ -905,7 +1117,7 @@ The visualizer analyzes the `query_result` DataFrame and applies these rules in 
 
 ---
 
-## 12. 📋 Logging System
+## 13. 📋 Logging System
 
 **File:** `logging_config.py`
 
@@ -939,7 +1151,7 @@ logger.info("SQL generated", extra={"sql": generated_sql, "confidence": 0.95})
 
 ---
 
-## 13. 📦 Data Models Reference
+## 14. 📦 Data Models Reference
 
 ### Request / Response Models (`agent/schema.py`)
 
@@ -980,7 +1192,7 @@ class SQLGeneration(BaseModel):
 
 ---
 
-## 14. 🔄 End-to-End Request Flow
+## 15. 🔄 End-to-End Request Flow
 
 ### Example: *"Show me total sales by region for Q1 2024"*
 
@@ -1065,7 +1277,7 @@ class SQLGeneration(BaseModel):
 
 ---
 
-## 15. 📚 Dependencies
+## 16. 📚 Dependencies
 
 ### Core Runtime
 
@@ -1102,7 +1314,7 @@ class SQLGeneration(BaseModel):
 
 ---
 
-## 16. 🧪 Testing
+## 17. 🧪 Testing
 
 ### Test Files
 
@@ -1165,4 +1377,57 @@ poetry run pytest --cov=src/ai_agentic_chatbot
 
 ---
 
-*Generated: 2026-05-29 | Repository: `ai-agentic-chatbot` | Branch: `main`*
+---
+
+## 18. 📋 Change Log
+
+### v1.1.0 — Azure AI Foundry Model Migration (2026-06-05)
+
+**Context:** The LLM backend is switching from Azure OpenAI Service (GPT-4o-mini / GPT-4o) to Azure AI Foundry serverless deployments (DeepSeek-V4-Flash / Llama-3.3-70B-Instruct). These models are hosted on a different endpoint type (`*.services.ai.azure.com/openai/v1/`) that requires `ChatOpenAI` (OpenAI-compatible client) rather than `AzureChatOpenAI`, and does not use `api_version`.
+
+#### Root Cause
+
+| Issue | Detail |
+|---|---|
+| Wrong LangChain client | `AzureChatOpenAI` is for Azure OpenAI Service; Azure AI Foundry serverless needs `ChatOpenAI` with `base_url` |
+| `azure_deployment` vs `model` | `AzureChatOpenAI` uses `azure_deployment`; `ChatOpenAI` uses `model` parameter |
+| Empty `api_version` | Azure AI Foundry endpoints have no API version; current config has `api_version: ""` which is invalid for `AzureChatOpenAI` |
+| `strict=True` incompatibility | `strict=True` in `.with_structured_output()` is an OpenAI-only JSON schema enforcement flag; DeepSeek and Llama do not support it and will return API errors |
+
+#### Pending Implementation Steps
+
+| # | File | Change Required |
+|---|---|---|
+| 1 | `infrastructure/llm/types.py` | Add `AZURE_AI_FOUNDRY = "azure_ai_foundry"` to `LLMProvider` enum |
+| 2 | `infrastructure/llm/config.py` | Add `AzureAIFoundryConfig` class whose `get_client_kwargs()` returns `ChatOpenAI`-compatible kwargs (`base_url`, `model`, `api_key`); register in `PROVIDER_CONFIG_REGISTRY`; update `ProviderConfig` Union |
+| 3 | `infrastructure/llm/factory.py` | Add `_create_azure_ai_foundry_client()` using `ChatOpenAI(**config.get_client_kwargs())`; add branch in `_create_client()` for `LLMProvider.AZURE_AI_FOUNDRY` |
+| 4 | `infrastructure/llm/settings.py` | Add `elif provider == LLMProvider.AZURE_AI_FOUNDRY:` block in `_apply_env_overrides()` mapping `AZURE_AI_FOUNDRY_API_KEY` and `AZURE_AI_FOUNDRY_ENDPOINT` |
+| 5 | `config.yaml` | Move `fast:` and `smart:` model entries from `azure_openai:` to a new `azure_ai_foundry:` key; update `llm.default` to `azure_ai_foundry.fast`; remove `api_version: ""`; keep `embedding:` under `azure_openai:` (still uses real Azure OpenAI endpoint) |
+| 6 | `application/transform_schema_to_text.py:38`<br>`agent/router.py:69`<br>`agent/subgraphs/sql_query/nodes/generate_sql.py:48` | Remove `strict=True` from all three `.with_structured_output()` calls |
+
+#### Model Change Summary
+
+| Role | Previous Model | New Model | Provider Type |
+|---|---|---|---|
+| Fast (routing) | `gpt-4o-mini` via Azure OpenAI | `DeepSeek-V4-Flash` via Azure AI Foundry | `AZURE_AI_FOUNDRY` |
+| Smart (SQL gen) | `gpt-4o` via Azure OpenAI | `Llama-3.3-70B-Instruct` via Azure AI Foundry | `AZURE_AI_FOUNDRY` |
+| Embedding | `text-embedding-3-small` via Azure OpenAI | No change | `AZURE_OPENAI` |
+
+#### Architecture Diagram Update (after migration)
+
+```
+┌───────────────────────────────────────────────────────────────┐
+│   Azure AI Foundry Serverless (LLM)                           │
+│   Endpoint: dccglobal-ai-services.services.ai.azure.com       │
+│   · FAST:  DeepSeek-V4-Flash    (routing, cheap tasks)        │
+│   · SMART: Llama-3.3-70B-Instruct (SQL generation)            │
+└───────────────────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────────────┐
+│   Azure OpenAI Service (Embedding — unchanged)                │
+│   · Embedding: text-embedding-3-small                         │
+└───────────────────────────────────────────────────────────────┘
+```
+
+---
+
+*Generated: 2026-05-29 | Updated: 2026-06-05 | Repository: `ai-agentic-chatbot` | Branch: `develop`*

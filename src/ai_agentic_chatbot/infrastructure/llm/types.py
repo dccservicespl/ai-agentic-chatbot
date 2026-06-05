@@ -6,6 +6,7 @@ class LLMProvider(Enum):
     """Supported LLM providers with extensibility."""
 
     AZURE_OPENAI = "azure_openai"
+    AZURE_AI_FOUNDRY = "azure_ai_foundry"
     OPENAI = "openai"
     ANTHROPIC = "anthropic"
     AWS_BEDROCK = "aws_bedrock"

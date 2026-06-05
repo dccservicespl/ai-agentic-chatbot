@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, Depends, HTTPException
 from langchain_core.messages import AIMessage
 from langchain_core.messages import HumanMessage
-from sqlalchemy import text, Engine
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 from starlette.responses import StreamingResponse
 
@@ -74,15 +74,30 @@ app = FastAPI(
 )
 
 
-@app.get("/health", tags=["Health"])
+@app.get(
+    "/health",
+    tags=["Health"],
+    summary="Liveness check",
+    description="Returns `UP` if the server process is running. Use this as a basic liveness probe.",
+    responses={200: {"description": "Server is running"}},
+)
 def health_check():
     return {"status": "UP"}
 
 
-@app.get("/db-health", tags=["Health"])
+@app.get(
+    "/db-health",
+    tags=["Health"],
+    summary="Database connectivity check",
+    description="Executes a lightweight `SELECT 1` against the PostgreSQL datasource. "
+                "Returns `UP` on success or HTTP 503 with the error detail if the database is unreachable.",
+    responses={
+        200: {"description": "Database is reachable"},
+        503: {"description": "Database unreachable — connection or query failed"},
+    },
+)
 def db_health(db: Session = Depends(get_db_session)):
     try:
-        db["mysql"].execute(text("SELECT 1"))
         db["postgresql"].execute(text("SELECT 1"))
         return {"databases": "UP"}
     except Exception as exc:
@@ -92,9 +107,25 @@ def db_health(db: Session = Depends(get_db_session)):
 graph = build_graph()
 
 
-@app.get("/schemaJson", tags=["SchemaExtractor"])
-def schema_json(db_engine: Engine = Depends(get_engine)):
+@app.get(
+    "/schemaJson",
+    tags=["SchemaExtractor"],
+    summary="Extract database schema to JSON",
+    description=(
+        "Introspects the PostgreSQL database using SQLAlchemy and extracts the structural schema "
+        "(tables, columns, primary keys, foreign keys) for the configured table whitelist: "
+        "`orders`, `customer`, `sales`, `product`, `inventory`. "
+        "The result is serialised to `temp/db_schema.json` and the file path is returned. "
+        "\n\n**Run this as Step 1 of the schema setup pipeline** before calling `/schemaText` or `/ingest`."
+    ),
+    responses={
+        200: {"description": "Schema extracted successfully — returns path to the JSON file"},
+        503: {"description": "Extraction failed — database unreachable or introspection error"},
+    },
+)
+def schema_json():
     try:
+        db_engine = get_engine("postgresql.primary")
         config = SchemaExtractionConfig(
             include_tables=["orders", "customer", "sales", "product", "inventory"]
         )
@@ -108,7 +139,21 @@ def schema_json(db_engine: Engine = Depends(get_engine)):
         raise HTTPException(status_code=503, detail=str(exc))
 
 
-@app.get("/schemaText", tags=["SchemaExtractor"])
+@app.get(
+    "/schemaText",
+    tags=["SchemaExtractor"],
+    summary="Convert schema JSON to LLM-enriched documentation",
+    description=(
+        "Reads the schema JSON produced by `/schemaJson` and sends each table to the LLM, "
+        "which generates a human-readable `TableSchemaDocumentation` (business purpose, key fields, "
+        "relationships, example questions). The output is saved as `schema_documentation.yaml`. "
+        "\n\n**Run this as Step 2 of the schema setup pipeline** after `/schemaJson` and before `/ingest`."
+    ),
+    responses={
+        200: {"description": "Schema converted to text documentation successfully"},
+        503: {"description": "Conversion failed — missing schema JSON or LLM error"},
+    },
+)
 def schema_text():
     try:
         transform_schema_to_text()
@@ -118,8 +163,23 @@ def schema_text():
         raise HTTPException(status_code=503, detail=str(exc))
 
 
-@app.get("/ingest")
-def schema_text():
+@app.get(
+    "/ingest",
+    tags=["SchemaExtractor"],
+    summary="Ingest schema into vector store",
+    description=(
+        "Reads the LLM-generated schema documentation (`schema_documentation.yaml`), chunks it per table, "
+        "embeds each chunk using Azure OpenAI embeddings, and upserts the vectors into the pgvector store in PostgreSQL. "
+        "After this step the SQL agent can perform semantic table discovery at query time. "
+        "\n\n**Run this as Step 3 of the schema setup pipeline** after `/schemaText`. "
+        "Re-run whenever the database schema changes."
+    ),
+    responses={
+        200: {"description": "Schema ingested into pgvector successfully"},
+        500: {"description": "Ingestion failed — embedding or database error"},
+    },
+)
+def ingest_schema_endpoint():
     try:
         ingest_schema(
             schema_path=SCHEMA_TO_TEXT_PATH,
@@ -130,7 +190,25 @@ def schema_text():
         raise exc
 
 
-@app.post("/stream")
+@app.post(
+    "/stream",
+    tags=["Chat"],
+    summary="Stream agent response via SSE",
+    description=(
+        "Main chat endpoint. Accepts a user message and a session `thread_id`, runs the full "
+        "LangGraph agent workflow (intent routing → schema retrieval → SQL generation → execution → visualisation), "
+        "and streams the response as **Server-Sent Events (SSE)**. "
+        "\n\nEach SSE event is a JSON object: `{ \"content\": \"...\", \"visualization\": { ... } }`. "
+        "The `visualization` field is `null` for non-SQL responses (greetings, clarifications) and "
+        "contains chart config (type, data, axes, summary) for SQL query results. "
+        "\n\nPass the same `thread_id` across turns to maintain multi-turn conversation memory."
+    ),
+    responses={
+        200: {"description": "SSE stream — JSON events with content and optional visualization"},
+        400: {"description": "Bad request — messages list is empty"},
+        500: {"description": "Internal server error during agent execution"},
+    },
+)
 async def stream_endpoint(stream_request: StreamRequest):
     """Streams agent responses using Server-Sent Events."""
     try:

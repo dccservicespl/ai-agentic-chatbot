@@ -42,7 +42,7 @@ class DataSourceSettings(BaseModel):
         """Parse configuration data into DataSourceSettings object."""
         datasource_config = config_data.get("datasources", {})
 
-        default_datasource = datasource_config.get("default", "mysql.primary")
+        default_datasource = datasource_config.get("default", "postgresql.primary")
         if "." in default_datasource:
             default_datasource = default_datasource.split(".", 1)[1]
 
@@ -82,19 +82,7 @@ class DataSourceSettings(BaseModel):
         """Apply environment variable overrides to datasource configuration."""
         ds_data = ds_data.copy()
 
-        if provider == DataSourceProvider.MYSQL:
-            if "MYSQL_HOST" in os.environ:
-                ds_data["host"] = os.environ["MYSQL_HOST"]
-            if "MYSQL_PORT" in os.environ:
-                ds_data["port"] = int(os.environ["MYSQL_PORT"])
-            if "MYSQL_DATABASE" in os.environ:
-                ds_data["database"] = os.environ["MYSQL_DATABASE"]
-            if "MYSQL_USERNAME" in os.environ:
-                ds_data["username"] = os.environ["MYSQL_USERNAME"]
-            if "MYSQL_PASSWORD" in os.environ:
-                ds_data["password"] = os.environ["MYSQL_PASSWORD"]
-
-        elif provider == DataSourceProvider.POSTGRESQL:
+        if provider == DataSourceProvider.POSTGRESQL:
             if "POSTGRES_HOST" in os.environ:
                 ds_data["host"] = os.environ["POSTGRES_HOST"]
             if "POSTGRES_PORT" in os.environ:
