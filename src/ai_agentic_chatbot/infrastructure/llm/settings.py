@@ -141,6 +141,13 @@ class Settings(BaseModel):
                 "AZURE_OPENAI_API_VERSION",
                 model_data.get("api_version", "2024-02-15-preview"),
             )
+        elif provider == LLMProvider.AZURE_AI_FOUNDRY:
+            model_data["api_key"] = os.getenv(
+                "AZURE_AI_FOUNDRY_API_KEY", model_data.get("api_key", "")
+            )
+            model_data["endpoint"] = os.getenv(
+                "AZURE_AI_FOUNDRY_ENDPOINT", model_data.get("endpoint", "")
+            )
         elif provider == LLMProvider.OPENAI:
             model_data["api_key"] = os.getenv(
                 "OPENAI_API_KEY", model_data.get("api_key", "")

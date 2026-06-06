@@ -105,9 +105,56 @@ class AzureOpenAIEmbeddingConfig(BaseModel):
         extra = "forbid"
 
 
-PROVIDER_CONFIG_REGISTRY[LLMProvider.AZURE_OPENAI] = AzureOpenAIConfig
+class AzureAIFoundryConfig(BaseLLMConfig):
+    """Configuration for Azure AI Foundry serverless deployments (DeepSeek, Llama, etc.).
 
-ProviderConfig = Union[AzureOpenAIConfig]
+    Uses ChatOpenAI-compatible client (base_url + model) instead of AzureChatOpenAI,
+    because Foundry serverless endpoints do not use api_version or azure_deployment.
+    """
+
+    api_key: str = Field(..., description="Azure AI Foundry API key")
+    endpoint: str = Field(..., description="Azure AI Foundry endpoint URL")
+    top_p: float = Field(
+        default=1.0, ge=0.0, le=1.0, description="Top-p sampling parameter"
+    )
+    frequency_penalty: float = Field(
+        default=0.0, ge=-2.0, le=2.0, description="Frequency penalty"
+    )
+    presence_penalty: float = Field(
+        default=0.0, ge=-2.0, le=2.0, description="Presence penalty"
+    )
+    temperature: float = Field(
+        default=0.7, ge=0.0, le=2.0, description="Model temperature"
+    )
+    max_tokens: Optional[int] = Field(
+        default=None, description="Maximum tokens in response"
+    )
+
+    @field_validator("endpoint")
+    def validate_endpoint(cls, v):
+        if not v.startswith(("http://", "https://")):
+            raise ValueError("Endpoint must be a valid URL")
+        return v.rstrip("/")
+
+    def get_client_kwargs(self) -> Dict[str, Any]:
+        return {
+            "model": self.model_name,
+            "base_url": self.endpoint,
+            "api_key": self.api_key,
+            "temperature": self.temperature,
+            "max_tokens": self.max_tokens,
+            "top_p": self.top_p,
+            "frequency_penalty": self.frequency_penalty,
+            "presence_penalty": self.presence_penalty,
+            "timeout": self.timeout,
+            "max_retries": self.max_retries,
+        }
+
+
+PROVIDER_CONFIG_REGISTRY[LLMProvider.AZURE_OPENAI] = AzureOpenAIConfig
+PROVIDER_CONFIG_REGISTRY[LLMProvider.AZURE_AI_FOUNDRY] = AzureAIFoundryConfig
+
+ProviderConfig = Union[AzureOpenAIConfig, AzureAIFoundryConfig]
 
 
 def get_provider_config_class(provider: LLMProvider):

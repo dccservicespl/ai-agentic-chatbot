@@ -6,7 +6,7 @@ from langchain_core.language_models import BaseChatModel
 from langchain_core.embeddings import Embeddings
 from langchain_openai import AzureChatOpenAI, ChatOpenAI, AzureOpenAIEmbeddings
 
-from .config import AzureOpenAIConfig, AzureOpenAIEmbeddingConfig
+from .config import AzureOpenAIConfig, AzureOpenAIEmbeddingConfig, AzureAIFoundryConfig
 from .settings import get_settings, ModelConfiguration
 from .types import LLMProvider, ModelType
 
@@ -77,12 +77,23 @@ class LLMFactory:
 
         if provider == LLMProvider.AZURE_OPENAI:
             return self._create_azure_openai_client(config)
+        elif provider == LLMProvider.AZURE_AI_FOUNDRY:
+            return self._create_azure_ai_foundry_client(config)
         else:
             raise ValueError(f"Unsupported provider: {provider}")
 
     def _create_azure_openai_client(self, config: AzureOpenAIConfig) -> AzureChatOpenAI:
         """Create Azure OpenAI LangChain client."""
         return AzureChatOpenAI(**config.get_client_kwargs())
+
+    def _create_azure_ai_foundry_client(self, config: AzureAIFoundryConfig) -> ChatOpenAI:
+        """Create Azure AI Foundry LangChain client.
+
+        Foundry serverless endpoints (DeepSeek, Llama, etc.) expose an
+        OpenAI-compatible API — ChatOpenAI with base_url is the correct client,
+        not AzureChatOpenAI (which requires api_version and azure_deployment).
+        """
+        return ChatOpenAI(**config.get_client_kwargs())
 
     def get_embedding(
         self, provider: Optional[LLMProvider] = None, model: Optional[ModelType] = None

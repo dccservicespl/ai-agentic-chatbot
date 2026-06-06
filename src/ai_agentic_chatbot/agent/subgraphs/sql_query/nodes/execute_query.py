@@ -30,7 +30,7 @@ def execute_query_node(state: dict) -> dict:
         return {"execution_error": "No SQL query to execute"}
 
     try:
-        engine = get_engine("mysql.primary")
+        engine = get_engine("postgresql.primary")
 
         start_time = time.time()
 

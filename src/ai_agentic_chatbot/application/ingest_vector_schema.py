@@ -5,7 +5,8 @@ from ai_agentic_chatbot.schema_extractor.vector_schema_builder import VectorSche
 from ai_agentic_chatbot.utils.utils import get_db_connection_string
 
 BASE_DIR = Path(__file__).resolve().parent.parent
-SCHEMA_TO_TEXT_PATH = BASE_DIR / "temp" / "schema_documentation.yaml"
+# SCHEMA_TO_TEXT_PATH = BASE_DIR / "temp" / "schema_documentation.yaml"
+SCHEMA_TO_TEXT_PATH = Path(__file__).resolve().parent.parent.parent.parent / "temp" / "schema_documentation.yaml"
 
 
 def ingest_schema(schema_path: str, pg_conn_str: str) -> None:
