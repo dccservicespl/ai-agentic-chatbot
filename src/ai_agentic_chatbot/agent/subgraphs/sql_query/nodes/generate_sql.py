@@ -1,5 +1,7 @@
 """SQL generation node with structured LLM output."""
 
+import re
+import json
 from ai_agentic_chatbot.infrastructure.llm.factory import get_llm
 from ai_agentic_chatbot.infrastructure.llm.types import LLMProvider, ModelType
 from langchain_core.messages import SystemMessage
@@ -45,7 +47,7 @@ def generate_sql_node(state: dict) -> dict:
 
     try:
         llm = get_llm(LLMProvider.AZURE_OPENAI, ModelType.SMART)
-        structured_llm = llm.with_structured_output(SQLGeneration, strict=True)
+        structured_llm = llm.with_structured_output(SQLGeneration)
 
         prompt_content = _create_generation_prompt(
             schema_text=schema_text,
@@ -55,7 +57,21 @@ def generate_sql_node(state: dict) -> dict:
         )
 
         prompt = SystemMessage(content=prompt_content)
-        result: SQLGeneration = structured_llm.invoke([prompt])
+
+        try:
+            result: SQLGeneration = structured_llm.invoke([prompt])
+        except Exception as parse_error:
+            # Llama/DeepSeek models sometimes append explanatory text after the JSON
+            # block, causing "trailing characters" parse errors. Extract the JSON
+            # object manually and parse via Pydantic as a fallback.
+            if "trailing" in str(parse_error).lower() or "json" in str(parse_error).lower():
+                logger.warning(
+                    f"Structured output parse failed, trying JSON extraction fallback: {parse_error}"
+                )
+                raw = llm.invoke([prompt])
+                result = SQLGeneration(**_extract_json_block(raw.content))
+            else:
+                raise parse_error
 
         logger.info(f"Generated SQL: {result.query}")
         logger.info(f"Confidence: {result.confidence}")
@@ -99,7 +115,7 @@ REQUIREMENTS:
 4. Use GROUP BY and aggregate functions when needed
 5. Limit results to a reasonable number (max 10 rows)
 6. Limit number of columns to a reasonable number for better visibility of the user.
-6. Use MySQL syntax and functions
+6. Use PostgreSQL syntax and functions
 7. Be precise with column names and table references
 8. Handle NULL values appropriately
 
@@ -117,7 +133,9 @@ EXAMPLE RESPONSE:
     "confidence": 0.95,
     "tables_used": ["customers", "orders"],
     "warnings": ["Results limited to top 100 customers"]
-}}"""
+}}
+
+CRITICAL: Return ONLY the JSON object above. Do not add any text, notes, or explanation before or after the JSON."""
 
     # Add error feedback if retrying
     if previous_error and generation_attempts > 0:
@@ -143,3 +161,15 @@ This is attempt #{generation_attempts + 1}. Be extra careful with:
 """
 
     return base_prompt
+
+
+def _extract_json_block(text: str) -> dict:
+    """Extract the first complete JSON object from a string that may contain trailing text.
+
+    Needed because open-weight models (Llama, DeepSeek) sometimes append
+    explanatory sentences after the JSON block, breaking standard parsers.
+    """
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    if not match:
+        raise ValueError(f"No JSON object found in model response: {text[:200]}")
+    return json.loads(match.group())

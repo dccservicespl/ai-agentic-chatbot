@@ -34,9 +34,7 @@ def transform_schema_to_text() -> None:
         user_prompt = load_file_content(USER_SCHEMA_TO_TEXT_PROMPT_PATH).format(
             table_json=table_json
         )
-        structured_llm = llm.with_structured_output(
-            TableSchemaDocumentation, strict=True
-        )
+        structured_llm = llm.with_structured_output(TableSchemaDocumentation)
 
         # decision = structured_llm.invoke([system_prompt, user_prompt, db_schema_json])
         decision = structured_llm.invoke([system_prompt, user_prompt])

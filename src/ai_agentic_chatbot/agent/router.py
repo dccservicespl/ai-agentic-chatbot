@@ -66,7 +66,7 @@ class RouterNode:
         for i, msg in enumerate(self.state["messages"]):
             logger.debug(f"  [{i}] {type(msg).__name__}: {msg.content[:50]}")
 
-        structured_llm = self.llm.with_structured_output(RouterDecision, strict=True)
+        structured_llm = self.llm.with_structured_output(RouterDecision)
         msgs = self.state["messages"]
 
         with open(os.environ["ROUTER_PROMPT_PATH"], "r") as f:

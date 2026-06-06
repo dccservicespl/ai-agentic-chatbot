@@ -1,6 +1,6 @@
 # 🤖 AI Agentic Chatbot — Technical & Process Flow Documentation
 
-> **Version:** 1.0.0 | **Stack:** FastAPI · LangGraph · LangChain · Azure OpenAI · PostgreSQL/pgvector · MySQL · SQLAlchemy
+> **Version:** 1.1.0 | **Stack:** FastAPI · LangGraph · LangChain · Azure AI Foundry · Azure OpenAI · PostgreSQL/pgvector · SQLAlchemy
 
 ---
 
@@ -24,6 +24,7 @@
 16. [Dependencies](#16-dependencies)
 17. [Testing](#17-testing)
 18. [Change Log](#18-change-log)
+19. [Known Performance Issue — Excessive Embedding API Calls](#19-known-performance-issue--excessive-embedding-api-calls)
 
 ---
 
@@ -37,7 +38,7 @@ The **AI Agentic Chatbot** is a production-grade, multi-agent conversational AI 
 |---|---|
 | 🧠 **Intent Classification** | Routes user messages: greeting · SQL query · nonsense · ambiguous |
 | 🔍 **Semantic Schema Discovery** | Finds relevant DB tables via vector similarity search |
-| ✍️ **LLM SQL Generation** | Azure OpenAI GPT-4o generates safe, accurate SQL |
+| ✍️ **LLM SQL Generation** | Llama-3.3-70B-Instruct (Azure AI Foundry) generates safe, accurate SQL |
 | ✅ **Query Validation** | Syntax checks + SQL injection prevention before execution |
 | ⚙️ **Multi-DB Execution** | Supports MySQL, PostgreSQL, Azure SQL, SQLite, AWS RDS |
 | 📊 **Smart Visualization** | Heuristic chart type selection (bar, line, pie, KPI, table) |
@@ -94,14 +95,17 @@ The **AI Agentic Chatbot** is a production-grade, multi-agent conversational AI 
            ▼
       { content, visualization }
 
-┌───────────────────────────┐    ┌──────────────────────────────────┐
-│   Azure OpenAI (LLM)      │    │   PostgreSQL + pgvector           │
-│   · FAST: gpt-4o-mini     │    │   · Schema embeddings             │
-│   · SMART: gpt-4o         │    │   · Conversation memory           │
-│   · Embedding: ada-002    │    └──────────────────────────────────┘
-└───────────────────────────┘
+┌──────────────────────────────────────┐    ┌──────────────────────────────────┐
+│   Azure AI Foundry Serverless (LLM)  │    │   PostgreSQL + pgvector           │
+│   · FAST:  DeepSeek-V4-Flash         │    │   · Schema embeddings             │
+│   · SMART: Llama-3.3-70B-Instruct    │    │   · Conversation memory           │
+└──────────────────────────────────────┘    └──────────────────────────────────┘
+┌──────────────────────────────────────┐
+│   Azure OpenAI Service (Embedding)   │
+│   · text-embedding-3-small           │
+└──────────────────────────────────────┘
 ┌───────────────────────────────────────────────────────────────────┐
-│   Business Database (MySQL / PostgreSQL / Azure SQL / SQLite)     │
+│   Business Database (PostgreSQL / Azure SQL / SQLite)             │
 │   · Query execution target                                        │
 └───────────────────────────────────────────────────────────────────┘
 ```
@@ -197,30 +201,46 @@ ai-agentic-chatbot/
 
 ```yaml
 llm:
-  default: azure_openai.fast          # Default model key
-  azure_openai:
-    fast:                             # 🚀 Fast model (routing, cheap tasks)
+  default: azure_ai_foundry.fast      # Active default — DeepSeek-V4-Flash
+
+  azure_ai_foundry:                   # Azure AI Foundry serverless (ChatOpenAI client)
+    fast:                             # 🚀 Fast model — routing, intent classification
+      model_name: "DeepSeek-V4-Flash"
+      api_key: "..."
+      endpoint: "https://dccglobal-ai-services.services.ai.azure.com/openai/v1/"
+      temperature: 0.1
+      max_retries: 3
+    smart:                            # 🧠 Smart model — SQL generation
+      model_name: "Llama-3.3-70B-Instruct"
+      api_key: "..."
+      endpoint: "https://dccglobal-ai-services.services.ai.azure.com/openai/v1/"
+      temperature: 0.1
+      max_tokens: 20000
+      timeout: 120
+      max_retries: 3
+
+  azure_openai:                       # Azure OpenAI Service (AzureChatOpenAI client)
+    fast:                             # Fallback — gpt-4o-mini (inactive, overridden by Foundry)
       model_name: "gpt-4o-mini"
       api_key: "..."
-      endpoint: "https://..."
+      endpoint: "https://dcc-azure-openai.cognitiveservices.azure.com"
       api_version: "2024-12-01-preview"
-      temperature: 0.0
-      max_tokens: 4000
-    smart:                            # 🧠 Smart model (SQL generation)
-      model_name: "gpt-4o"
-      ...
-    embedding:                        # 🧬 Embedding model (schema search)
-      model_name: "text-embedding-ada-002"
-      ...
+      temperature: 0.1
+    smart:                            # Fallback — gpt-4.1 (inactive, overridden by Foundry)
+      model_name: "gpt-4.1"
+      api_key: "..."
+      endpoint: "https://dcc-azure-openai.cognitiveservices.azure.com"
+      api_version: "2024-12-01-preview"
+      temperature: 0.1
+      max_tokens: 32768
+    embedding:                        # 🧬 Embedding model — schema search (active)
+      model_name: "text-embedding-3-small"
+      api_key: "..."
+      endpoint: "https://dcc-azure-openai.cognitiveservices.azure.com"
+      api_version: "2023-05-15"
 
 datasources:
-  default: mysql.primary
-  mysql:
-    primary:
-      host: "..."
-      port: 3306
-      database: "ai_chatbot_db"
-      ssl_ca: "..."                   # SSL certificate path
+  default: postgresql.primary
   postgresql:
     primary:
       host: "..."
@@ -233,15 +253,17 @@ logging:
   file_level: "DEBUG"
 ```
 
+> **Provider resolution note:** `settings.py` stores models by short key (`fast`, `smart`, `embedding`). When both `azure_openai` and `azure_ai_foundry` declare `fast`/`smart`, the last-parsed provider wins. Since `azure_ai_foundry` is listed first in `config.yaml`, it takes precedence. To switch back to Azure OpenAI models, move the `azure_openai` block above `azure_ai_foundry`.
+
 ### 4.2 Environment Variables
 
 | Variable | Purpose | Overrides |
 |---|---|---|
-| `AZURE_OPENAI_ENDPOINT` | Azure OpenAI base URL | `llm.azure_openai.*.endpoint` |
-| `AZURE_OPENAI_API_KEY` | Azure OpenAI credential | `llm.azure_openai.*.api_key` |
-| `AZURE_OPENAI_API_VERSION` | API version string | `llm.azure_openai.*.api_version` |
-| `MYSQL_HOST` / `MYSQL_PORT` | MySQL connection | `datasources.mysql.primary.*` |
-| `MYSQL_DB` / `MYSQL_USER` / `MYSQL_PASSWORD` | MySQL credentials | `datasources.mysql.primary.*` |
+| `AZURE_AI_FOUNDRY_API_KEY` | Azure AI Foundry credential (fast + smart) | `llm.azure_ai_foundry.*.api_key` |
+| `AZURE_AI_FOUNDRY_ENDPOINT` | Azure AI Foundry base URL | `llm.azure_ai_foundry.*.endpoint` |
+| `AZURE_OPENAI_ENDPOINT` | Azure OpenAI base URL (embedding + fallback) | `llm.azure_openai.*.endpoint` |
+| `AZURE_OPENAI_API_KEY` | Azure OpenAI credential (embedding + fallback) | `llm.azure_openai.*.api_key` |
+| `AZURE_OPENAI_API_VERSION` | Azure OpenAI API version string | `llm.azure_openai.*.api_version` |
 | `POSTGRESQL_HOST` / `POSTGRESQL_PORT` | PostgreSQL connection | `datasources.postgresql.primary.*` |
 | `POSTGRESQL_DB` / `POSTGRESQL_USER` / `POSTGRESQL_PASSWORD` | PostgreSQL credentials | `datasources.postgresql.primary.*` |
 | `ROUTER_PROMPT_PATH` | Path to router system prompt file | — |
@@ -615,13 +637,14 @@ Performs two categories of validation:
 
 ```python
 class LLMProvider(Enum):
-    AZURE_OPENAI = "azure_openai"
-    OPENAI       = "openai"
-    ANTHROPIC    = "anthropic"
-    AWS_BEDROCK  = "aws_bedrock"
+    AZURE_OPENAI     = "azure_openai"      # Azure OpenAI Service (AzureChatOpenAI)
+    AZURE_AI_FOUNDRY = "azure_ai_foundry"  # Azure AI Foundry serverless (ChatOpenAI)
+    OPENAI           = "openai"
+    ANTHROPIC        = "anthropic"
+    AWS_BEDROCK      = "aws_bedrock"
 
 class ModelType(Enum):
-    FAST      = "fast"       # Low-latency model — routing, cheap tasks
+    FAST      = "fast"       # Low-latency model — routing, intent classification
     SMART     = "smart"      # High-capability model — SQL generation
     EMBEDDING = "embedding"  # Embedding model — schema vectorisation
     VISION    = "vision"     # Vision-capable model (reserved)
@@ -642,11 +665,18 @@ BaseLLMConfig (ABC)
     · max_retries: int      (default 3)
     · get_client_kwargs() → Dict   ← abstract, returns LangChain init args
          │
-         ├── AzureOpenAIConfig
+         ├── AzureOpenAIConfig                       ← AZURE_OPENAI provider
          │     · api_key, endpoint (validated URL), api_version
          │     · temperature, max_tokens, top_p
          │     · frequency_penalty, presence_penalty
-         │     · get_client_kwargs() → { azure_deployment, azure_endpoint, ... }
+         │     · get_client_kwargs() → { azure_deployment, azure_endpoint, api_version, ... }
+         │
+         ├── AzureAIFoundryConfig                    ← AZURE_AI_FOUNDRY provider
+         │     · api_key, endpoint (validated URL)
+         │     · temperature, max_tokens, top_p
+         │     · frequency_penalty, presence_penalty
+         │     · get_client_kwargs() → { model, base_url, api_key, ... }
+         │       (no api_version — Foundry endpoints are version-free)
          │
          └── AzureOpenAIEmbeddingConfig  (separate — not a chat model)
                · api_key, endpoint, api_version
@@ -654,7 +684,7 @@ BaseLLMConfig (ABC)
                · get_client_kwargs() → { azure_deployment, azure_endpoint, ... }
 ```
 
-`config.py` registers `AzureOpenAIConfig` into `PROVIDER_CONFIG_REGISTRY` at module load. Adding a new provider means: add an enum value in `types.py`, create a config class in `config.py`, and register it — no changes needed elsewhere.
+`config.py` registers both `AzureOpenAIConfig` and `AzureAIFoundryConfig` into `PROVIDER_CONFIG_REGISTRY` at module load. Adding a new provider means: add an enum value in `types.py`, create a config class in `config.py`, and register it — no changes needed elsewhere.
 
 ---
 
@@ -678,10 +708,11 @@ Settings.from_config_file(config_path?)
                            └─ For each model key (fast / smart / embedding):
                                   │
                                   ├─ _apply_env_overrides(model_data, provider)
-                                  │     Azure:   AZURE_OPENAI_API_KEY / ENDPOINT / API_VERSION
-                                  │     OpenAI:  OPENAI_API_KEY / OPENAI_ORGANIZATION
+                                  │     Foundry:  AZURE_AI_FOUNDRY_API_KEY / ENDPOINT
+                                  │     Azure:    AZURE_OPENAI_API_KEY / ENDPOINT / API_VERSION
+                                  │     OpenAI:   OPENAI_API_KEY / OPENAI_ORGANIZATION
                                   │     Anthropic: ANTHROPIC_API_KEY
-                                  │     Bedrock: AWS_ACCESS_KEY_ID / SECRET / TOKEN / REGION
+                                  │     Bedrock:  AWS_ACCESS_KEY_ID / SECRET / TOKEN / REGION
                                   │
                                   ├─ config_class(**model_data)  → ProviderConfig (validated)
                                   ├─ _determine_model_type(key)  → ModelType (matched by key substring)
@@ -724,6 +755,8 @@ get_llm(provider?, model?)
            _create_client(model_config)
                └─ provider == AZURE_OPENAI:
                       AzureChatOpenAI(**config.get_client_kwargs())
+               └─ provider == AZURE_AI_FOUNDRY:
+                      ChatOpenAI(**config.get_client_kwargs())  ← base_url + model
                └─ other providers: raises ValueError (extensible)
            _clients[model_key] = client
            return client
@@ -771,12 +804,13 @@ structured_llm = llm.with_structured_output(SQLGeneration)
 
 | Provider Enum | LangChain Client | Chat | Embedding | Status |
 |---|---|---|---|---|
-| `AZURE_OPENAI` | `AzureChatOpenAI` / `AzureOpenAIEmbeddings` | ✅ | ✅ | **Active** |
+| `AZURE_AI_FOUNDRY` | `ChatOpenAI` (base_url) | ✅ | — | **Active — default provider** |
+| `AZURE_OPENAI` | `AzureChatOpenAI` / `AzureOpenAIEmbeddings` | ✅ | ✅ | **Active — embedding only (chat overridden by Foundry)** |
 | `OPENAI` | `ChatOpenAI` | ✅ | — | Enum defined, factory raises `ValueError` (not yet wired) |
 | `ANTHROPIC` | `ChatAnthropic` | ✅ | — | Enum defined, factory raises `ValueError` |
 | `AWS_BEDROCK` | `BedrockChat` | ✅ | — | Enum defined, factory raises `ValueError` |
 
-> Only `AZURE_OPENAI` is fully wired end-to-end. The other providers have enum values and env-override logic in `settings.py` but `_create_client()` in the factory will raise `ValueError` until their LangChain instantiation is added.
+> `AZURE_AI_FOUNDRY` is the active chat provider (DeepSeek + Llama). `AZURE_OPENAI` remains active for embedding only. To switch back to Azure OpenAI chat models, reorder the provider blocks in `config.yaml` so `azure_openai` is parsed last.
 
 ---
 
@@ -784,6 +818,8 @@ structured_llm = llm.with_structured_output(SQLGeneration)
 
 | Variable | Provider | Overrides |
 |---|---|---|
+| `AZURE_AI_FOUNDRY_API_KEY` | Azure AI Foundry | `config.yaml llm.azure_ai_foundry.*.api_key` |
+| `AZURE_AI_FOUNDRY_ENDPOINT` | Azure AI Foundry | `config.yaml llm.azure_ai_foundry.*.endpoint` |
 | `AZURE_OPENAI_API_KEY` | Azure OpenAI | `config.yaml llm.azure_openai.*.api_key` |
 | `AZURE_OPENAI_ENDPOINT` | Azure OpenAI | `config.yaml llm.azure_openai.*.endpoint` |
 | `AZURE_OPENAI_API_VERSION` | Azure OpenAI | `config.yaml llm.azure_openai.*.api_version` |
@@ -1381,9 +1417,9 @@ poetry run pytest --cov=src/ai_agentic_chatbot
 
 ## 18. 📋 Change Log
 
-### v1.1.0 — Azure AI Foundry Model Migration (2026-06-05)
+### v1.1.0 — Azure AI Foundry Model Migration (2026-06-05) ✅ COMPLETED
 
-**Context:** The LLM backend is switching from Azure OpenAI Service (GPT-4o-mini / GPT-4o) to Azure AI Foundry serverless deployments (DeepSeek-V4-Flash / Llama-3.3-70B-Instruct). These models are hosted on a different endpoint type (`*.services.ai.azure.com/openai/v1/`) that requires `ChatOpenAI` (OpenAI-compatible client) rather than `AzureChatOpenAI`, and does not use `api_version`.
+**Context:** The LLM backend was migrated from Azure OpenAI Service (GPT-4o-mini / GPT-4.1) to Azure AI Foundry serverless deployments (DeepSeek-V4-Flash / Llama-3.3-70B-Instruct). These models are hosted on a different endpoint type (`*.services.ai.azure.com/openai/v1/`) that requires `ChatOpenAI` (OpenAI-compatible client) rather than `AzureChatOpenAI`, and does not use `api_version`. Azure OpenAI fallback models remain in `config.yaml` and are re-activated by reordering provider blocks.
 
 #### Root Cause
 
@@ -1391,43 +1427,110 @@ poetry run pytest --cov=src/ai_agentic_chatbot
 |---|---|
 | Wrong LangChain client | `AzureChatOpenAI` is for Azure OpenAI Service; Azure AI Foundry serverless needs `ChatOpenAI` with `base_url` |
 | `azure_deployment` vs `model` | `AzureChatOpenAI` uses `azure_deployment`; `ChatOpenAI` uses `model` parameter |
-| Empty `api_version` | Azure AI Foundry endpoints have no API version; current config has `api_version: ""` which is invalid for `AzureChatOpenAI` |
-| `strict=True` incompatibility | `strict=True` in `.with_structured_output()` is an OpenAI-only JSON schema enforcement flag; DeepSeek and Llama do not support it and will return API errors |
+| `api_version` not supported | Azure AI Foundry endpoints are version-free; `api_version: ""` would cause Pydantic `extra="forbid"` rejection |
+| `strict=True` incompatibility | OpenAI-only constrained decoding flag; DeepSeek and Llama return 400 API errors when passed |
 
-#### Pending Implementation Steps
+#### Completed Implementation Steps
 
-| # | File | Change Required |
-|---|---|---|
-| 1 | `infrastructure/llm/types.py` | Add `AZURE_AI_FOUNDRY = "azure_ai_foundry"` to `LLMProvider` enum |
-| 2 | `infrastructure/llm/config.py` | Add `AzureAIFoundryConfig` class whose `get_client_kwargs()` returns `ChatOpenAI`-compatible kwargs (`base_url`, `model`, `api_key`); register in `PROVIDER_CONFIG_REGISTRY`; update `ProviderConfig` Union |
-| 3 | `infrastructure/llm/factory.py` | Add `_create_azure_ai_foundry_client()` using `ChatOpenAI(**config.get_client_kwargs())`; add branch in `_create_client()` for `LLMProvider.AZURE_AI_FOUNDRY` |
-| 4 | `infrastructure/llm/settings.py` | Add `elif provider == LLMProvider.AZURE_AI_FOUNDRY:` block in `_apply_env_overrides()` mapping `AZURE_AI_FOUNDRY_API_KEY` and `AZURE_AI_FOUNDRY_ENDPOINT` |
-| 5 | `config.yaml` | Move `fast:` and `smart:` model entries from `azure_openai:` to a new `azure_ai_foundry:` key; update `llm.default` to `azure_ai_foundry.fast`; remove `api_version: ""`; keep `embedding:` under `azure_openai:` (still uses real Azure OpenAI endpoint) |
-| 6 | `application/transform_schema_to_text.py:38`<br>`agent/router.py:69`<br>`agent/subgraphs/sql_query/nodes/generate_sql.py:48` | Remove `strict=True` from all three `.with_structured_output()` calls |
+| # | File | Change Made | Status |
+|---|---|---|---|
+| 1 | `infrastructure/llm/types.py` | Added `AZURE_AI_FOUNDRY = "azure_ai_foundry"` to `LLMProvider` enum | ✅ |
+| 2 | `infrastructure/llm/config.py` | Added `AzureAIFoundryConfig` (no `api_version`; `get_client_kwargs()` returns `model`+`base_url`); registered in `PROVIDER_CONFIG_REGISTRY`; updated `ProviderConfig` Union | ✅ |
+| 3 | `infrastructure/llm/factory.py` | Added `_create_azure_ai_foundry_client()` using `ChatOpenAI`; wired `elif AZURE_AI_FOUNDRY` branch in `_create_client()` | ✅ |
+| 4 | `infrastructure/llm/settings.py` | Added `elif AZURE_AI_FOUNDRY` block in `_apply_env_overrides()` mapping `AZURE_AI_FOUNDRY_API_KEY` / `ENDPOINT` | ✅ |
+| 5 | `config.yaml` | Added `azure_ai_foundry:` block with `fast`/`smart`; `default` set to `azure_ai_foundry.fast`; removed `api_version: ""`; `embedding` kept under `azure_openai:` | ✅ |
+| 6 | `transform_schema_to_text.py`<br>`router.py`<br>`generate_sql.py` | Removed `strict=True` from all three `.with_structured_output()` calls | ✅ |
 
 #### Model Change Summary
 
 | Role | Previous Model | New Model | Provider Type |
 |---|---|---|---|
 | Fast (routing) | `gpt-4o-mini` via Azure OpenAI | `DeepSeek-V4-Flash` via Azure AI Foundry | `AZURE_AI_FOUNDRY` |
-| Smart (SQL gen) | `gpt-4o` via Azure OpenAI | `Llama-3.3-70B-Instruct` via Azure AI Foundry | `AZURE_AI_FOUNDRY` |
+| Smart (SQL gen) | `gpt-4.1` via Azure OpenAI | `Llama-3.3-70B-Instruct` via Azure AI Foundry | `AZURE_AI_FOUNDRY` |
 | Embedding | `text-embedding-3-small` via Azure OpenAI | No change | `AZURE_OPENAI` |
-
-#### Architecture Diagram Update (after migration)
-
-```
-┌───────────────────────────────────────────────────────────────┐
-│   Azure AI Foundry Serverless (LLM)                           │
-│   Endpoint: dccglobal-ai-services.services.ai.azure.com       │
-│   · FAST:  DeepSeek-V4-Flash    (routing, cheap tasks)        │
-│   · SMART: Llama-3.3-70B-Instruct (SQL generation)            │
-└───────────────────────────────────────────────────────────────┘
-┌───────────────────────────────────────────────────────────────┐
-│   Azure OpenAI Service (Embedding — unchanged)                │
-│   · Embedding: text-embedding-3-small                         │
-└───────────────────────────────────────────────────────────────┘
-```
 
 ---
 
-*Generated: 2026-05-29 | Updated: 2026-06-05 | Repository: `ai-agentic-chatbot` | Branch: `develop`*
+---
+
+## 19. ⚠️ Known Performance Issue — Excessive Embedding API Calls
+
+**File:** `src/ai_agentic_chatbot/agent/subgraphs/sql_query/nodes/retrieve_schemas.py` — `_semantic_search()`
+
+### Observed Behaviour
+
+Every user query triggers **~100+ HTTP calls** to the Azure OpenAI embedding endpoint (`text-embedding-3-small`). This is visible in logs as a long burst of:
+
+```
+INFO - httpx - HTTP Request: POST https://.../openai/deployments/text-embedding-3-small/embeddings ... "HTTP/1.1 200 OK"
+```
+
+### Root Cause
+
+`_semantic_search()` calls `embedding_model.embed_query()` individually for every piece of schema text on **every single query**, including content that never changes between requests.
+
+The call breakdown for **4 tables** with the current schema YAML:
+
+```
+1 call        → embed_query(user_query)                       # computed once before the loop
+
+Per table (×4 tables):
+  N calls     → embed_query(each example_question)           # lines 110–116
+  1 call      → embed_query(business_purpose)                # line 121
+  1 call      → embed_query(search_text)                     # line 129
+  N calls     → embed_query(each key_field.meaning)          # lines 137–139
+```
+
+Concrete totals from the current `schema_documentation.yaml`:
+
+| Table | `example_questions` | `key_fields` | Per-table calls |
+|---|---|---|---|
+| `customer` | 8 | 16 | **26** |
+| `inventory` | 7 | 13 | **22** |
+| `orders` | 6 | 17 | **25** |
+| `product` | 7 | 19 | **28** |
+| **Total** | | + 1 (user query) | **~102 calls/request** |
+
+### Why This Matters
+
+- **Latency:** Each `embed_query()` is a synchronous HTTP round-trip. 100+ sequential calls add significant overhead to every user-facing query, stacking on top of LLM latency.
+- **Cost:** Azure OpenAI charges per token processed. Re-embedding identical schema text on every request multiplies token spend by the number of queries.
+- **Scalability:** The call count grows linearly with `tables × (example_questions + key_fields)`. Adding more tables or richer schema docs makes it worse.
+
+### The Fix (Not Yet Implemented)
+
+The schema text (`example_questions`, `business_purpose`, `key_field meanings`) is **static** — it never changes between queries. Embeddings for it should be computed **once** and reused:
+
+**Option A — Pre-compute at ingestion time (recommended)**
+
+Store schema embeddings in pgvector alongside the schema documents (already partially supported by `PgVectorSchemaStore`). At query time, run only `embed_query(user_query)` (1 call) and compare against stored vectors via `similarity_search_with_score()`.
+
+```
+Before:  ~102 embed_query() calls per user query
+After:   1 embed_query() call per user query
+```
+
+**Option B — In-process cache (interim fix)**
+
+Cache schema embeddings in a module-level dict on first load, keyed by the text content. Subsequent queries hit the cache instead of the API. Still pays the cost on cold start but eliminates re-computation.
+
+**Option C — Batch embed (partial improvement)**
+
+Replace sequential `embed_query()` calls inside the loop with a single `embed_documents([...all_texts...])` call. The Azure OpenAI API accepts up to 2048 inputs per request, so all schema texts can be embedded in one HTTP round-trip instead of N. This doesn't eliminate redundant re-embedding across requests, but reduces per-request latency significantly.
+
+### Related Code Locations
+
+| Symbol | File | Line |
+|---|---|---|
+| `_semantic_search()` | `nodes/retrieve_schemas.py` | 83 |
+| `embed_query(query)` — user query | `nodes/retrieve_schemas.py` | 98 |
+| `embed_query(question)` — example questions loop | `nodes/retrieve_schemas.py` | 110 |
+| `embed_query(business_purpose)` | `nodes/retrieve_schemas.py` | 121 |
+| `embed_query(search_text)` | `nodes/retrieve_schemas.py` | 129 |
+| `embed_query(field_meaning)` — key fields loop | `nodes/retrieve_schemas.py` | 137 |
+| `get_table_docs_for_search()` | `schema_extractor/schema_loader.py` | 53 |
+| `PgVectorSchemaStore` | `infrastructure/vector_store/pgvector_store.py` | — |
+
+---
+
+*Generated: 2026-05-29 | Updated: 2026-06-07 | Repository: `ai-agentic-chatbot` | Branch: `develop`*
