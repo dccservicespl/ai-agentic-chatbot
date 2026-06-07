@@ -1659,58 +1659,458 @@ Add:
 ### Phase 1 — Pre-Dockerization Cleanup
 
 **1.1 — Fix Windows-specific file paths**
-- `config.yaml` and `.env` contain hardcoded Windows paths (e.g. `D:\ai_azure_cert_file\...`) for SSL certs and prompt files
-- Replace all hardcoded paths with environment variables that can be overridden at container runtime
-- Audit `ROUTER_PROMPT_PATH`, `CONFIG_DIR`, `SCHEMA_PATH`, `SCHEMA_SUMMARY_PATH`, `SYSTEM_PROMPT_PATH` in `.env`
+
+Six env vars in `.env` point to `D:\ai_azure_cert_file\...` — a folder that only exists on the Windows dev machine. On a Linux Docker container that path doesn't exist and the app crashes at startup. The fix differs per variable because they represent three different kinds of files.
+
+#### Category A — Static Prompt Files (bake into the image)
+
+These are read-only `.md` files the LLM uses as system prompts. They don't change at runtime, so they should live inside the repo and ship inside the Docker image like any other source file.
+
+**Affected vars:**
+```
+ROUTER_PROMPT_PATH=D:\ai_azure_cert_file\chatbot\router_prompts.md
+SYSTEM_PROMPT_PATH=D:\ai_azure_cert_file\chatbot\system_prompt.md
+```
+
+**Consumed by:**
+- `router.py:72` — `open(os.environ["ROUTER_PROMPT_PATH"], "r")`
+- `prompt_loader.py:41` — `load_file_content(os.environ["SYSTEM_PROMPT_PATH"])`
+
+**Todos:**
+- [ ] Copy `router_prompts.md` and `system_prompt.md` from `D:\ai_azure_cert_file\chatbot\` into the repo at `src/ai_agentic_chatbot/prompts/`
+- [ ] Update `.env` to use the container-internal path:
+  ```
+  ROUTER_PROMPT_PATH=/app/src/ai_agentic_chatbot/prompts/router_prompts.md
+  SYSTEM_PROMPT_PATH=/app/src/ai_agentic_chatbot/prompts/system_prompt.md
+  ```
+- [ ] Delete `CONFIG_DIR=D:\ai_azure_cert_file\chatbot` from `.env` — grep confirms it is never read by any code in `src/`, it is a dead variable
+
+#### Category B — Generated Schema Files (runtime output, bind-mounted volume)
+
+These are **output** files, not inputs. `/schemaText` writes `schema_documentation.yaml`; `generate_schema_summary()` writes `db_schema.json`. They are then read back by the SQL agent and router. They cannot be baked into the image (they depend on the live DB and don't exist at build time). They must survive container restarts, so they need a persistent bind-mount from the VM filesystem.
+
+**Affected vars:**
+```
+SCHEMA_PATH=D:\ai_azure_cert_file\chatbot\schema_documentation.yaml
+SCHEMA_SUMMARY_PATH=D:\ai_azure_cert_file\chatbot\schema_summary\db_schema.json
+```
+
+**Consumed by:**
+- `schema_loader.py:32` — `Path(os.environ["SCHEMA_PATH"])`
+- `transform_schema_to_text.py:86,102,107` — reads and writes both paths
+- `schema_loader.py:43` — `os.environ.get("SCHEMA_SUMMARY_PATH")`
+
+**Todos:**
+- [ ] Create a `data/` directory at the project root with placeholder files:
+  ```
+  data/
+    .gitkeep
+    schema_summary/
+      .gitkeep
+  ```
+- [ ] Add generated files to `.gitignore`:
+  ```
+  data/*.yaml
+  data/**/*.json
+  ```
+- [ ] Update `.env` to use the container-internal path:
+  ```
+  SCHEMA_PATH=/app/data/schema_documentation.yaml
+  SCHEMA_SUMMARY_PATH=/app/data/schema_summary/db_schema.json
+  ```
+- [ ] In `docker run` (Phase 7) and `docker-compose.yml` (Phase 3), bind-mount the directory so schema files survive restarts and image upgrades:
+  ```
+  -v /opt/ai-chatbot/data:/app/data
+  ```
+
+#### Category C — MySQL SSL Certificate (commit the public cert into the repo)
+
+`DigiCertGlobalRootG2.crt.pem` is a **public CA root certificate** (not a secret — it is freely downloadable from DigiCert's website). MySQL is not the active datasource (PostgreSQL is the default), but the cert path is wired in `datasource_config.py:81` and would cause a crash if MySQL is ever enabled in a container.
+
+**Affected var:**
+```
+MYSQL_SSL_CA=D:\ai_azure_cert_file\DigiCertGlobalRootG2.crt.pem
+```
+
+**Consumed by:**
+- `datasource_config.py:55,65,81` — passed as `ssl_ca` in MySQL connection args
+
+**Todos:**
+- [ ] Copy `DigiCertGlobalRootG2.crt.pem` into the repo at `certs/DigiCertGlobalRootG2.crt.pem` (safe to commit — public cert)
+- [ ] Update `.env`:
+  ```
+  MYSQL_SSL_CA=/app/certs/DigiCertGlobalRootG2.crt.pem
+  ```
+
+#### Bonus — PostgreSQL env var mismatch bug (`datasource_settings.py`)
+
+The env var override block for PostgreSQL in `datasource_settings.py:86–95` checks for `POSTGRES_HOST`, `POSTGRES_USER`, etc. — but `.env` defines `POSTGRESQL_HOST`, `POSTGRESQL_USER` (with the full `QLQL` suffix). **The override never fires.** The app silently falls back to the credentials hardcoded in `config.yaml` instead of reading from `.env`.
+
+- [ ] Fix `datasource_settings.py` to match the env var names actually used in `.env`:
+  ```python
+  # Before                          # After
+  "POSTGRES_HOST"        →          "POSTGRESQL_HOST"
+  "POSTGRES_PORT"        →          "POSTGRESQL_PORT"
+  "POSTGRES_DB"          →          "POSTGRESQL_DB"
+  "POSTGRES_USER"        →          "POSTGRESQL_USER"
+  "POSTGRES_PASSWORD"    →          "POSTGRESQL_PASSWORD"
+  ```
+
+#### Summary
+
+| Env Var | Category | Fix |
+|---|---|---|
+| `ROUTER_PROMPT_PATH` | A — Static prompt | Move `.md` into repo `prompts/`; update path to `/app/src/.../prompts/` |
+| `SYSTEM_PROMPT_PATH` | A — Static prompt | Same as above |
+| `CONFIG_DIR` | Dead variable | Delete from `.env` |
+| `SCHEMA_PATH` | B — Generated output | Create `data/` dir; update path to `/app/data/`; bind-mount on VM |
+| `SCHEMA_SUMMARY_PATH` | B — Generated output | Same as above |
+| `MYSQL_SSL_CA` | C — Public cert | Commit cert to `certs/`; update path to `/app/certs/` |
 
 **1.2 — Externalize secrets from `config.yaml`**
-- `config.yaml` currently embeds API keys and DB passwords inline
-- Move all secrets to environment variables; `config.yaml` should only hold non-sensitive structure (pool sizes, log levels, model names)
-- Verify `config.example.yaml` is fully sanitized and up to date
+
+`config.yaml` has real API keys and database credentials hardcoded inline. Although `config.yaml` is listed in `.gitignore` (so it won't be committed), it **will be copied into the Docker image at build time** unless excluded from the build context. Anyone with access to the image can extract it via `docker inspect` or by running the container. The env var override system already exists in `settings.py` — but it is **not actually being used** because the matching env vars are missing or misnamed in `.env`. The app works today only because secrets are hardcoded in `config.yaml`.
+
+#### Task 1.2.1 — Fix `.env`: add missing env vars for Azure AI Foundry
+
+`settings.py:144–149` overrides foundry credentials using `AZURE_AI_FOUNDRY_API_KEY` and `AZURE_AI_FOUNDRY_ENDPOINT` — but **neither exists in `.env`**. The foundry override never fires. Additionally, `.env` currently stores the Foundry key under the wrong variable name:
+
+```
+# Wrong — this is the Foundry key stored under the Azure OpenAI variable name
+AZURE_OPENAI_API_KEY=IT1mTuqtvWk...
+```
+
+- [ ] Add `AZURE_AI_FOUNDRY_API_KEY=IT1mTuqtvWk...` to `.env`
+- [ ] Add `AZURE_AI_FOUNDRY_ENDPOINT=https://dccglobal-ai-services.services.ai.azure.com/openai/v1/` to `.env`
+- [ ] Fix `AZURE_OPENAI_API_KEY` in `.env` to hold the actual Azure OpenAI key (`ClNBSEtoqW...` from `config.yaml`), not the Foundry key
+
+#### Task 1.2.2 — Strip all API keys from `config.yaml`
+
+Once `.env` is correct, set all `api_key` fields to `""`. The `settings.py._apply_env_overrides()` fills them at runtime. The keys must remain in the file (Pydantic config classes expect them) — just emptied.
+
+Fields to clear:
+- `llm.azure_openai.fast.api_key`
+- `llm.azure_openai.smart.api_key`
+- `llm.azure_openai.embedding.api_key`
+- `llm.azure_ai_foundry.fast.api_key`
+- `llm.azure_ai_foundry.smart.api_key`
+
+#### Task 1.2.3 — Strip database credentials from `config.yaml`
+
+`datasource_settings.py` now correctly overrides PostgreSQL credentials from `POSTGRESQL_*` env vars (fixed in 1.1). So `host`, `username`, and `password` in `config.yaml` can be emptied.
+
+Fields to clear:
+- `datasources.postgresql.primary.host`
+- `datasources.postgresql.primary.username`
+- `datasources.postgresql.primary.password`
+
+#### Task 1.2.4 — Remove the dead `embedding:` block from `config.yaml`
+
+`config.yaml` has a top-level `embedding:` section with another hardcoded API key. This block is **never read by any settings class**. `get_azure_openai_embedding()` in `embedding_connection.py:11–16` reads directly from `EMBEDDING_*` env vars, completely bypassing `config.yaml`. The block is dead config that exists only to expose a credential — delete it entirely.
+
+#### Task 1.2.5 — Update `config.example.yaml` to match
+
+`config.example.yaml` is the safe template committed to git. It must mirror the structure of the cleaned `config.yaml` with all secret values set to `""`. The current example is outdated (it still references the old MySQL-first structure).
+
+#### What Does NOT Need to Change
+
+| Item | Reason |
+|---|---|
+| `EMBEDDING_*` vars in `.env` | `embedding_connection.py` reads directly from env — already correct |
+| `POSTGRESQL_*` vars in `.env` | Present and now wired in `datasource_settings.py` after Phase 1.1 fix |
+| Non-secret fields in `config.yaml` | Pool sizes, log levels, model names, temperature — safe to keep |
+
+#### Summary
+
+| Task | File | Change |
+|---|---|---|
+| 1.2.1 | `.env` | Add `AZURE_AI_FOUNDRY_API_KEY`, `AZURE_AI_FOUNDRY_ENDPOINT`; fix `AZURE_OPENAI_API_KEY` |
+| 1.2.2 | `config.yaml` | Clear all `api_key` fields in `llm` block |
+| 1.2.3 | `config.yaml` | Clear `host`, `username`, `password` in `datasources.postgresql.primary` |
+| 1.2.4 | `config.yaml` | Delete entire top-level `embedding:` block |
+| 1.2.5 | `config.example.yaml` | Sync structure to match cleaned `config.yaml` |
 
 **1.3 — Audit `.dockerignore`**
-- Current `.dockerignore` only excludes `.venv`, `__pycache__`, `.env`, `build`, `worker.egg-info`
-- Add: `*.log`, `logs/`, `.git`, `tests/`, `*.md`, `*.pyc`, `**/__pycache__`, `config.yaml` (secrets come from env/mounted volume at runtime)
+
+The current `.dockerignore` has only 5 entries (`.venv`, `__pycache__`, `.env`, `build`, `worker.egg-info`). Every `docker build` sends the entire project tree to the Docker daemon as build context — including `.git/` history, test files, IDE config, and runtime-generated directories. This makes builds slower, image layers larger, and increases the image attack surface.
+
+#### Task 1.3.1 — Exclude `.git/`
+Git history is never needed inside the image and can be hundreds of MB on large repos.
+- [ ] Add `.git/`
+
+#### Task 1.3.2 — Make `__pycache__` exclusion recursive
+The current `__pycache__` entry only matches the root level. Every `src/` subdirectory has its own cache.
+- [ ] Replace `__pycache__` with `**/__pycache__`
+- [ ] Add `**/*.pyc` and `**/*.pyo`
+
+#### Task 1.3.3 — Exclude runtime-generated directories
+`logs/` and `data/` are written at runtime and will be bind-mounted from the VM filesystem in Phase 7. `temp/` is where `SaveSchemaJson` writes intermediate schema files.
+- [ ] Add `logs/`
+- [ ] Add `data/`
+- [ ] Add `temp/`
+
+#### Task 1.3.4 — Exclude test files
+Tests and the pytest cache are dev-only and have no role in the production container.
+- [ ] Add `tests/`
+- [ ] Add `.pytest_cache/`
+
+#### Task 1.3.5 — Exclude IDE and OS artefacts
+- [ ] Add `.idea/`
+- [ ] Add `.vscode/`
+
+#### Task 1.3.6 — Exclude log files and top-level docs
+`*.log` files belong to the running app, not the image. Top-level markdown docs serve no purpose inside the container.
+- [ ] Add `*.log`
+- [ ] Add `README.md` and `technical_doc.md` explicitly
+
+> **Important:** Do NOT use `*.md` globally — `src/ai_agentic_chatbot/prompts/*.md` (router and system prompt files added in Phase 1.1) **must ship inside the image**.
+
+#### What stays in the image
+
+| Path | Why it's needed |
+|---|---|
+| `src/` | Application source code |
+| `pyproject.toml` + `poetry.lock` | Dependency installation |
+| `certs/` | MySQL SSL certificate (added Phase 1.1) |
+| `config.yaml` | Non-secret config (cleaned in Phase 1.2) |
+| `config.example.yaml` | Template reference |
 
 **1.4 — Create `logs/` directory placeholder**
-- The app writes rotating log files; add `logs/.gitkeep`
-- Ensure the log path is configurable via env var (not hardcoded to a Windows path)
+
+Most of this phase requires no code changes — `logging_config.py` was already written correctly for containers.
+
+**Current state (no action needed on these):**
+- `logging_config.py:14–15` calls `log_dir.mkdir(exist_ok=True)` at startup — `logs/` auto-creates itself inside the container; no `RUN mkdir` in the Dockerfile is needed
+- Log file paths are hardcoded as **relative** strings (`"logs/app.log"`, `"logs/error.log"`, `"logs/datasource.log"`) — these are cross-platform and resolve correctly inside the container when the working directory is `/app`
+- The original concern about Windows-hardcoded paths does not apply here — `logging_config.py` was already written portably
+
+**What is missing:**
+
+#### Task 1.4.1 — Add `logs/.gitkeep`
+Without a `.gitkeep`, git does not track the `logs/` directory. A fresh clone of the repo will have no `logs/` folder. The auto-create in `logging_config.py` handles runtime, but having the directory visible in the repo is good practice.
+- [ ] Create `logs/.gitkeep`
+- No `.gitignore` change needed — the existing `*.log` rule already prevents actual log files from being committed
+
+#### Task 1.4.2 — Confirm no further action needed
+- [ ] Confirm `logging_config.py:14–15` covers directory creation at runtime inside the container
+- [ ] Confirm relative paths (`logs/app.log` etc.) resolve to `/app/logs/*` in the container — no env var override needed
+
+**Phase 7 reminder:** Even though `logging_config.py` auto-creates `logs/` inside the container, log files written there are ephemeral — they disappear when the container is replaced. The bind mount `-v /opt/ai-chatbot/logs:/app/logs` in Phase 7 is what makes logs persist on the VM across restarts and image upgrades.
 
 ---
 
 ### Phase 2 — Dockerfile
 
 **2.1 — Create `Dockerfile` at project root**
-- Base image: `python:3.13-slim` (matches `pyproject.toml` requirement)
-- Install system deps: `libpq-dev gcc` (required for `psycopg2-binary` and `cryptography`)
-- Install Poetry and configure it for non-interactive, no-venv mode inside the container
-- Copy `pyproject.toml` and `poetry.lock` first (layer-cache optimization), install deps
-- Copy the full `src/` directory
-- Copy `config.example.yaml` as the default config template
-- Set `PYTHONPATH=/app/src`
-- Expose port `8000`
-- Default CMD: `uvicorn ai_agentic_chatbot.server:app --host 0.0.0.0 --port 8000`
+
+**Key facts from the codebase:**
+
+| Fact | Detail |
+|---|---|
+| Python version | `>=3.13` (`pyproject.toml:9`) |
+| Package manager | Poetry — `pyproject.toml` + `poetry.lock` |
+| Package location | `src/ai_agentic_chatbot/` — needs `PYTHONPATH=/app/src` |
+| Entry point | `uvicorn ai_agentic_chatbot.server:app --host 0.0.0.0 --port 8000` |
+| Runtime dirs | `logs/`, `data/schema_summary/` (auto-created by code, pre-create in image as fallback) |
+
+#### Task 2.1.1 — Base image: `python:3.13-slim`
+Debian-based slim variant — matches the `>=3.13` constraint, avoids Alpine's compilation failures with `cryptography` and `psycopg2-binary`.
+
+#### Task 2.1.2 — Install system-level build dependencies
+Two packages need OS-level libs at install time:
+- `cryptography>=46` needs `gcc` + `libffi-dev` to compile Rust/C extensions
+- `psycopg2-binary` needs `libpq-dev` runtime libs on slim images
+
+Install and clean up in a single `RUN` layer to avoid bloating the image:
+```dockerfile
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc libffi-dev libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
+```
+
+#### Task 2.1.3 — Install Poetry and disable virtualenv creation
+Poetry must not create a virtualenv inside the container — packages go directly into system Python:
+```dockerfile
+RUN pip install --no-cache-dir poetry
+RUN poetry config virtualenvs.create false
+```
+
+#### Task 2.1.4 — Layer-cache-optimised dependency install
+Copy `pyproject.toml` and `poetry.lock` **before** source code so that source-only changes don't invalidate the dependency install layer:
+```dockerfile
+COPY pyproject.toml poetry.lock ./
+RUN poetry install --only=main --no-root --no-interaction --no-ansi
+```
+- `--only=main` excludes the `dev` group (`pytest`, `pytest-asyncio`) from the image
+- `--no-root` skips installing the project itself as a package — `PYTHONPATH` handles imports instead
+
+#### Task 2.1.5 — Copy application files
+```dockerfile
+COPY src/ ./src/
+COPY certs/ ./certs/
+COPY config.yaml ./
+COPY config.example.yaml ./
+```
+Do **not** copy `.env` — excluded via `.dockerignore`; secrets come from `--env-file` at runtime.
+
+#### Task 2.1.6 — Create runtime directories
+`logging_config.py` and `transform_schema_to_text.py` auto-create these at runtime, but pre-creating them ensures correct ownership before the app starts:
+```dockerfile
+RUN mkdir -p logs data/schema_summary
+```
+
+#### Task 2.1.7 — Set `PYTHONPATH`
+```dockerfile
+ENV PYTHONPATH=/app/src
+```
+
+#### Task 2.1.8 — Add a non-root user
+Running as `root` inside a container is a security risk. A non-root user limits blast radius if the app is compromised:
+```dockerfile
+RUN addgroup --system appgroup && adduser --system --ingroup appgroup appuser
+RUN chown -R appuser:appgroup /app
+USER appuser
+```
+
+#### Task 2.1.9 — Expose port and set CMD
+Use exec (array) form — `docker stop` sends `SIGTERM` directly to uvicorn for a clean shutdown:
+```dockerfile
+EXPOSE 8000
+CMD ["uvicorn", "ai_agentic_chatbot.server:app", "--host", "0.0.0.0", "--port", "8000"]
+```
+
+#### Build order summary
+```
+FROM python:3.13-slim
+  apt-get: gcc, libffi-dev, libpq-dev          ← 2.1.2
+  pip install poetry + config virtualenvs=false ← 2.1.3
+WORKDIR /app
+  COPY pyproject.toml poetry.lock              ← 2.1.4
+  poetry install --only=main --no-root         ← 2.1.4
+  COPY src/ certs/ config*.yaml                ← 2.1.5
+  mkdir -p logs data/schema_summary            ← 2.1.6
+  adduser appuser + chown /app                 ← 2.1.8
+  USER appuser
+ENV PYTHONPATH=/app/src                        ← 2.1.7
+EXPOSE 8000                                    ← 2.1.9
+CMD ["uvicorn", ...]                           ← 2.1.9
+```
 
 **2.2 — Create `entrypoint.sh`**
-- Validate required environment variables are set before starting the app
-- Optionally run a DB connectivity check and retry before marking the container ready
-- Exec into the uvicorn process
+
+The entrypoint runs before uvicorn starts and has three jobs: validate required env vars, wait for PostgreSQL to accept connections, then hand off to uvicorn cleanly.
+
+#### Task 2.2.1 — Use `sh` not `bash`, start with `set -e`
+Slim Docker images guarantee `/bin/sh` but not `/bin/bash`. `set -e` exits immediately on any error.
+- Shebang: `#!/bin/sh`
+- First line: `set -e`
+
+#### Task 2.2.2 — Validate required environment variables
+Fail fast with a readable message instead of a cryptic Python traceback. Split into groups matching each subsystem:
+
+| Group | Variables |
+|---|---|
+| PostgreSQL | `POSTGRESQL_HOST`, `POSTGRESQL_PORT`, `POSTGRESQL_DB`, `POSTGRESQL_USER`, `POSTGRESQL_PASSWORD` |
+| Active LLM (Foundry) | `AZURE_AI_FOUNDRY_API_KEY`, `AZURE_AI_FOUNDRY_ENDPOINT` |
+| Embeddings | `EMBEDDING_API_KEY`, `EMBEDDING_ENDPOINT`, `EMBEDDING_MODEL_NAME`, `EMBEDDING_API_VERSION` |
+| Prompt files | `ROUTER_PROMPT_PATH`, `SYSTEM_PROMPT_PATH` |
+
+- Write a `check_var()` helper that prints `ERROR: '<VAR>' is not set` and exits 1 if empty
+- Call it for all 13 required vars
+
+#### Task 2.2.3 — Wait for PostgreSQL TCP readiness
+`server.py` catches datasource init failures silently (`lifespan` except block, line 55) — the app starts but is broken. A wait loop ensures PostgreSQL is reachable before handing off. Use a Python one-liner (Python is already in the image — no extra packages):
+
+```sh
+python -c "
+import socket, time, sys
+host, port = '$POSTGRESQL_HOST', int('$POSTGRESQL_PORT')
+for i in range(30):
+    try:
+        socket.create_connection((host, port), timeout=2).close()
+        print('PostgreSQL is ready.')
+        sys.exit(0)
+    except OSError:
+        print(f'Attempt {i+1}/30 — not ready, retrying in 2s...')
+        time.sleep(2)
+print('ERROR: PostgreSQL did not become ready after 60s.')
+sys.exit(1)
+"
+```
+30 attempts × 2 seconds = 60 second max wait. Exits 1 if never ready so the container fails visibly.
+
+#### Task 2.2.4 — Hand off to CMD with `exec "$@"`
+`exec "$@"` replaces the shell process with the CMD passed at runtime. This means `SIGTERM` from `docker stop` goes directly to uvicorn for graceful shutdown. It also keeps the entrypoint flexible — CMD can be overridden at `docker run` time without touching this script.
+- Final line: `exec "$@"`
+
+#### Task 2.2.5 — Wire into the Dockerfile
+The Dockerfile must be updated to split the existing `CMD` into `ENTRYPOINT + CMD`:
+```dockerfile
+COPY entrypoint.sh ./
+RUN chmod +x entrypoint.sh
+ENTRYPOINT ["./entrypoint.sh"]
+CMD ["uvicorn", "ai_agentic_chatbot.server:app", "--host", "0.0.0.0", "--port", "8000"]
+```
+`ENTRYPOINT` always runs the validation and wait. `CMD` is the default command passed to `exec "$@"` and can be overridden at runtime.
+
+#### Script structure
+```
+#!/bin/sh
+set -e
+  check_var() helper
+  Validate PostgreSQL vars        (5 vars)
+  Validate LLM vars               (2 vars)
+  Validate Embedding vars         (4 vars)
+  Validate Prompt path vars       (2 vars)
+  Wait loop — PostgreSQL TCP      (30 × 2s, Python one-liner)
+exec "$@"   ← hands off to CMD (uvicorn)
+```
 
 ---
 
 ### Phase 3 — Docker Compose (Local Testing)
 
 **3.1 — Create `docker-compose.yml`**
-- Service `app`: FastAPI container built from `Dockerfile`
-- Service `pgvector`: `pgvector/pgvector:pg16` image — PostgreSQL with pgvector pre-installed (for local testing, separate from the Azure-hosted DB)
-- Mount `config.yaml` as a bind volume into the container (avoid baking secrets into the image)
-- Pass all secrets via `.env` file using `env_file:` directive
-- Health checks for both services
-- Named volume for pgvector data persistence
+
+Both local testing and production connect to the real Azure PostgreSQL. All connection details come from `.env`. The compose file is intentionally minimal — one service, three volume mounts, all config via `env_file`.
+
+> **Design decision (2026-06-08):** A local pgvector sidecar was considered and removed. Running against the real Azure database gives accurate test results and avoids maintaining separate local seed data. The `POSTGRESQL_SSLMODE` env override added to `datasource_settings.py` remains useful for any future local container use.
+
+#### Task 3.1.1 — Add `POSTGRESQL_SSLMODE` env override to `datasource_settings.py`
+Added for flexibility — `PostgreSQLConfig.sslmode` previously had no env override:
+```python
+if "POSTGRESQL_SSLMODE" in os.environ:
+    ds_data["sslmode"] = os.environ["POSTGRESQL_SSLMODE"]
+```
+
+#### Task 3.1.2 — Define the `app` service
+- `build: .` — builds from `Dockerfile` at project root
+- `env_file: .env` — all connection details (PostgreSQL, LLM, embeddings) from `.env`
+- Port `8000:8000`
+- Three volume mounts:
+  - `./config.yaml:/app/config.yaml:ro` — non-secret config, read-only
+  - `./logs:/app/logs` — persist logs on the host
+  - `./data:/app/data` — persist generated schema files
+
+#### Compose structure
+```
+services:
+  app:
+    build: .
+    ports: 8000:8000
+    env_file: .env
+    volumes: config.yaml(ro), logs/, data/
+```
 
 **3.2 — Create `.env.docker` template**
-- Safe-to-commit file showing all required env vars without values
-- Document which vars are required vs optional
+
+A safe-to-commit file mirroring `.env` structure — all secret values stripped, every variable annotated as required or optional, with notes on which vars are overridden by `docker-compose.yml` for local runs.
+
+- [ ] **3.2.1** — Strip all secret values (`API_KEY`, `PASSWORD`); keep safe non-secret defaults (endpoints, versions, paths, timeouts)
+- [ ] **3.2.2** — Annotate each variable as `# REQUIRED` or `# OPTIONAL`
+- [ ] **3.2.3** — Mark PostgreSQL connection vars and `POSTGRESQL_SSLMODE` as `# overridden by docker-compose.yml for local` — they don't need filling for local compose runs
+- [ ] **3.2.4** — Add a header comment explaining the file is a template to copy to `.env` and fill in before running the container
+- [ ] **3.2.5** — Commit `.env.docker` to git; `.env` remains gitignored
 
 ---
 

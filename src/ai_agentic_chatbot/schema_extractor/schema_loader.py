@@ -14,7 +14,7 @@ class SchemaLoader:
     """Utility class to load pre-processed schema data."""
 
     def __init__(self):
-        self.base_dir = Path(__file__).resolve().parent.parent
+        self.base_dir = Path(__file__).resolve().parent.parent.parent.parent
         self.temp_dir = self.base_dir / "temp"
 
     def load_schema_json(self) -> Dict:
