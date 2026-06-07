@@ -25,6 +25,7 @@
 17. [Testing](#17-testing)
 18. [Change Log](#18-change-log)
 19. [Known Performance Issue — Excessive Embedding API Calls](#19-known-performance-issue--excessive-embedding-api-calls)
+20. [Dockerize & Deploy to Azure VM — Todo List](#20-dockerize--deploy-to-azure-vm--todo-list)
 
 ---
 
@@ -1644,6 +1645,234 @@ Add:
 | `get_vector_store()` — to be added | `infrastructure/vector_store/pgvector_store.py` | — |
 | `get_table_docs_for_search()` | `schema_extractor/schema_loader.py` | 53 |
 | `VectorSchemaBuilder.build_table_text()` | `schema_extractor/vector_schema_builder.py` | 16 |
+
+---
+
+---
+
+## 20. 🐳 Dockerize & Deploy to Azure VM — Todo List
+
+> **Goal:** Package the FastAPI application into a Docker image and deploy it to an Azure Virtual Machine with TLS, auto-restart, and CI/CD support.
+
+---
+
+### Phase 1 — Pre-Dockerization Cleanup
+
+**1.1 — Fix Windows-specific file paths**
+- `config.yaml` and `.env` contain hardcoded Windows paths (e.g. `D:\ai_azure_cert_file\...`) for SSL certs and prompt files
+- Replace all hardcoded paths with environment variables that can be overridden at container runtime
+- Audit `ROUTER_PROMPT_PATH`, `CONFIG_DIR`, `SCHEMA_PATH`, `SCHEMA_SUMMARY_PATH`, `SYSTEM_PROMPT_PATH` in `.env`
+
+**1.2 — Externalize secrets from `config.yaml`**
+- `config.yaml` currently embeds API keys and DB passwords inline
+- Move all secrets to environment variables; `config.yaml` should only hold non-sensitive structure (pool sizes, log levels, model names)
+- Verify `config.example.yaml` is fully sanitized and up to date
+
+**1.3 — Audit `.dockerignore`**
+- Current `.dockerignore` only excludes `.venv`, `__pycache__`, `.env`, `build`, `worker.egg-info`
+- Add: `*.log`, `logs/`, `.git`, `tests/`, `*.md`, `*.pyc`, `**/__pycache__`, `config.yaml` (secrets come from env/mounted volume at runtime)
+
+**1.4 — Create `logs/` directory placeholder**
+- The app writes rotating log files; add `logs/.gitkeep`
+- Ensure the log path is configurable via env var (not hardcoded to a Windows path)
+
+---
+
+### Phase 2 — Dockerfile
+
+**2.1 — Create `Dockerfile` at project root**
+- Base image: `python:3.13-slim` (matches `pyproject.toml` requirement)
+- Install system deps: `libpq-dev gcc` (required for `psycopg2-binary` and `cryptography`)
+- Install Poetry and configure it for non-interactive, no-venv mode inside the container
+- Copy `pyproject.toml` and `poetry.lock` first (layer-cache optimization), install deps
+- Copy the full `src/` directory
+- Copy `config.example.yaml` as the default config template
+- Set `PYTHONPATH=/app/src`
+- Expose port `8000`
+- Default CMD: `uvicorn ai_agentic_chatbot.server:app --host 0.0.0.0 --port 8000`
+
+**2.2 — Create `entrypoint.sh`**
+- Validate required environment variables are set before starting the app
+- Optionally run a DB connectivity check and retry before marking the container ready
+- Exec into the uvicorn process
+
+---
+
+### Phase 3 — Docker Compose (Local Testing)
+
+**3.1 — Create `docker-compose.yml`**
+- Service `app`: FastAPI container built from `Dockerfile`
+- Service `pgvector`: `pgvector/pgvector:pg16` image — PostgreSQL with pgvector pre-installed (for local testing, separate from the Azure-hosted DB)
+- Mount `config.yaml` as a bind volume into the container (avoid baking secrets into the image)
+- Pass all secrets via `.env` file using `env_file:` directive
+- Health checks for both services
+- Named volume for pgvector data persistence
+
+**3.2 — Create `.env.docker` template**
+- Safe-to-commit file showing all required env vars without values
+- Document which vars are required vs optional
+
+---
+
+### Phase 4 — Azure VM Setup
+
+**4.1 — Provision the Azure VM**
+- Recommended size: `Standard_B2s` or `Standard_D2s_v3` (2 vCPU, 4–8 GB RAM)
+- OS: Ubuntu Server 22.04 LTS
+- Open inbound ports: `22` (SSH), `8000` (API), `443` (HTTPS via reverse proxy)
+- Assign a static public IP or DNS label
+- Add the VM to the same VNet as the Azure PostgreSQL instance, or configure the PostgreSQL firewall to allow the VM's IP
+
+**4.2 — Install Docker on the VM**
+```bash
+sudo apt-get update
+sudo apt-get install -y ca-certificates curl gnupg
+# Add Docker's official GPG key and repo, then:
+sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+sudo usermod -aG docker $USER
+```
+
+**4.3 — Configure Azure PostgreSQL firewall**
+- Add the VM's outbound public IP to the Azure PostgreSQL `Allowed IPs` list, **or**
+- Place the VM in the same VNet and use a private endpoint (recommended for production)
+
+---
+
+### Phase 5 — Azure Container Registry
+
+**5.1 — Create an Azure Container Registry (ACR)**
+```bash
+az acr create --name <registry-name> --resource-group <rg> --sku Basic
+```
+- Enable admin access, or use managed identity for the VM
+
+**5.2 — Build and push the image**
+```bash
+az acr login --name <registry-name>
+docker build -t <registry-name>.azurecr.io/ai-agentic-chatbot:latest .
+docker push <registry-name>.azurecr.io/ai-agentic-chatbot:latest
+```
+
+**5.3 — Configure the VM to pull from ACR**
+- Run `az acr login` on the VM, or assign the `AcrPull` role to the VM's managed identity
+
+---
+
+### Phase 6 — Secrets Management on the VM
+
+**6.1 — Choose a secrets strategy**
+- **Option A (simple):** Place `.env` at `/opt/ai-chatbot/.env` on the VM, restrict permissions to `600`, reference it in the `docker run` command
+- **Option B (recommended):** Use **Azure Key Vault** — store all API keys there, use the VM's managed identity to fetch secrets at startup via a small init script
+
+**6.2 — Mount `config.yaml` from the VM filesystem**
+- Store `config.yaml` (non-secret parts only) at `/opt/ai-chatbot/config.yaml` on the VM
+- Bind-mount it read-only: `-v /opt/ai-chatbot/config.yaml:/app/config.yaml:ro`
+
+---
+
+### Phase 7 — Container Deployment on the VM
+
+**7.1 — Pull and run the container**
+```bash
+docker pull <registry>.azurecr.io/ai-agentic-chatbot:latest
+
+docker run -d \
+  --name ai-chatbot \
+  --restart unless-stopped \
+  --env-file /opt/ai-chatbot/.env \
+  -v /opt/ai-chatbot/config.yaml:/app/config.yaml:ro \
+  -v /opt/ai-chatbot/logs:/app/logs \
+  -p 8000:8000 \
+  <registry>.azurecr.io/ai-agentic-chatbot:latest
+```
+
+**7.2 — Verify the deployment**
+```bash
+docker logs ai-chatbot
+curl http://localhost:8000/health
+curl http://localhost:8000/db-health
+```
+
+---
+
+### Phase 8 — Reverse Proxy & HTTPS
+
+**8.1 — Install Nginx on the VM**
+- Acts as a reverse proxy in front of the container on port `8000`
+- Handles TLS termination
+
+**8.2 — Obtain a TLS certificate**
+- Use Let's Encrypt via Certbot (if a domain name points to the VM), **or**
+- Use Azure Application Gateway in front of the VM for managed TLS
+
+**8.3 — Configure Nginx**
+```nginx
+server {
+    listen 443 ssl;
+    server_name <your-domain>;
+
+    location / {
+        proxy_pass http://127.0.0.1:8000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_buffering off;   # Required for SSE /stream endpoint
+    }
+}
+```
+
+> ⚠️ `proxy_buffering off` is critical — the `/stream` endpoint uses **Server-Sent Events** and will hang with buffering enabled.
+
+---
+
+### Phase 9 — CI/CD Pipeline (Optional)
+
+**9.1 — Create a GitHub Actions workflow**
+- Trigger on push to `main`
+- Steps: checkout → build Docker image → push to ACR → SSH into Azure VM → pull new image → restart container
+
+**9.2 — Store secrets in GitHub Actions**
+- `ACR_USERNAME`, `ACR_PASSWORD`, `VM_SSH_KEY`, `VM_HOST`
+
+---
+
+### Phase 10 — Observability & Maintenance
+
+**10.1 — Set up log forwarding**
+- Bind-mount `/app/logs` to the VM filesystem (already covered in Phase 7.1)
+- Optionally ship logs to Azure Monitor / Log Analytics via the Azure Monitor Agent
+
+**10.2 — Container auto-restart**
+- `--restart unless-stopped` ensures the container comes back after VM reboots (set in Phase 7.1)
+
+**10.3 — Health check cron on the VM**
+```bash
+# /etc/cron.d/ai-chatbot-healthcheck
+*/5 * * * * root curl -sf http://localhost:8000/health || docker restart ai-chatbot
+```
+
+**10.4 — First-run schema ingestion**
+- After first deployment, call the schema setup pipeline once (see [Section 10.9](#109-full-schema-setup-pipeline-3-step)):
+  1. `GET /schemaJson`
+  2. `GET /schemaText`
+  3. `GET /ingest`
+- This populates pgvector so the SQL agent can perform semantic table search
+
+---
+
+### Files to Create / Modify
+
+| File | Action | Notes |
+|---|---|---|
+| `Dockerfile` | **Create** | Python 3.13-slim, Poetry, expose 8000 |
+| `entrypoint.sh` | **Create** | Env var validation + uvicorn exec |
+| `docker-compose.yml` | **Create** | App + pgvector services for local testing |
+| `.env.docker` | **Create** | Safe template — no real values |
+| `.dockerignore` | **Update** | Add logs/, .git, tests/, config.yaml |
+| `config.yaml` | **Update** | Remove hardcoded secrets — use env var references |
+| `.env` | **Update** | Replace Windows paths with Linux-compatible paths |
+| `.github/workflows/deploy.yml` | **Create** | CI/CD pipeline (optional) |
+
+> **Critical blockers to fix first:** Item 1.1 (Windows paths) and 1.2 (secrets in `config.yaml`) — the container will fail to start if these are not resolved before building the image.
 
 ---
 
