@@ -1,10 +1,13 @@
-from typing import List, Dict
+from typing import List, Dict, Tuple, Optional
 
 from langchain_core.documents import Document
 from langchain_postgres import PGVector
 
 from ai_agentic_chatbot.infrastructure.datasource import get_engine
 from ai_agentic_chatbot.infrastructure.embedding.embedding_connection import get_azure_openai_embedding
+from ai_agentic_chatbot.logging_config import get_logger
+
+logger = get_logger(__name__)
 
 
 class PgVectorSchemaStore:
@@ -12,6 +15,7 @@ class PgVectorSchemaStore:
     Infrastructure service responsible for:
     - Embedding schema text
     - Storing vectors in PostgreSQL (pgvector)
+    - Searching stored vectors by semantic similarity
     """
 
     def __init__(
@@ -20,9 +24,6 @@ class PgVectorSchemaStore:
             collection_name: str = "db_schema_vectors",
             embedding_model: str = "text-embedding-3-small",
     ):
-        # self._embedding = OpenAIEmbeddings(model=embedding_model)
-        # self._embedding = get_embedding(provider=LLMProvider.AZURE_OPENAI,model=ModelType.EMBEDDING)
-
         self._engine = get_engine("postgresql.primary")
         self._embedding = get_azure_openai_embedding()
 
@@ -44,3 +45,52 @@ class PgVectorSchemaStore:
             )
 
         self._vectorstore.add_documents(documents)
+
+    def search(
+        self,
+        query: str,
+        k: int = 5,
+        score_threshold: float = 0.3,
+    ) -> List[Tuple[str, float]]:
+        """Search stored schema vectors by semantic similarity to query.
+
+        Uses similarity_search_with_relevance_scores (NOT similarity_search_with_score)
+        because PGVector returns cosine *distance* (lower = better) from the raw method.
+        The relevance variant converts it to cosine *similarity* (higher = better, 0-1)
+        via: relevance = 1.0 - distance. The score_threshold of 0.3 applies directly.
+
+        Costs exactly 1 embedding API call regardless of how many tables are stored.
+
+        Args:
+            query: The user query to search against stored schema embeddings.
+            k: Maximum number of results to return before threshold filtering.
+            score_threshold: Minimum relevance score (0-1) to include a result.
+
+        Returns:
+            List of (table_name, relevance_score) sorted by score descending.
+        """
+        results = self._vectorstore.similarity_search_with_relevance_scores(query, k=k)
+
+        matched = []
+        for doc, score in results:
+            if score >= score_threshold:
+                table_name = doc.metadata.get("table_name", "")
+                if table_name:
+                    matched.append((table_name, score))
+                else:
+                    logger.warning(f"pgvector document missing table_name in metadata: {doc.metadata}")
+
+        matched.sort(key=lambda x: x[1], reverse=True)
+        logger.debug(f"pgvector search returned {len(matched)} tables above threshold {score_threshold}")
+        return matched
+
+
+_vector_store: Optional[PgVectorSchemaStore] = None
+
+
+def get_vector_store() -> PgVectorSchemaStore:
+    """Return the singleton PgVectorSchemaStore instance."""
+    global _vector_store
+    if _vector_store is None:
+        _vector_store = PgVectorSchemaStore(connection_string="")
+    return _vector_store

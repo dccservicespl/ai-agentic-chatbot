@@ -1453,35 +1453,47 @@ poetry run pytest --cov=src/ai_agentic_chatbot
 
 ---
 
-## 19. ⚠️ Known Performance Issue — Excessive Embedding API Calls
+## 19. ⚠️ Performance Issue — Excessive Embedding API Calls & Fix
 
 **File:** `src/ai_agentic_chatbot/agent/subgraphs/sql_query/nodes/retrieve_schemas.py` — `_semantic_search()`
 
 ### Observed Behaviour
 
-Every user query triggers **~100+ HTTP calls** to the Azure OpenAI embedding endpoint (`text-embedding-3-small`). This is visible in logs as a long burst of:
+Every user query triggers **~102 HTTP calls** to the Azure OpenAI embedding endpoint (`text-embedding-3-small`), visible in logs as a burst of identical lines before any SQL is generated:
 
 ```
 INFO - httpx - HTTP Request: POST https://.../openai/deployments/text-embedding-3-small/embeddings ... "HTTP/1.1 200 OK"
+INFO - httpx - HTTP Request: POST https://.../openai/deployments/text-embedding-3-small/embeddings ... "HTTP/1.1 200 OK"
+... (repeats ~100 times)
 ```
 
-### Root Cause
+---
 
-`_semantic_search()` calls `embedding_model.embed_query()` individually for every piece of schema text on **every single query**, including content that never changes between requests.
+### Root Cause — Two Systems That Were Never Wired Together
 
-The call breakdown for **4 tables** with the current schema YAML:
+The system has **two parallel schema search mechanisms** that were built independently and never connected:
+
+**1. The `/ingest` pipeline (correct, runs once at setup)**
+
+`VectorSchemaBuilder.build_table_text()` concatenates all schema information — business purpose, key fields, example questions, relationships, operational notes — into one rich text block per table. `PgVectorSchemaStore.ingest()` embeds each block **once** and stores the vectors in pgvector (PostgreSQL). This is the right approach.
+
+**2. `_semantic_search()` at query time (the problem, runs on every request)**
+
+Completely ignores pgvector. Instead reads the YAML file directly, re-embeds every individual field separately with manual weighting, and computes cosine similarity in Python. This runs **102 API calls per user query**.
+
+The developer who wrote `_semantic_search()` wanted weighted multi-level matching (example questions ×2.0, business purpose ×1.5, key fields ×1.2) and implemented it manually — but at the cost of bypassing the already-computed pgvector embeddings entirely.
+
+**Call breakdown per request (4 tables, current `schema_documentation.yaml`):**
 
 ```
-1 call        → embed_query(user_query)                       # computed once before the loop
+1 call        → embed_query(user_query)                 # line 98, once before the loop
 
 Per table (×4 tables):
-  N calls     → embed_query(each example_question)           # lines 110–116
-  1 call      → embed_query(business_purpose)                # line 121
-  1 call      → embed_query(search_text)                     # line 129
-  N calls     → embed_query(each key_field.meaning)          # lines 137–139
+  N calls     → embed_query(each example_question)      # lines 110–116
+  1 call      → embed_query(business_purpose)           # line 121
+  1 call      → embed_query(search_text)                # line 129
+  N calls     → embed_query(each key_field.meaning)     # lines 137–139
 ```
-
-Concrete totals from the current `schema_documentation.yaml`:
 
 | Table | `example_questions` | `key_fields` | Per-table calls |
 |---|---|---|---|
@@ -1491,45 +1503,147 @@ Concrete totals from the current `schema_documentation.yaml`:
 | `product` | 7 | 19 | **28** |
 | **Total** | | + 1 (user query) | **~102 calls/request** |
 
-### Why This Matters
+The call count grows linearly with `tables × (example_questions + key_fields)`. A richer schema makes it worse.
 
-- **Latency:** Each `embed_query()` is a synchronous HTTP round-trip. 100+ sequential calls add significant overhead to every user-facing query, stacking on top of LLM latency.
-- **Cost:** Azure OpenAI charges per token processed. Re-embedding identical schema text on every request multiplies token spend by the number of queries.
-- **Scalability:** The call count grows linearly with `tables × (example_questions + key_fields)`. Adding more tables or richer schema docs makes it worse.
+---
 
-### The Fix (Not Yet Implemented)
+### Impact
 
-The schema text (`example_questions`, `business_purpose`, `key_field meanings`) is **static** — it never changes between queries. Embeddings for it should be computed **once** and reused:
+| Dimension | Effect |
+|---|---|
+| **Latency** | 100+ sequential HTTP round-trips before any SQL generation begins, stacking on top of LLM latency |
+| **Cost** | Azure OpenAI charges per token. Identical static schema text is re-billed on every user query |
+| **Scalability** | Degrades proportionally as more tables or richer schema docs are added |
 
-**Option A — Pre-compute at ingestion time (recommended)**
+---
 
-Store schema embeddings in pgvector alongside the schema documents (already partially supported by `PgVectorSchemaStore`). At query time, run only `embed_query(user_query)` (1 call) and compare against stored vectors via `similarity_search_with_score()`.
+### Solution — Wire `_semantic_search()` to pgvector
+
+The embeddings are already stored in pgvector from `/ingest`. The fix is to use them.
+
+At query time: call `embed_query(user_query)` **once**, then let pgvector do the cosine comparison in SQL against the stored vectors. The rich text block from `VectorSchemaBuilder` already contains all the same information the weighted loop was trying to match separately.
+
+**Before → After:**
 
 ```
 Before:  ~102 embed_query() calls per user query
-After:   1 embed_query() call per user query
+After:      1 embed_query() call per user query
 ```
 
-**Option B — In-process cache (interim fix)**
+#### Score Direction — Critical Detail (Verified)
 
-Cache schema embeddings in a module-level dict on first load, keyed by the text content. Subsequent queries hit the cache instead of the API. Still pays the cost on cold start but eliminates re-computation.
+`PGVector.similarity_search_with_score()` returns **cosine distance** (lower = more similar). Applying `score >= 0.3` directly would be backwards — it would pass bad matches and reject good ones.
 
-**Option C — Batch embed (partial improvement)**
+**Must use `similarity_search_with_relevance_scores()` instead.** Confirmed from `langchain_core/vectorstores/base.py`:
 
-Replace sequential `embed_query()` calls inside the loop with a single `embed_documents([...all_texts...])` call. The Azure OpenAI API accepts up to 2048 inputs per request, so all schema texts can be embedded in one HTTP round-trip instead of N. This doesn't eliminate redundant re-embedding across requests, but reduces per-request latency significantly.
+```python
+def _cosine_relevance_score_fn(distance: float) -> float:
+    return 1.0 - distance   # converts distance → similarity
+```
+
+`PGVector` selects this function automatically when using the default `COSINE` distance strategy. `similarity_search_with_relevance_scores()` returns scores in **0–1 where higher = more similar** — directly compatible with the existing `score_threshold=0.3` without any conversion in our code.
+
+---
+
+### Implementation Plan — 4 Tasks, 2 Files
+
+#### Task 1 — Add `search()` to `PgVectorSchemaStore`
+**File:** `infrastructure/vector_store/pgvector_store.py`
+
+Add a `search(query, k, score_threshold)` method:
+- Calls `self._vectorstore.similarity_search_with_relevance_scores(query, k=k)`
+- PGVector handles `embed_query(query)` internally — **1 API call total**
+- Filters results by `score >= score_threshold`
+- Extracts `doc.metadata["table_name"]` (confirmed present — set by `VectorSchemaBuilder`)
+- Returns `List[Tuple[str, float]]` → `(table_name, relevance_score)`
+
+#### Task 2 — Add `get_vector_store()` singleton
+**File:** `infrastructure/vector_store/pgvector_store.py`
+
+`PgVectorSchemaStore.__init__` calls `get_engine()` and `get_azure_openai_embedding()` on every construction. Without a singleton, a new DB connection and embedding client would be created on every user query.
+
+```python
+_vector_store: Optional[PgVectorSchemaStore] = None
+
+def get_vector_store() -> PgVectorSchemaStore:
+    global _vector_store
+    if _vector_store is None:
+        _vector_store = PgVectorSchemaStore(connection_string="")
+    return _vector_store
+```
+
+Same pattern as `get_schema_loader()` in `schema_loader.py`.
+
+#### Task 3 — Rewrite `_semantic_search()` in `retrieve_schemas.py`
+**File:** `nodes/retrieve_schemas.py`
+
+New flow (return signature `List[Tuple[str, str, float]]` unchanged):
+
+```
+1. get_vector_store().search(query, k, score_threshold)
+   → 1 API call internally (embed_query on user query only)
+   → returns [(table_name, score), ...]
+
+2. get_schema_loader().get_table_docs_for_search()
+   → 0 API calls — file read only
+   → build lookup dict: {table_name → table_doc}
+
+3. For each (table_name, score) from pgvector:
+   → fetch DDL from lookup dict
+   → apply router_hint boost ×1.3 (math only, 0 API calls)
+
+4. Return [(table_name, ddl, score), ...]
+```
+
+`_expand_related_tables()` is unchanged — it only needs `table_docs` and the retrieved list, no embedding calls.
+
+**Fallback:** If pgvector raises (e.g. `/ingest` was never run, store is empty), fall back to router hints — same as the current `except` clause.
+
+#### Task 4 — Remove dead code from `retrieve_schemas.py`
+**File:** `nodes/retrieve_schemas.py`
+
+Remove (all become unused after Task 3):
+- `get_azure_openai_embedding` import
+- `AzureOpenAIEmbeddingConfig` import
+- `AzureOpenAIEmbeddings` import
+- `get_embedding` import
+- `LLMProvider`, `ModelType` imports
+- `_cosine_similarity()` function (lines 192–207)
+- Commented-out old `_semantic_search` block (lines 62–81)
+
+Add:
+- `from ai_agentic_chatbot.infrastructure.vector_store.pgvector_store import get_vector_store`
+
+---
+
+### Files Changed
+
+| File | Change |
+|---|---|
+| `infrastructure/vector_store/pgvector_store.py` | Add `search()` method + `get_vector_store()` singleton |
+| `nodes/retrieve_schemas.py` | Rewrite `_semantic_search()`, remove dead imports and `_cosine_similarity()` |
+
+**No other files change.** `schema_loader.py`, `ingest_vector_schema.py`, `vector_schema_builder.py`, and `pgvector_store.ingest()` are all untouched.
+
+---
+
+### Pre-condition
+
+`/ingest` must have been called at least once so pgvector has data. If the store is empty, the fallback to router hints activates and a warning is logged. This is not a new constraint — the schema setup pipeline (Section 10.9) already requires `/ingest` to be run during initial setup.
+
+---
 
 ### Related Code Locations
 
 | Symbol | File | Line |
 |---|---|---|
-| `_semantic_search()` | `nodes/retrieve_schemas.py` | 83 |
-| `embed_query(query)` — user query | `nodes/retrieve_schemas.py` | 98 |
-| `embed_query(question)` — example questions loop | `nodes/retrieve_schemas.py` | 110 |
-| `embed_query(business_purpose)` | `nodes/retrieve_schemas.py` | 121 |
-| `embed_query(search_text)` | `nodes/retrieve_schemas.py` | 129 |
-| `embed_query(field_meaning)` — key fields loop | `nodes/retrieve_schemas.py` | 137 |
+| `_semantic_search()` — to be rewritten | `nodes/retrieve_schemas.py` | 83 |
+| `_cosine_similarity()` — to be removed | `nodes/retrieve_schemas.py` | 192 |
+| `PgVectorSchemaStore.ingest()` | `infrastructure/vector_store/pgvector_store.py` | 35 |
+| `PgVectorSchemaStore.search()` — to be added | `infrastructure/vector_store/pgvector_store.py` | — |
+| `get_vector_store()` — to be added | `infrastructure/vector_store/pgvector_store.py` | — |
 | `get_table_docs_for_search()` | `schema_extractor/schema_loader.py` | 53 |
-| `PgVectorSchemaStore` | `infrastructure/vector_store/pgvector_store.py` | — |
+| `VectorSchemaBuilder.build_table_text()` | `schema_extractor/vector_schema_builder.py` | 16 |
 
 ---
 

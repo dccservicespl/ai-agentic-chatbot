@@ -1,17 +1,13 @@
 """Schema retrieval node for semantic table search."""
 
-import os
 from typing import List, Tuple, Dict, Any
 from ai_agentic_chatbot.infrastructure.embedding.embedding_connection import (
     get_azure_openai_embedding,
 )
-from ai_agentic_chatbot.infrastructure.llm.config import AzureOpenAIEmbeddingConfig
 from langchain_core.runnables import RunnableConfig
 from ai_agentic_chatbot.schema_extractor.schema_loader import get_schema_loader
-from ai_agentic_chatbot.infrastructure.llm.factory import get_embedding
-from ai_agentic_chatbot.infrastructure.llm.types import LLMProvider, ModelType
 from ai_agentic_chatbot.logging_config import get_logger
-from langchain_openai import AzureOpenAIEmbeddings
+from ai_agentic_chatbot.infrastructure.vector_store.pgvector_store import get_vector_store
 
 logger = get_logger(__name__)
 
@@ -29,7 +25,7 @@ def retrieve_schemas_node(state: dict, config: RunnableConfig) -> dict:
         schema_loader = get_schema_loader()
         table_docs = schema_loader.get_table_docs_for_search()
 
-        retrieved = _semantic_search(user_query, table_docs, router_hints)
+        retrieved = _semantic_searchV2(user_query, table_docs, router_hints)
 
         if not retrieved:
             logger.warning("No tables retrieved from semantic search")
@@ -205,6 +201,95 @@ def _cosine_similarity(vec1: List[float], vec2: List[float]) -> float:
         return 0.0
 
     return dot_product / (magnitude1 * magnitude2)
+
+
+def _semantic_searchV2(
+    query: str,
+    table_docs: List[Dict[str, Any]],
+    router_hints: List[str],
+    k: int = 5,
+    score_threshold: float = 0.3,
+) -> List[Tuple[str, str, float]]:
+    """Semantic search using pgvector stored embeddings — 1 API call per query.
+
+    Replaces _semantic_search() which re-embedded all schema text on every request
+    (~102 API calls). This version calls embed_query() exactly once (internally inside
+    similarity_search_with_relevance_scores), then compares against pre-computed vectors
+    stored in pgvector at /ingest time.
+
+    Falls back to router hints if pgvector raises (e.g. /ingest was never run).
+    """
+    try:
+        # Build a lookup dict for DDL and relationship data from SchemaLoader.
+        # get_table_docs_for_search() is a file read — zero API calls.
+        table_doc_map = {doc["name"]: doc for doc in table_docs}
+
+        # Single API call: pgvector embeds the query internally and compares
+        # against all stored schema vectors using cosine similarity in SQL.
+        # Returns (table_name, relevance_score) sorted descending, already filtered
+        # by score_threshold. Scores are 0-1 (higher = more similar).
+        vector_store = get_vector_store()
+        pgvector_results = vector_store.search(query, k=k, score_threshold=score_threshold)
+
+        if not pgvector_results:
+            logger.warning("pgvector returned no results above threshold — falling back to router hints")
+            return _router_hint_fallback(table_doc_map, router_hints, k)
+
+        results: List[Tuple[str, str, float]] = []
+        for table_name, score in pgvector_results:
+            table_doc = table_doc_map.get(table_name)
+            if not table_doc:
+                logger.warning(f"pgvector returned table '{table_name}' not found in schema loader — skipping")
+                continue
+
+            final_score = score
+
+            # Router hint boost — 30% score bump for tables the router identified.
+            # Pure math, zero API calls.
+            if router_hints and table_name in router_hints:
+                final_score *= 1.3
+                logger.info(f"Router hint boost for {table_name}: {final_score:.3f}")
+
+            # Relationship boost — if the query explicitly names a related table.
+            # Pure string match, zero API calls.
+            relationships = table_doc.get("relationships") or []
+            query_lower = query.lower()
+            for rel in relationships:
+                related_table = rel.get("related_table", "").lower()
+                if related_table and related_table in query_lower:
+                    final_score *= 1.2
+                    logger.info(f"Relationship boost for {table_name} -> {rel.get('related_table')}")
+
+            results.append((table_name, table_doc["ddl"], final_score))
+
+        results.sort(key=lambda x: x[2], reverse=True)
+
+        logger.info("Top semantic matches (V2):")
+        for name, _, score in results[:3]:
+            logger.info(f"  {name}: {score:.3f}")
+
+        return results[:k]
+
+    except Exception as e:
+        logger.error(f"_semantic_searchV2 failed: {e}", exc_info=True)
+        table_doc_map = {doc["name"]: doc for doc in table_docs}
+        return _router_hint_fallback(table_doc_map, router_hints, k)
+
+
+def _router_hint_fallback(
+    table_doc_map: Dict[str, Any],
+    router_hints: List[str],
+    k: int,
+) -> List[Tuple[str, str, float]]:
+    """Return router-hinted tables with a fixed score when vector search is unavailable."""
+    if not router_hints:
+        return []
+    results = []
+    for table_name in router_hints:
+        table_doc = table_doc_map.get(table_name)
+        if table_doc:
+            results.append((table_name, table_doc["ddl"], 0.8))
+    return results[:k]
 
 
 def _expand_related_tables(
