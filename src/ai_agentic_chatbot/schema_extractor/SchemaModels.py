@@ -24,6 +24,8 @@ class TableSchema:
     columns: List[ColumnSchema]
     primary_keys: List[str]
     foreign_keys: List[ForeignKeySchema]
+    object_type: str = "table"          # "table" | "view"
+    view_definition: Optional[str] = None
 
 
 @dataclass

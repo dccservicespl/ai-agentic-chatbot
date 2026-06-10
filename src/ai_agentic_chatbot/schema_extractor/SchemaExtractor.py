@@ -22,10 +22,12 @@ class SchemaExtractor:
             for table_name in self.inspector.get_table_names(schema=schema_name):
                 if not self._table_allowed(table_name):
                     continue
+                tables.append(self._extract_table_schema(schema_name, table_name))
 
-                tables.append(
-                    self._extract_table_schema(schema_name, table_name)
-                )
+            for view_name in self.inspector.get_view_names(schema=schema_name):
+                if not self._table_allowed(view_name):
+                    continue
+                tables.append(self._extract_view_schema(schema_name, view_name))
 
         return DatabaseSchema(
             database_name=database_name,
@@ -65,6 +67,20 @@ class SchemaExtractor:
             columns=columns,
             primary_keys=primary_keys,
             foreign_keys=foreign_keys
+        )
+
+    def _extract_view_schema(self, schema_name: str, view_name: str) -> TableSchema:
+        columns = self._extract_columns(schema_name, view_name)
+        view_definition = self.inspector.get_view_definition(view_name, schema=schema_name)
+
+        return TableSchema(
+            schema_name=schema_name,
+            table_name=view_name,
+            columns=columns,
+            primary_keys=[],
+            foreign_keys=[],
+            object_type="view",
+            view_definition=view_definition,
         )
 
     def _extract_columns(self, schema_name: str, table_name: str) -> list[ColumnSchema]:

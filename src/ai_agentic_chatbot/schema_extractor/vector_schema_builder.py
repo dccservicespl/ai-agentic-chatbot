@@ -1,4 +1,5 @@
 from typing import List, Dict
+import uuid
 import yaml
 
 
@@ -71,6 +72,7 @@ class VectorSchemaBuilder:
                 {
                     "table_name": table["table_name"],
                     "content": content,
+                    "id": str(uuid.uuid5(uuid.NAMESPACE_DNS, table["table_name"])),
                     "metadata": {
                         "database": schema["database_name"],
                         "schema_version": schema["version"],

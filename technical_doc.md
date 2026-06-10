@@ -2623,6 +2623,158 @@ None of the following have a migration script in the repository:
 
 ---
 
+### P2 — Deep Dive: Fix `SchemaExtractor` to Extract Views
+
+#### The Core Problem
+
+The schema setup pipeline runs in 3 steps:
+
+```
+GET /schemaJson  →  GET /schemaText  →  GET /ingest
+  (extract)            (enrich)         (embed into pgvector)
+```
+
+**Step 1 (`/schemaJson`)** calls `SchemaExtractor.extract_database_schema()` which uses SQLAlchemy's inspector. The inspector has **two separate methods** for tables and views — but only one is ever called:
+
+```python
+inspector.get_table_names()   # called  → ['customer', 'orders', 'sales', 'product', 'inventory']
+inspector.get_view_names()    # never called → ['v_sales_summary']  ❌
+```
+
+Because `get_view_names()` is never called, `v_sales_summary` is completely invisible to the entire pipeline. It never enters `db_schema.json`, never gets enriched into YAML, and never gets embedded into pgvector.
+
+The result: even though P1 (system prompt injection) tells the SQL generator to *prefer* `v_sales_summary`, when the semantic retrieval step searches for relevant tables, there is no pgvector entry for the view — it can never be retrieved and passed to the LLM.
+
+---
+
+#### What Needs to Change — 2 Things
+
+**Thing 1 — Extract `v_sales_summary` as a view**
+
+Add a view extraction loop alongside the existing table loop in `SchemaExtractor.extract_database_schema()`. For each view, the inspector's `get_columns()` call works identically to tables in PostgreSQL, so column extraction is free. `get_view_definition()` returns the raw `SELECT ... FROM ...` DDL that defines the view.
+
+The DDL stored in pgvector for `v_sales_summary` will look like:
+
+```sql
+CREATE OR REPLACE VIEW public.v_sales_summary AS
+SELECT s.id AS sales_id, s.order_date, s.quantity * s.unit_price AS line_total,
+       c.customer_name, c.code AS customer_code, c.activation_status AS customer_status,
+       o.order_no, o.order_status, o.grand_total,
+       p.product_name, p.product_code, p.status AS product_status,
+       i.on_hand, i.available_quantity, i.expected_quantity, ...
+FROM sales s
+LEFT JOIN customer c ON s.customer_code = c.code
+LEFT JOIN orders o ON s.reference_no = o.order_no
+LEFT JOIN product p ON s.product_code = p.product_code
+LEFT JOIN inventory i ON s.product_code = i.product_code
+```
+
+Once this is embedded, a query like *"top customers by revenue"* will match `v_sales_summary` in pgvector with a high similarity score. The retrieved DDL is then passed to the SQL generator, which (post-P1) also has the system prompt telling it to prefer this view. Both signals align.
+
+**Thing 2 — Exclude `schema_metadata` and `business_glossary`**
+
+After P0 creates these tables in the database, `get_table_names()` will pick them up on the next `/schemaJson` call. That causes two problems:
+
+- The LLM enrichment step (`/schemaText`) wastes API calls generating "business purpose" docs for internal system tables
+- They get embedded into pgvector and could appear as candidates for semantic search — queries like *"show descriptions"* might retrieve `schema_metadata` instead of a business table
+
+**Fix:** Since `include_tables` in `SchemaExtractionConfig` already acts as a whitelist, `schema_metadata` and `business_glossary` are implicitly excluded from the table loop. The same whitelist is applied to the new view loop via `_table_allowed()`. No extra `exclude_tables` entry is needed as long as `v_sales_summary` is added to `include_tables`.
+
+---
+
+#### Files That Change
+
+| File | Change |
+|---|---|
+| `schema_extractor/SchemaModels.py` | Add `object_type: str = "table"` and `view_definition: str \| None = None` to `TableSchema` dataclass |
+| `schema_extractor/SchemaExtractor.py` | Add view extraction loop in `extract_database_schema()` + new `_extract_view_schema()` method |
+| `server.py` | Add `"v_sales_summary"` to `include_tables` in the `/schemaJson` endpoint config |
+
+---
+
+#### Current Code vs After Fix
+
+**`SchemaExtractor.py` — `extract_database_schema()` before:**
+
+```python
+def extract_database_schema(self) -> DatabaseSchema:
+    tables = []
+    for schema_name in self._get_schemas():
+        if not self._schema_allowed(schema_name):
+            continue
+        for table_name in self.inspector.get_table_names(schema=schema_name):
+            if not self._table_allowed(table_name):
+                continue
+            tables.append(self._extract_table_schema(schema_name, table_name))
+            # views never extracted ❌
+    return DatabaseSchema(database_name=..., tables=tables)
+```
+
+**After:**
+
+```python
+def extract_database_schema(self) -> DatabaseSchema:
+    tables = []
+    for schema_name in self._get_schemas():
+        if not self._schema_allowed(schema_name):
+            continue
+        for table_name in self.inspector.get_table_names(schema=schema_name):
+            if not self._table_allowed(table_name):
+                continue
+            tables.append(self._extract_table_schema(schema_name, table_name))
+        # new: extract views (v_sales_summary)
+        for view_name in self.inspector.get_view_names(schema=schema_name):
+            if not self._table_allowed(view_name):
+                continue
+            tables.append(self._extract_view_schema(schema_name, view_name))
+    return DatabaseSchema(database_name=..., tables=tables)
+
+def _extract_view_schema(self, schema_name: str, view_name: str) -> TableSchema:
+    columns = self._extract_columns(schema_name, view_name)
+    view_definition = self.inspector.get_view_definition(view_name, schema=schema_name)
+    return TableSchema(
+        schema_name=schema_name,
+        table_name=view_name,
+        columns=columns,
+        primary_keys=[],
+        foreign_keys=[],
+        object_type="view",
+        view_definition=view_definition,
+    )
+```
+
+**`server.py` — `/schemaJson` config before:**
+
+```python
+config = SchemaExtractionConfig(
+    include_tables=["orders", "customer", "sales", "product", "inventory"]
+)
+```
+
+**After:**
+
+```python
+config = SchemaExtractionConfig(
+    include_tables=["orders", "customer", "sales", "product", "inventory", "v_sales_summary"]
+)
+```
+
+---
+
+#### After P2 Is Done — Re-run the Setup Pipeline
+
+P2 only changes the extraction code. To make the view available for semantic search, the 3-step pipeline must be re-run once:
+
+```
+GET /schemaJson   → db_schema.json now includes v_sales_summary
+GET /schemaText   → LLM generates business-context YAML for the view
+GET /ingest       → v_sales_summary embedded into pgvector, retrievable by semantic search
+```
+
+From that point: a query like *"show revenue by customer"* → semantic search returns `v_sales_summary` → DDL injected into generation prompt → LLM generates `SELECT ... FROM v_sales_summary` instead of a 3-table JOIN.
+
+---
+
 ### P1 — Deep Dive: Injecting `system_prompt.md` into the SQL Generator
 
 #### The Problem in Plain English
@@ -2808,5 +2960,253 @@ No other files change. The retry logic (appending `previous_error` on subsequent
 Llama-3.3-70B is configured with `max_tokens: 20000` and a 128k context window. The larger input is well within limits and does not affect output speed meaningfully.
 
 ---
+
+---
+
+### P7 — Deep Dive: LLM Provider Resolution Bug — `provider` Argument Silently Ignored
+
+> **GitHub Issue:** [#15](https://github.com/dccservicespl/ai-agentic-chatbot/issues/15)
+
+#### Summary
+
+Despite `config.yaml` having `default: azure_openai.fast` and call sites explicitly passing `LLMProvider.AZURE_OPENAI`, the app was actually running **Azure AI Foundry models** (DeepSeek-V4-Flash / Llama-3.3-70B) for all LLM calls. The `provider` argument to `get_llm()` was silently discarded and the `default` setting had no effect.
+
+---
+
+#### Three Bugs Working Together
+
+**Bug 1 — `settings.py` strips the provider prefix from the default key (line 93–94)**
+
+```python
+default_model_key = llm_config.get("default", "azure_openai.fast")
+if "." in default_model_key:
+    default_model_key = default_model_key.split(".", 1)[1]   # "azure_openai.fast" → "fast"
+```
+
+The provider portion `"azure_openai"` is thrown away immediately. Only `"fast"` survives.
+
+**Bug 2 — Both providers stored under the same short key — last one parsed wins**
+
+`_parse_config()` builds a flat `models` dict keyed by `"fast"`, `"smart"`, `"embedding"`. Both `azure_openai` and `azure_ai_foundry` define `fast` and `smart`. Since `azure_ai_foundry` appears second in `config.yaml`, it silently overwrites the azure_openai entries:
+
+```
+models["fast"]  = AZURE_OPENAI (gpt-4o-mini)      ← stored first
+models["smart"] = AZURE_OPENAI (gpt-4.1)           ← stored first
+models["fast"]  = AZURE_AI_FOUNDRY (DeepSeek)      ← overwrites ❌
+models["smart"] = AZURE_AI_FOUNDRY (Llama-3.3-70B) ← overwrites ❌
+```
+
+**Bug 3 — `factory.py` ignores the `provider` argument entirely (lines 56–71)**
+
+```python
+def get_llm(self, provider=None, model=None):
+    ...
+    model_key = model.value   # just "fast" or "smart" — provider never used
+    model_config = self._settings.get_model_config(model_key)
+    # provider argument is discarded — get_llm(AZURE_OPENAI, SMART)
+    # and get_llm(AZURE_AI_FOUNDRY, SMART) return identical results
+```
+
+---
+
+#### Actual Models Used Before Fix
+
+| Call site | Code says | Key resolved | Model actually used |
+|---|---|---|---|
+| `router.py:62` | `get_llm()` | `"fast"` → AZURE_AI_FOUNDRY | **DeepSeek-V4-Flash** ❌ |
+| `graph.py:13` | `get_llm(AZURE_OPENAI, FAST)` | `"fast"` → AZURE_AI_FOUNDRY | **DeepSeek-V4-Flash** ❌ |
+| `generate_sql.py:50` | `get_llm(AZURE_OPENAI, SMART)` | `"smart"` → AZURE_AI_FOUNDRY | **Llama-3.3-70B** ❌ |
+| `embedding` | `get_embedding()` | `"embedding"` → AZURE_OPENAI | **text-embedding-3-small** ✅ |
+
+---
+
+#### The Fix — Full Provider-Qualified Keys Throughout
+
+The `config.yaml` design (`default: azure_openai.fast`, separate provider blocks) is correct. The fix is to stop stripping the provider prefix and use full keys `"azure_openai.fast"`, `"azure_openai.smart"`, `"azure_ai_foundry.fast"` etc. everywhere so both providers coexist without collision.
+
+**`settings.py` changes:**
+
+1. Keep the full default key — do not strip the provider prefix
+2. Store models under full keys `"{provider}.{model_key}"` instead of just `"{model_key}"`
+
+```python
+# Before
+default_model_key = default.split(".", 1)[1]          # "fast"
+models["fast"] = ModelConfiguration(AZURE_OPENAI, ...) # overwritten by foundry
+
+# After
+default_model_key = default                            # "azure_openai.fast"
+models["azure_openai.fast"]      = ModelConfiguration(AZURE_OPENAI, FAST, ...)
+models["azure_openai.smart"]     = ModelConfiguration(AZURE_OPENAI, SMART, ...)
+models["azure_ai_foundry.fast"]  = ModelConfiguration(AZURE_AI_FOUNDRY, FAST, ...)
+models["azure_ai_foundry.smart"] = ModelConfiguration(AZURE_AI_FOUNDRY, SMART, ...)
+```
+
+**`factory.py` changes:**
+
+Build the lookup key from provider + model when both are supplied:
+
+```python
+# Before — provider ignored
+model_key = model.value   # "smart"
+
+# After — uses provider to build full key
+if provider is not None and model is not None:
+    model_key = f"{provider.value}.{model.value}"   # "azure_openai.smart"
+elif model is not None:
+    model_key = model.value                          # short key fallback (shouldn't occur)
+else:
+    model_key = self._settings.default_model        # "azure_openai.fast" from config
+```
+
+---
+
+#### Models After Fix
+
+| Call | Key resolved | Model used |
+|---|---|---|
+| `get_llm()` | `"azure_openai.fast"` (default) | gpt-4o-mini ✅ |
+| `get_llm(AZURE_OPENAI, FAST)` | `"azure_openai.fast"` | gpt-4o-mini ✅ |
+| `get_llm(AZURE_OPENAI, SMART)` | `"azure_openai.smart"` | gpt-4.1 ✅ |
+| `get_llm(AZURE_AI_FOUNDRY, FAST)` | `"azure_ai_foundry.fast"` | DeepSeek-V4-Flash ✅ |
+| `get_llm(AZURE_AI_FOUNDRY, SMART)` | `"azure_ai_foundry.smart"` | Llama-3.3-70B ✅ |
+
+Both providers coexist. Each call site gets exactly the model it requests. Switching a call site from one provider to another is a one-argument change.
+
+---
+
+#### Files Changed
+
+| File | Change |
+|---|---|
+| `infrastructure/llm/settings.py` | Keep full key as default; store models under `"{provider}.{model_key}"` |
+| `infrastructure/llm/factory.py` | Build lookup key as `"{provider.value}.{model.value}"` when provider is supplied |
+
+---
+
+### P8 — Deep Dive: `/ingest` Duplicates Schema Rows on Every Run
+
+#### Summary
+
+Every call to `GET /ingest` **always inserts new rows** into the pgvector table — it never updates or replaces existing ones. After N ingest runs with 5 tables, the collection holds N×5 rows. Semantic search returns duplicate entries for the same table, consuming the top-k budget and crowding out other relevant tables.
+
+---
+
+#### Root Cause — Three Missing Pieces
+
+**1. No stable document IDs in `VectorSchemaBuilder`**
+
+`vector_schema_builder.py:build_all_tables()` returns chunks with no `id` field:
+
+```python
+{
+    "table_name": "sales",
+    "content": "...",
+    "metadata": { "table_name": "sales", ... }
+    # no "id" field ❌
+}
+```
+
+Without an ID, LangChain generates a **random UUID** per document on every call. Same table ingested 5 times → 5 different UUIDs → 5 separate rows.
+
+**2. `add_documents()` called without `ids=` — upsert never fires**
+
+`pgvector_store.py:47`:
+
+```python
+self._vectorstore.add_documents(documents)   # no ids= argument ❌
+```
+
+LangChain PGVector supports upsert when `ids=` is passed — it executes `INSERT ... ON CONFLICT (id) DO UPDATE`. Without IDs the conflict check never fires and every call is a pure `INSERT`.
+
+**3. No pre-ingest cleanup**
+
+There is no `delete_collection()`, filter-based delete, or any cleanup before inserting. Old rows accumulate indefinitely.
+
+---
+
+#### Impact on Search Quality
+
+After multiple ingest runs, `search()` returns duplicate `table_name` values:
+
+```
+[("sales", 0.91), ("sales", 0.90), ("sales", 0.89), ("customer", 0.88), ("customer", 0.87)]
+```
+
+The top-k limit (`k=5`) is consumed by duplicates of the same table, crowding out other relevant tables. Every downstream step — router hint boost, `_expand_related_tables()`, SQL generation — operates on this polluted result set.
+
+---
+
+#### Fix 1 — Stable Deterministic IDs in `VectorSchemaBuilder`
+
+**File:** `schema_extractor/vector_schema_builder.py`
+
+Use `uuid.uuid5(uuid.NAMESPACE_DNS, table_name)` — produces the **same UUID for the same table name on every run**. Add it to every chunk in `build_all_tables()`:
+
+```python
+import uuid
+
+chunk["id"] = str(uuid.uuid5(uuid.NAMESPACE_DNS, table["table_name"]))
+```
+
+This is the prerequisite for Fix 2 — without stable IDs, upsert has nothing to key on.
+
+---
+
+#### Fix 2 — Pass `ids=` to `add_documents()` to Enable Upsert
+
+**File:** `infrastructure/vector_store/pgvector_store.py:ingest()`
+
+Extract IDs from chunks and pass them explicitly. PGVector then executes `INSERT ... ON CONFLICT (id) DO UPDATE SET embedding=..., document=..., cmetadata=...`:
+
+```python
+def ingest(self, table_chunks: List[Dict]) -> None:
+    documents, ids = [], []
+    for chunk in table_chunks:
+        documents.append(Document(page_content=chunk["content"], metadata=chunk["metadata"]))
+        ids.append(chunk["id"])
+    self._vectorstore.add_documents(documents, ids=ids)
+```
+
+---
+
+#### Fix 3 — `reset_collection()` to Clean Up Existing Duplicates
+
+**File:** `infrastructure/vector_store/pgvector_store.py`
+
+If `/ingest` was called multiple times before this fix, the collection already has duplicates. Add a `reset_collection()` method that drops and recreates the collection, and expose a `force_reset` flag on the `/ingest` endpoint for one-time cleanup:
+
+```python
+def reset_collection(self) -> None:
+    self._vectorstore.delete_collection()
+    self._vectorstore.create_collection()
+```
+
+---
+
+#### Fix 4 — Deduplicate by `table_name` in `search()` (Safety Net)
+
+**File:** `infrastructure/vector_store/pgvector_store.py:search()`
+
+Even with upsert working correctly, add a deduplication step that keeps only the highest-scoring entry per `table_name`. Guards against any future accidental duplicates:
+
+```python
+seen: Dict[str, float] = {}
+for table_name, score in all_results:
+    if table_name not in seen or score > seen[table_name]:
+        seen[table_name] = score
+return sorted(seen.items(), key=lambda x: x[1], reverse=True)
+```
+
+---
+
+#### TODO Summary
+
+| Fix | File | What it does | Priority |
+|---|---|---|---|
+| 1 — Stable IDs | `vector_schema_builder.py` | `uuid.uuid5` per table — same ID every run | P0 — prerequisite |
+| 2 — Upsert via IDs | `pgvector_store.py:ingest()` | `add_documents(docs, ids=ids)` → INSERT OR UPDATE | P0 — stops new duplicates |
+| 3 — Reset existing duplicates | `pgvector_store.py` | `reset_collection()` + `force_reset` flag on `/ingest` | P1 — one-time cleanup |
+| 4 — Search deduplication | `pgvector_store.py:search()` | Keep highest score per `table_name` | P1 — safety net |
 
 *Generated: 2026-05-29 | Updated: 2026-06-10 | Repository: `ai-agentic-chatbot` | Branch: `develop`*
