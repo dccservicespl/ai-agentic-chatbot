@@ -1,0 +1,20 @@
+services:
+
+  # -------------------------------------------------------
+  # app — FastAPI application built from the project root
+  # Dockerfile.
+  #
+  # All connection details (PostgreSQL, LLM, embeddings)
+  # come from .env — pointing to the real Azure-hosted
+  # services for both local testing and production.
+  # -------------------------------------------------------
+  app:
+    build: .
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - ./logs:/app/logs
+      - ./temp:/app/temp

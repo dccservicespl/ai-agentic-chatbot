@@ -83,16 +83,18 @@ class DataSourceSettings(BaseModel):
         ds_data = ds_data.copy()
 
         if provider == DataSourceProvider.POSTGRESQL:
-            if "POSTGRES_HOST" in os.environ:
-                ds_data["host"] = os.environ["POSTGRES_HOST"]
-            if "POSTGRES_PORT" in os.environ:
-                ds_data["port"] = int(os.environ["POSTGRES_PORT"])
-            if "POSTGRES_DB" in os.environ:
-                ds_data["database"] = os.environ["POSTGRES_DB"]
-            if "POSTGRES_USER" in os.environ:
-                ds_data["username"] = os.environ["POSTGRES_USER"]
-            if "POSTGRES_PASSWORD" in os.environ:
-                ds_data["password"] = os.environ["POSTGRES_PASSWORD"]
+            if "POSTGRESQL_HOST" in os.environ:
+                ds_data["host"] = os.environ["POSTGRESQL_HOST"]
+            if "POSTGRESQL_PORT" in os.environ:
+                ds_data["port"] = int(os.environ["POSTGRESQL_PORT"])
+            if "POSTGRESQL_DB" in os.environ:
+                ds_data["database"] = os.environ["POSTGRESQL_DB"]
+            if "POSTGRESQL_USER" in os.environ:
+                ds_data["username"] = os.environ["POSTGRESQL_USER"]
+            if "POSTGRESQL_PASSWORD" in os.environ:
+                ds_data["password"] = os.environ["POSTGRESQL_PASSWORD"]
+            if "POSTGRESQL_SSLMODE" in os.environ:
+                ds_data["sslmode"] = os.environ["POSTGRESQL_SSLMODE"]
 
         elif provider == DataSourceProvider.AZURE_SQL:
             if "AZURE_SQL_HOST" in os.environ:
