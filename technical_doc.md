@@ -2146,6 +2146,74 @@ az acr create --name <registry-name> --resource-group <rg> --sku Basic
 ```
 - Enable admin access, or use managed identity for the VM
 
+The note "Enable admin access, **or** use managed identity for the VM" refers to **how the VM authenticates to pull your image from the ACR**. Two options:
+
+#### Option A — Enable Admin Access (Simple, but less secure)
+
+ACR has a built-in admin user you can enable. It gives you a username + two passwords.
+
+```bash
+az acr update --name <registry-name> --admin-enabled true
+```
+
+Then on the VM, log in using those credentials:
+
+```bash
+az acr login --name <registry-name>
+# OR
+docker login <registry-name>.azurecr.io \
+  --username <registry-name> \
+  --password <password-from-portal>
+```
+
+**Drawback:** Static password — if it leaks, anyone can pull your images. Requires manual credential rotation.
+
+#### Option B — Managed Identity (Recommended for production)
+
+The VM's Azure-managed identity is granted `AcrPull` permission directly. No passwords stored anywhere.
+
+**Step 1:** Enable system-assigned managed identity on the VM:
+```bash
+az vm identity assign \
+  --resource-group <rg> \
+  --name <vm-name>
+```
+
+**Step 2:** Get the VM's principal ID:
+```bash
+az vm show \
+  --resource-group <rg> \
+  --name <vm-name> \
+  --query identity.principalId \
+  --output tsv
+```
+
+**Step 3:** Get the ACR's resource ID:
+```bash
+az acr show --name <registry-name> --query id --output tsv
+```
+
+**Step 4:** Assign the `AcrPull` role — VM identity → ACR:
+```bash
+az role assignment create \
+  --assignee <principal-id-from-step-2> \
+  --role AcrPull \
+  --scope <acr-resource-id-from-step-3>
+```
+
+**Step 5:** On the VM, log in without a password (Azure uses the VM's identity token automatically):
+```bash
+az acr login --name <registry-name>
+```
+
+| | Admin Access | Managed Identity |
+|---|---|---|
+| Setup effort | Minimal | ~5 commands |
+| Security | Weaker (static password) | Strong (no secrets) |
+| Suitable for | Quick testing | Production |
+
+**Recommendation:** Use Managed Identity for production. Admin access is acceptable for initial pipeline testing only.
+
 **5.2 — Build and push the image**
 ```bash
 az acr login --name <registry-name>
@@ -2164,34 +2232,125 @@ docker push <registry-name>.azurecr.io/ai-agentic-chatbot:latest
 - **Option A (simple):** Place `.env` at `/opt/ai-chatbot/.env` on the VM, restrict permissions to `600`, reference it in the `docker run` command
 - **Option B (recommended):** Use **Azure Key Vault** — store all API keys there, use the VM's managed identity to fetch secrets at startup via a small init script
 
+**Option A — Solution Steps**
+
+> **Note:** `scp` runs as your regular SSH user and cannot write directly into `/opt/ai-chatbot/` (owned by root). Copy to home directory first, then move with `sudo`.
+
+```bash
+# Step 1: Copy .env to your home directory on the VM
+scp .env <user>@<vm-ip>:~/ai-chatbot.env
+
+# Step 2: SSH into the VM, then move it to the target location
+sudo mv ~/ai-chatbot.env /opt/ai-chatbot/.env
+
+# Step 3: Lock down permissions — owned by your SSH user, not root
+# Replace <user> with your actual VM username (e.g. azureuser)
+sudo chown <user>:<user> /opt/ai-chatbot/.env
+sudo chmod 600 /opt/ai-chatbot/.env
+```
+
+Reference the `.env` file when running the container:
+```bash
+docker run --env-file /opt/ai-chatbot/.env ...
+```
+
 **6.2 — Mount `config.yaml` from the VM filesystem**
 - Store `config.yaml` (non-secret parts only) at `/opt/ai-chatbot/config.yaml` on the VM
 - Bind-mount it read-only: `-v /opt/ai-chatbot/config.yaml:/app/config.yaml:ro`
+
+> **Note:** `config.yaml` is intentionally **not baked into the Docker image** — it is mounted from the VM at runtime so model settings and tuning knobs can be changed without rebuilding the image.
+
+**Solution Steps**
+
+```bash
+# Step 1: Copy config.yaml to your home directory on the VM
+scp config.yaml <user>@<vm-ip>:~/ai-chatbot-config.yaml
+
+# Step 2: SSH into the VM, then move it to the target location
+sudo mv ~/ai-chatbot-config.yaml /opt/ai-chatbot/config.yaml
+
+# Step 3: Set permissions (readable by all, not secret)
+sudo chmod 644 /opt/ai-chatbot/config.yaml
+sudo chown root:root /opt/ai-chatbot/config.yaml
+```
+
+Add the bind-mount flag when running the container:
+```bash
+docker run \
+  --env-file /opt/ai-chatbot/.env \
+  -v /opt/ai-chatbot/config.yaml:/app/config.yaml:ro \
+  ...
+```
 
 ---
 
 ### Phase 7 — Container Deployment on the VM
 
 **7.1 — Pull and run the container**
-```bash
-docker pull <registry>.azurecr.io/ai-agentic-chatbot:latest
 
-docker run -d \
-  --name ai-chatbot \
-  --restart unless-stopped \
-  --env-file /opt/ai-chatbot/.env \
-  -v /opt/ai-chatbot/config.yaml:/app/config.yaml:ro \
-  -v /opt/ai-chatbot/logs:/app/logs \
-  -p 8000:8000 \
-  <registry>.azurecr.io/ai-agentic-chatbot:latest
+Use `docker-compose.prod.yml` (checked into the repo) to manage the container on the VM. It pulls the pre-built image from ACR, mounts secrets and config from the VM filesystem, and uses named volumes for `logs` and `temp`.
+
+```bash
+# Step 1: Copy docker-compose.prod.yml to the VM
+scp docker-compose.prod.yml <user>@<vm-ip>:~/docker-compose.prod.yml
+
+# Step 2: Start the container
+docker compose -f docker-compose.prod.yml up -d
+
+# Stop the container
+docker compose -f docker-compose.prod.yml down
+
+# Tail live logs
+docker compose -f docker-compose.prod.yml logs -f
 ```
 
+> **Note:** `logs` and `temp` use **named Docker volumes** (not bind mounts). The container runs as a non-root `appuser` — bind-mounting a host directory owned by root causes a `PermissionError` when the app tries to write log files. Named volumes are managed by Docker and are writable by the container user automatically.
+>
+> To inspect logs:
+> ```bash
+> docker compose -f docker-compose.prod.yml logs -f   # stdout/stderr
+> docker exec ai-agentic-chatbot-app-1 cat /app/logs/app.log  # file logs
+> ```
+
 **7.2 — Verify the deployment**
+
+From inside the VM:
 ```bash
-docker logs ai-chatbot
+docker compose -f docker-compose.prod.yml logs
 curl http://localhost:8000/health
 curl http://localhost:8000/db-health
 ```
+
+To verify from outside the VM (browser or curl using the VM's public IP), port `8000` must be opened in the Azure NSG. Do this **temporarily for testing only** — close it again once Phase 8 (Nginx + HTTPS) is in place.
+
+**Enable external access on port 8000 (testing only):**
+```bash
+az network nsg rule create \
+  --resource-group <your-resource-group> \
+  --nsg-name <your-nsg-name> \
+  --name allow-chatbot-8000 \
+  --protocol Tcp \
+  --direction Inbound \
+  --priority 1000 \
+  --destination-port-range 8000 \
+  --access Allow
+```
+
+Then access via:
+```
+http://<vm-public-ip>:8000/health
+http://<vm-public-ip>:8000/db-health
+```
+
+**Disable external access on port 8000 (after testing):**
+```bash
+az network nsg rule delete \
+  --resource-group <your-resource-group> \
+  --nsg-name <your-nsg-name> \
+  --name allow-chatbot-8000
+```
+
+> **Note:** Port 8000 should not remain open in production — it exposes the app over plain HTTP. Phase 8 (Nginx reverse proxy + HTTPS) handles public traffic on port `443` and keeps port `8000` closed externally.
 
 ---
 

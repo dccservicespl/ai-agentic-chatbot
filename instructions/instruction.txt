@@ -1,0 +1,177 @@
+
+Add Useful Indexes for Query Performance
+NL queries will heavily filter by date, customer, and product:
+
+-- customer
+CREATE INDEX idx_customer_code        ON customer(code);
+CREATE INDEX idx_customer_name        ON customer(customer_name);
+
+-- orders
+CREATE INDEX idx_orders_customer_id   ON orders(customer_id);
+CREATE INDEX idx_orders_delivery_date ON orders(delivery_date);
+CREATE INDEX idx_orders_order_status  ON orders(order_status);
+CREATE INDEX idx_orders_order_no      ON orders(order_no);
+
+-- product
+CREATE INDEX idx_product_code         ON product(product_code);
+CREATE INDEX idx_product_name         ON product(product_name);
+CREATE INDEX idx_product_status       ON product(status);
+
+-- inventory
+CREATE INDEX idx_inventory_product    ON inventory(product_code);
+CREATE INDEX idx_inventory_lot        ON inventory(lot_number);
+
+
+
+Create a Denormalized Summary View
+This is a big one. A single flat view joining all 5 tables makes NL-to-SQL dramatically simpler
+and more accurate — the AI generates simpler SQL against the view instead of complex multi-table JOINs:
+
+CREATE OR REPLACE VIEW v_sales_summary AS
+SELECT
+    -- Sales
+    s.id                AS sales_id,
+    s.order_date,
+    s.delivery_date,
+    s.line_no,
+    s.quantity,
+    s.unit_price,
+    s.quantity * s.unit_price   AS line_total,
+    s.sales_status,
+    s.brand,
+    s.origin,
+    s.reference_no,
+
+    -- Customer
+    c.id                AS customer_id,
+    c.code              AS customer_code,
+    c.customer_name,
+    c.short_name,
+    c.activation_status AS customer_status,
+    c.credit_status,
+
+    -- Orders
+    o.id                AS order_id,
+    o.order_no,
+    o.order_status,
+    o.delivery_method,
+    o.grand_total,
+    o.discount,
+    o.delivery_fees,
+    o.total_quantity    AS order_total_quantity,
+    o.po_number,
+
+    -- Product
+    p.id                AS product_id,
+    p.product_name,
+    p.product_code,
+    p.product_number,
+    p.status            AS product_status,
+    p.new_arrival,
+
+    -- Inventory
+    i.id                AS inventory_id,
+    i.on_hand,
+    i.available_quantity,
+    i.expected_quantity,
+    i.base_cost,
+    i.sell_for,
+    i.lot_number,
+    i.receive_date
+
+FROM sales s
+LEFT JOIN customer c  ON s.customer_code  = c.code
+LEFT JOIN orders  o   ON s.reference_no   = o.order_no
+LEFT JOIN product p   ON s.product_code   = p.product_code
+LEFT JOIN inventory i ON s.product_code   = i.product_code;
+
+
+Create a Metadata Table
+Store human-readable descriptions of every table and column:
+CREATE TABLE schema_metadata (
+    id               SERIAL PRIMARY KEY,
+    table_name       VARCHAR(100) NOT NULL,
+    column_name      VARCHAR(100),           -- NULL means it's a table-level description
+    data_type        VARCHAR(50),
+    description      TEXT NOT NULL,
+    sample_values    TEXT,                   -- comma-separated examples
+    is_join_key      BOOLEAN DEFAULT FALSE,
+    join_references  VARCHAR(200)            -- e.g. 'orders.order_no'
+);
+
+
+
+Populate Metadata With Business Descriptions
+This is manual work but extremely high value:
+
+-- Table descriptions
+INSERT INTO schema_metadata (table_name, description) VALUES
+('customer',  'Master list of all customers. Each customer has a unique code used across orders and sales.'),
+('orders',    'Customer orders with status tracking from PENDING through COMPLETED or VOID.'),
+('sales',     'Individual line items of each order. Each row is one product sold in one order.'),
+('product',   'Product master catalog with pricing, status, and category information.'),
+('inventory', 'Current stock levels per product including on-hand, available, and expected quantities.');
+
+-- Column descriptions
+INSERT INTO schema_metadata (table_name, column_name, data_type, description, sample_values, is_join_key) VALUES
+('customer', 'code',            'VARCHAR', 'Unique short code identifying the customer. Used as FK in sales table.', 'CUST001, ABC123', TRUE),
+('customer', 'customer_name',   'VARCHAR', 'Full legal name of the customer.',               'Acme Corp, Global Traders', FALSE),
+('customer', 'activation_status','ENUM',  'Whether customer account is active or inactive.', 'ACTIVE, INACTIVE',          FALSE),
+('customer', 'credit_status',   'VARCHAR', 'Customer credit standing.',                      'GOOD, HOLD, BLOCKED',       FALSE),
+
+('orders',   'order_no',        'VARCHAR', 'Unique order number. Referenced by sales.reference_no.', 'ORD-2024-001',   TRUE),
+('orders',   'order_status',    'ENUM',    'Current status of the order.',  'PENDING, PROCESSING, COMPLETED, VOID',   FALSE),
+('orders',   'delivery_method', 'ENUM',    'How the order will be fulfilled.', 'DELIVERY, PICKUP',                    FALSE),
+('orders',   'grand_total',     'NUMERIC', 'Final order total after discount and delivery fees.', '1500.00, 230.50', FALSE),
+('orders',   'delivery_date',   'DATE',    'Scheduled or actual delivery date.',             '2024-01-15',            FALSE),
+
+('sales',    'reference_no',    'VARCHAR', 'Links sales line to an order via orders.order_no.', 'ORD-2024-001',       TRUE),
+('sales',    'customer_code',   'VARCHAR', 'Links to customer.code.',                        'CUST001',               TRUE),
+('sales',    'product_code',    'VARCHAR', 'Links to product.product_code and inventory.product_code.', 'PROD-A1',   TRUE),
+('sales',    'quantity',        'BIGINT',  'Number of units sold in this line item.',         '10, 50, 200',          FALSE),
+('sales',    'unit_price',      'FLOAT',   'Price per unit at time of sale.',                 '25.00, 100.50',        FALSE),
+('sales',    'order_date',      'DATE',    'Date the order line was placed.',                 '2024-01-10',           FALSE),
+('sales',    'sales_status',    'ENUM',    'Processing state of the sales line.',             'PROCESSING, PROCESSED',FALSE),
+
+('product',  'product_code',    'VARCHAR', 'Unique product identifier. Used as FK in sales and inventory.', 'PRD001', TRUE),
+('product',  'product_name',    'VARCHAR', 'Full product name.',                             'Red Apple 1kg',         FALSE),
+('product',  'status',          'ENUM',    'Product availability status.',                   'CALL, OUT',             FALSE),
+('product',  'new_arrival',     'BOOLEAN', 'Whether product is newly added to catalog.',     'true, false',           FALSE),
+
+('inventory','on_hand',         'BIGINT',  'Total physical stock currently in warehouse.',   '500, 1200',             FALSE),
+('inventory','available_quantity','BIGINT','Stock available for new orders (on_hand minus reserved).', '300, 900',   FALSE),
+('inventory','expected_quantity','BIGINT', 'Incoming stock not yet received.',               '200, 600',              FALSE),
+('inventory','base_cost',       'FLOAT',   'Cost price per unit.',                           '10.00, 45.50',          FALSE),
+('inventory','sell_for',        'FLOAT',   'Listed selling price per unit.',                 '15.00, 60.00',          FALSE);
+
+
+
+
+Write a Business Glossary
+Define terms your users will say in plain English that map to SQL concepts:
+
+CREATE TABLE business_glossary (
+    term         VARCHAR(100) PRIMARY KEY,
+    sql_meaning  TEXT NOT NULL
+);
+
+INSERT INTO business_glossary VALUES
+('revenue',         'SUM(sales.quantity * sales.unit_price)'),
+('total sales',     'SUM(sales.quantity * sales.unit_price)'),
+('active customers','customers WHERE activation_status = ''ACTIVE'''),
+('pending orders',  'orders WHERE order_status = ''PENDING'''),
+('void orders',     'orders WHERE order_status = ''VOID'''),
+('stock level',     'inventory.available_quantity'),
+('low stock',       'inventory WHERE available_quantity < 50'),
+('new arrivals',    'product WHERE new_arrival = TRUE'),
+('this month',      'WHERE order_date >= date_trunc(''month'', CURRENT_DATE)'),
+('last month',      'WHERE order_date BETWEEN date_trunc(''month'', CURRENT_DATE - INTERVAL ''1 month'') AND date_trunc(''month'', CURRENT_DATE) - INTERVAL ''1 day'''),
+('this year',       'WHERE order_date >= date_trunc(''year'', CURRENT_DATE)'),
+('top customers',   'GROUP BY customer_name ORDER BY SUM(quantity * unit_price) DESC'),
+('best sellers',    'GROUP BY product_name ORDER BY SUM(quantity) DESC');
+
+
+  - "Check my memory for the improvement plan"
+  - "Recall the instruction.txt TODO list"
+  - "What was the improvement plan we saved?"
+

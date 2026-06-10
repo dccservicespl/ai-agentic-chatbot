@@ -1,0 +1,28 @@
+services:
+
+  # -------------------------------------------------------
+  # app — production deployment on Azure VM.
+  #
+  # Pulls the pre-built image from Azure Container Registry.
+  # Secrets come from /opt/ai-chatbot/.env on the VM.
+  # config.yaml is bind-mounted read-only from the VM so
+  # model settings can be changed without rebuilding.
+  # logs and temp use named volumes so the non-root appuser
+  # can write to them (bind-mounting host dirs owned by root
+  # causes PermissionError inside the container).
+  # -------------------------------------------------------
+  app:
+    image: dccglobalregistry.azurecr.io/ai-agentic-chatbot:latest
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file:
+      - /opt/ai-chatbot/.env
+    volumes:
+      - /opt/ai-chatbot/config.yaml:/app/config.yaml:ro
+      - ai-chatbot-logs:/app/logs
+      - ai-chatbot-temp:/app/temp
+
+volumes:
+  ai-chatbot-logs:
+  ai-chatbot-temp:
