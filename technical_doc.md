@@ -26,6 +26,7 @@
 18. [Change Log](#18-change-log)
 19. [Known Performance Issue — Excessive Embedding API Calls](#19-known-performance-issue--excessive-embedding-api-calls)
 20. [Dockerize & Deploy to Azure VM — Todo List](#20-dockerize--deploy-to-azure-vm--todo-list)
+21. [NL-to-SQL Accuracy Improvements — Improvement Plan](#21-nl-to-sql-accuracy-improvements--improvement-plan)
 
 ---
 
@@ -2435,4 +2436,377 @@ server {
 
 ---
 
-*Generated: 2026-05-29 | Updated: 2026-06-07 | Repository: `ai-agentic-chatbot` | Branch: `develop`*
+---
+
+## 21. 🎯 NL-to-SQL Accuracy Improvements — Improvement Plan
+
+> **Analysis date:** 2026-06-10 | **GitHub Issue:** [#15](https://github.com/dccservicespl/ai-agentic-chatbot/issues/15)
+> **Context:** Fresh audit comparing `instruction.txt` prescriptions, `system_prompt.md`, and the live codebase. Four bugs and missing database objects identified.
+
+---
+
+### What `instruction.txt` Prescribes
+
+The instruction file defines four infrastructure items that form the foundation of accurate NL-to-SQL generation:
+
+| Object | Type | Purpose |
+|---|---|---|
+| `v_sales_summary` | VIEW | Flat denormalized JOIN of all 5 tables — AI generates simpler SQL against one view instead of complex multi-table JOINs |
+| `schema_metadata` | TABLE + inserts | Human-readable descriptions of every table and column with sample values and join key flags |
+| `business_glossary` | TABLE + inserts | Maps plain-English user terms ("revenue", "low stock", "top customers") to exact SQL expressions |
+| 12 indexes | INDEX | Composite indexes on customer, orders, product, inventory — covers the most common NL filter columns |
+
+---
+
+### Current State of `system_prompt.md`
+
+The system prompt is already comprehensive and well-structured. It contains:
+
+- Full column reference for all 5 tables
+- `v_sales_summary` view columns documented (all 43 columns listed)
+- 30+ business definitions (revenue, stock level, order lifecycle terms, date ranges)
+- The 8-stage order lifecycle (PENDING → COMPLETED / VOID)
+- 12 SQL generation rules (ILIKE, COALESCE, LIMIT 100, COUNT DISTINCT, etc.)
+- Intent classification (SQL_QUERY / GREETING / EXPLAIN / OUT_OF_SCOPE / UNKNOWN)
+- 30+ example query pairs across all domains
+
+**The prompt file is in good shape. The gaps are in the code and database — not the prompt.**
+
+---
+
+### Bugs Found
+
+#### BUG 1 — `system_prompt.md` never reaches the SQL generator (Critical)
+
+**File:** `agent/router.py:79` — correctly loads `get_system_prompt()` and passes it to the router LLM.
+
+**File:** `agent/subgraphs/sql_query/nodes/generate_sql.py:_create_generation_prompt()` — uses a **fully hardcoded inline prompt** with no reference to `system_prompt.md`. The SQL generator is blind to:
+
+- `v_sales_summary` preference rule (Rule 8)
+- All 30+ business definitions (revenue, stock level, etc.)
+- All 12 SQL rules (ILIKE, COALESCE, LIMIT 100, COUNT DISTINCT, etc.)
+- The order lifecycle
+- All 30+ example query patterns
+
+**Impact:** The SMART LLM (Llama-3.3-70B) generates SQL without any domain knowledge, business context, or the rules defined in the system prompt.
+
+**Fix:** Call `get_system_prompt()` inside `_create_generation_prompt()` and prepend it to the prompt.
+
+---
+
+#### BUG 2 — `SchemaExtractor` never extracts views (Critical)
+
+**File:** `schema_extractor/SchemaExtractor.py:extract_database_schema()`
+
+Uses only `inspector.get_table_names()`. PostgreSQL views require `inspector.get_view_names()` — a separate call. Even after `v_sales_summary` is created in the database, it will **never appear** in `db_schema.json`, `schema_documentation.yaml`, or the pgvector store. The view is invisible to the semantic retrieval step.
+
+**Fix:** Add `_extract_view_schema()` using `inspector.get_view_names()` and `inspector.get_view_definition()`, included in `extract_database_schema()` output.
+
+---
+
+#### BUG 3 — Router schema_summary iteration is broken
+
+**File:** `agent/router.py:76-78`
+
+```python
+schema_summary = schema_loader.load_schema_summary()   # returns full JSON dict
+schema_summary_text = "\n".join(
+    [f"- {table}: {desc}" for table, desc in schema_summary.items()]
+)
+```
+
+`schema_summary` structure (from `generate_schema_summary()` in `transform_schema_to_text.py`):
+
+```json
+{
+  "database_name": "...",
+  "version": "v1",
+  "tables": [{ "table": "...", "bussiness_purpose": "...", "example_questions": [...] }]
+}
+```
+
+Calling `.items()` on this dict yields the top-level keys `database_name`, `version`, `tables` as "table names". The router prompt receives `"- database_name: ai_chatbot_db"` instead of actual table names and purposes.
+
+**Fix:** Replace `.items()` iteration with `schema_summary.get("tables", [])` loop using `t["table"]` and `t["bussiness_purpose"]`.
+
+---
+
+#### BUG 4 — LIMIT inconsistency: 10 rows in code vs 100 in system prompt
+
+**File:** `agent/subgraphs/sql_query/nodes/generate_sql.py:117`
+
+```
+"Limit results to a reasonable number (max 10 rows)"
+```
+
+**system_prompt.md Rule 5:**
+
+```
+Default LIMIT 100 — unless user says "all", "every", or specifies a number
+```
+
+The SQL generator applies a 10-row cap while the system prompt promises 100.
+
+**Fix:** Update `generate_sql.py:117` to align with the system prompt default.
+
+---
+
+### Missing Database Objects
+
+None of the following have a migration script in the repository:
+
+| Object | Status | Impact if missing |
+|---|---|---|
+| `v_sales_summary` view | ❌ not created | AI generates complex multi-table JOINs instead of querying the optimized view |
+| `schema_metadata` table + inserts | ❌ not created | Column-level business descriptions unavailable for dynamic injection |
+| `business_glossary` table + inserts | ❌ not created | Term → SQL mapping not available at runtime from DB |
+| 12 indexes on customer/orders/product/inventory | ❌ not created | NL queries filtering by date, customer, product run without index support |
+
+---
+
+### TODO List (Prioritized)
+
+#### P0 — Database objects (prerequisite for everything)
+
+- [ ] Run all SQL from `instruction.txt` in the PostgreSQL business database:
+  - `CREATE OR REPLACE VIEW v_sales_summary AS ...` (joins all 5 tables)
+  - `CREATE TABLE schema_metadata (...)` + all `INSERT INTO schema_metadata` rows
+  - `CREATE TABLE business_glossary (...)` + all `INSERT INTO business_glossary` rows
+  - All 12 `CREATE INDEX` statements on customer, orders, product, inventory
+- [ ] Add a `migrations/` or `scripts/` folder in the repo with these DDL statements so setup is reproducible
+
+#### P1 — Fix SQL generator not using `system_prompt.md`
+
+- [ ] **`generate_sql.py`:** Call `get_system_prompt()` and inject it at the start of `_create_generation_prompt()` so the SMART LLM knows the view preference, business definitions, SQL rules, and example patterns
+
+#### P2 — Fix `SchemaExtractor` missing views
+
+- [ ] **`SchemaExtractor.py`:** Add `_extract_view_schema()` using `inspector.get_view_names()` + `inspector.get_view_definition()`; include views in `extract_database_schema()` output
+- [ ] **`server.py` (schemaJson config):** Add `schema_metadata` and `business_glossary` to `exclude_tables` in `SchemaExtractionConfig` — these are internal metadata tables the AI should not query directly
+
+#### P3 — Fix router schema_summary bug
+
+- [ ] **`router.py:76-78`:** Replace `schema_summary.items()` with `schema_summary.get("tables", [])` loop using `t["table"]` and `t["bussiness_purpose"]`
+
+#### P4 — Fix LIMIT inconsistency
+
+- [ ] **`generate_sql.py:117`:** Change `"max 10 rows"` → `"default LIMIT 100, unless user specifies a count or says 'all'"`
+
+#### P5 — Re-ingest vector store after P0 + P2
+
+- [ ] After creating the view and fixing the extractor, re-run the full schema setup pipeline:
+  1. `GET /schemaJson` — extracts tables + `v_sales_summary` view into `db_schema.json`
+  2. `GET /schemaText` — LLM enriches schema into `schema_documentation.yaml`
+  3. `GET /ingest` — embeds and stores in pgvector so semantic search can retrieve the view
+
+#### P6 — Runtime glossary injection (enhancement)
+
+- [ ] Add a function that queries `business_glossary` at request time, matches terms present in the user query, and injects matching `(term → sql_meaning)` pairs into the SQL generation prompt as a dynamic hint
+- [ ] Add a function that queries `schema_metadata` for column descriptions of the retrieved tables and appends them to the schema context in the generation prompt
+
+---
+
+### Status Summary
+
+| Item | `system_prompt.md` | Code | Database |
+|---|---|---|---|
+| `v_sales_summary` columns documented | ✅ all 43 columns listed | ❌ not extracted by `SchemaExtractor` | ❌ view may not exist |
+| Business glossary | ✅ 30+ terms inline | ❌ not injected into SQL gen | ❌ table may not exist |
+| SQL rules (ILIKE, LIMIT, COALESCE) | ✅ 12 rules defined | ❌ SQL gen uses inline hardcoded prompt | — |
+| 12 indexes | — | — | ❌ not created |
+| `schema_metadata` | — | ❌ not used anywhere | ❌ not created |
+| Router schema summary | ✅ feeds router intent | ❌ BUG — `.items()` gives wrong keys | — |
+| `system_prompt.md` in router | ✅ | ✅ `router.py:79` | — |
+| `system_prompt.md` in SQL gen | ✅ | ❌ `generate_sql.py` ignores it | — |
+
+**Highest-leverage fixes:** P1 (inject system prompt into SQL generator) + P0 (create DB objects). Together these will immediately improve SQL accuracy and view utilisation.
+
+---
+
+### P1 — Deep Dive: Injecting `system_prompt.md` into the SQL Generator
+
+#### The Problem in Plain English
+
+The system makes two LLM calls per query. Only the first one receives `system_prompt.md`:
+
+```
+Router LLM (FAST model — DeepSeek-V4-Flash)     → gets system_prompt.md  ✅
+SQL Generator LLM (SMART model — Llama-3.3-70B) → gets hardcoded generic prompt ❌
+```
+
+The router uses the system prompt to classify intent and identify relevant tables. But when actual SQL is generated — the most critical step — the LLM has no domain knowledge: no business definitions, no view preference, no SQL rules, no example patterns.
+
+---
+
+#### What the SQL Generator Currently Receives
+
+`generate_sql.py:_create_generation_prompt()` (lines 103–138) sends only this to the SMART LLM:
+
+```
+You are an expert SQL query generator...
+
+DATABASE SCHEMA:
+-- Table: sales (Relevance: 0.91)
+CREATE TABLE sales (...)      ← raw DDL from vector store
+
+USER REQUEST:
+show me top customers this year
+
+REQUIREMENTS:
+1. Generate ONLY SELECT queries
+2. Use proper JOIN syntax
+3. Include WHERE clauses
+4. Use GROUP BY when needed
+5. Limit results to max 10 rows   ← conflicts with system_prompt.md rule (should be 100)
+6. Use PostgreSQL syntax
+...
+```
+
+The LLM must infer joins, business term meanings, and query patterns from raw DDL alone.
+
+---
+
+#### What the SQL Generator Should Receive After the Fix
+
+After prepending `system_prompt.md`, the SMART LLM receives full domain context:
+
+```
+# NL-to-SQL System Prompt — Sales Order Management & Inventory System
+
+## ROLE
+You are a PostgreSQL SQL query generator...
+
+## PREFERRED VIEW
+Use v_sales_summary for any query involving more than one table.
+
+## FULL COLUMN REFERENCE
+[all 5 tables with every column and type documented]
+
+## v_sales_summary VIEW COLUMNS
+sales_id, order_date, ..., customer_name, ..., product_name, ..., on_hand, ...
+
+## BUSINESS DEFINITIONS
+"revenue"       → SUM(sales.quantity * sales.unit_price)
+"top customers" → GROUP BY customer_name ORDER BY SUM(quantity * unit_price) DESC
+"this year"     → WHERE order_date >= date_trunc('year', CURRENT_DATE)
+"pending orders"→ orders.order_status = 'PENDING'
+...
+
+## ORDER LIFECYCLE
+PENDING → ORDERED → PROCESSING → PROCESSED → POSTED → DELIVERED → COMPLETED
+
+## SQL GENERATION RULES
+1. SELECT only — never INSERT/UPDATE/DELETE/DROP
+2. Always use aliases (customer c, orders o, sales s, ...)
+3. GROUP BY required for any aggregation
+4. Default LIMIT 100
+5. ILIKE for text search — never LIKE
+6. Prefer v_sales_summary for multi-table queries
+7. COALESCE for nulls in aggregations
+8. COUNT DISTINCT for orders
+...
+
+## EXAMPLE QUERY PAIRS
+Q: Top 10 customers by revenue this year
+→ SELECT customer_name, SUM(quantity * unit_price) AS revenue
+  FROM v_sales_summary
+  WHERE order_date >= date_trunc('year', CURRENT_DATE)
+  GROUP BY customer_name ORDER BY revenue DESC LIMIT 10;
+[30+ more examples]
+
+--- [dynamic section appended below] ---
+
+## RETRIEVED SCHEMA CONTEXT
+-- Table: v_sales_summary (Relevance: 0.94)
+CREATE TABLE v_sales_summary (...)
+
+## USER REQUEST
+show me top customers this year
+```
+
+---
+
+#### The Concrete Code Change
+
+**File:** `src/ai_agentic_chatbot/agent/subgraphs/sql_query/nodes/generate_sql.py`
+
+**Step 1 — Add import at the top of the file:**
+
+```python
+from ai_agentic_chatbot.utils.prompt_loader import get_system_prompt
+```
+
+**Step 2 — Update `_create_generation_prompt()` to prepend the system prompt:**
+
+```python
+# Before
+def _create_generation_prompt(schema_text, user_query, previous_error, generation_attempts):
+    base_prompt = f"""You are an expert SQL query generator...
+
+DATABASE SCHEMA:
+{schema_text}
+
+USER REQUEST:
+{user_query}
+
+REQUIREMENTS:
+...
+Limit results to a reasonable number (max 10 rows)   ← wrong
+..."""
+    return base_prompt
+
+# After
+def _create_generation_prompt(schema_text, user_query, previous_error, generation_attempts):
+    system_context = get_system_prompt()   # loads system_prompt.md at call time
+
+    base_prompt = f"""{system_context}
+
+---
+
+## RETRIEVED SCHEMA CONTEXT
+The following tables were retrieved as most relevant to the user's request:
+
+{schema_text}
+
+## USER REQUEST
+{user_query}
+
+Generate the SQL query following all rules and business definitions above.
+Return ONLY the JSON object — no markdown, no explanation outside the JSON."""
+    return base_prompt
+```
+
+No other files change. The retry logic (appending `previous_error` on subsequent attempts) is added after `base_prompt` exactly as it is today.
+
+---
+
+#### Impact by Query Type
+
+| User Query | Without P1 | With P1 |
+|---|---|---|
+| "show revenue this month" | LLM guesses formula | Knows `revenue = SUM(quantity * unit_price)` from BUSINESS DEFINITIONS |
+| "top customers this year" | Writes 3-table JOIN | Uses `v_sales_summary`, correct GROUP BY pattern from examples |
+| "pending orders" | May use `'pending'` (wrong case) | Knows `order_status = 'PENDING'` from definitions |
+| "find customer abc" | Uses `LIKE '%abc%'` | Uses `ILIKE '%abc%'` (Rule 6) |
+| "sales this month" | May hardcode a date | Uses `date_trunc('month', CURRENT_DATE)` (Rule 12 + examples) |
+| Row limit | Returns 10 rows | Returns 100 rows (Rule 5) |
+| "gross profit" | Unknown — may error | Knows `SUM((sell_for - base_cost) * quantity)` |
+
+---
+
+#### Token Budget Consideration
+
+`system_prompt.md` is ~930 lines (~5,000 tokens). Combined with retrieved schema DDL (~500 tokens), the total input per SQL generation call increases from ~800 tokens to ~5,800 tokens.
+
+| | Current | After P1 |
+|---|---|---|
+| Input tokens per SQL call | ~800 | ~5,800 |
+| Output tokens per SQL call | ~200 | ~200 (unchanged) |
+| Context window used | <1% of 128k | ~4.5% of 128k |
+| Latency impact | baseline | negligible — input tokens are fast |
+
+Llama-3.3-70B is configured with `max_tokens: 20000` and a 128k context window. The larger input is well within limits and does not affect output speed meaningfully.
+
+---
+
+*Generated: 2026-05-29 | Updated: 2026-06-10 | Repository: `ai-agentic-chatbot` | Branch: `develop`*
