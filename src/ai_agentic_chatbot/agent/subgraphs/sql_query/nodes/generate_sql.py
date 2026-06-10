@@ -4,10 +4,15 @@ import re
 import json
 from ai_agentic_chatbot.infrastructure.llm.factory import get_llm
 from ai_agentic_chatbot.infrastructure.llm.types import LLMProvider, ModelType
+from ai_agentic_chatbot.infrastructure.datasource.factory import get_engine
 from langchain_core.messages import SystemMessage
 from pydantic import BaseModel, Field
 from typing import List, Optional
 from ai_agentic_chatbot.utils.prompt_loader import get_system_prompt
+from ai_agentic_chatbot.agent.subgraphs.sql_query.nodes.glossary_lookup import (
+    fetch_glossary_hints,
+    fetch_column_hints,
+)
 from ai_agentic_chatbot.logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -47,6 +52,9 @@ def generate_sql_node(state: dict) -> dict:
     generation_attempts = state.get("generation_attempts", 0)
 
     try:
+        engine = get_engine("postgresql.primary")
+        table_names = [name for name, _ddl, _score in retrieved_tables]
+
         llm = get_llm(LLMProvider.AZURE_OPENAI, ModelType.SMART)
         structured_llm = llm.with_structured_output(SQLGeneration)
 
@@ -55,6 +63,8 @@ def generate_sql_node(state: dict) -> dict:
             user_query=user_query,
             previous_error=previous_error,
             generation_attempts=generation_attempts,
+            glossary_hints=fetch_glossary_hints(user_query, engine),
+            column_hints=fetch_column_hints(table_names, engine),
         )
 
         prompt = SystemMessage(content=prompt_content)
@@ -98,10 +108,15 @@ def _create_generation_prompt(
         user_query: str,
         previous_error: Optional[str] = None,
         generation_attempts: int = 0,
+        glossary_hints: str = "",
+        column_hints: str = "",
 ) -> str:
     """Create the SQL generation prompt."""
 
     system_context = get_system_prompt()
+
+    hints_block = "\n\n".join(filter(None, [glossary_hints, column_hints]))
+    hints_section = f"\n\n{hints_block}" if hints_block else ""
 
     base_prompt = f"""{system_context}
 
@@ -112,7 +127,7 @@ def _create_generation_prompt(
 The following tables/views were retrieved as most relevant to the user's request.
 Use them as the authoritative DDL reference — prefer v_sales_summary whenever it appears:
 
-{schema_text}
+{schema_text}{hints_section}
 
 ## USER REQUEST
 

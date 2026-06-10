@@ -1,7 +1,7 @@
 """Safety validation node for SQL queries."""
 
 import re
-from typing import List
+from typing import List, Tuple
 from ai_agentic_chatbot.logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -40,8 +40,8 @@ def validate_query_node(state: dict) -> dict:
     if syntax:
         errors.extend(syntax)
 
-    # Check 5: Resource limits
-    resource = _check_resource_limits(sql_query)
+    # Check 5: Resource limits — auto-appends LIMIT 100 if missing rather than failing
+    sql_query, resource = _check_resource_limits(sql_query)
     if resource:
         errors.extend(resource)
 
@@ -52,7 +52,7 @@ def validate_query_node(state: dict) -> dict:
     else:
         logger.warning(f"❌ Query failed validation: {errors}")
 
-    return {"is_safe": is_safe, "validation_errors": errors}
+    return {"is_safe": is_safe, "validation_errors": errors, "generated_sql": sql_query}
 
 
 def _is_select_only(query: str) -> bool:
@@ -123,8 +123,8 @@ def _check_injection_patterns(query: str) -> List[str]:
             "Potential schema enumeration attack",
         ),
         (r"UNION.*SELECT.*FROM.*pg_", "Potential PostgreSQL system table access"),
-        (r"'.*OR.*'.*=.*'", "Potential OR-based injection"),
-        (r"'.*AND.*'.*=.*'", "Potential AND-based injection"),
+        (r"'\s*OR\s*'", "Potential OR-based injection"),
+        (r"'\s*AND\s*'", "Potential AND-based injection"),
         (r"1\s*=\s*1", "Potential tautology injection"),
         (r"'.*;\s*--", "Potential comment-based injection"),
         (r"WAITFOR\s+DELAY", "Time-based attack pattern"),
@@ -185,32 +185,37 @@ def _check_basic_syntax(query: str) -> List[str]:
     return errors
 
 
-def _check_resource_limits(query: str) -> List[str]:
-    """Check for resource-intensive operations."""
+def _check_resource_limits(query: str):
+    """Enforce resource limits. Returns (query, errors).
+
+    Missing LIMIT is auto-fixed by appending LIMIT 100 (matching the default
+    in system_prompt.md Rule 5) rather than failing the query outright.
+    Pure aggregate queries (COUNT/SUM/AVG/MAX/MIN with no GROUP BY) are exempt.
+    """
     errors = []
     query_upper = query.upper()
 
-    # Check for LIMIT clause
+    aggregate_only_patterns = [
+        r"SELECT\s+COUNT\(",
+        r"SELECT\s+MAX\(",
+        r"SELECT\s+MIN\(",
+        r"SELECT\s+AVG\(",
+        r"SELECT\s+SUM\(",
+    ]
+    is_aggregate_only = any(
+        re.search(p, query_upper) for p in aggregate_only_patterns
+    ) and "GROUP BY" not in query_upper
+
     if "LIMIT" not in query_upper:
-        # Check if it's a simple query that might not need LIMIT
-        simple_patterns = [
-            r"SELECT\s+COUNT\(",  # COUNT queries
-            r"SELECT\s+MAX\(",  # MAX queries
-            r"SELECT\s+MIN\(",  # MIN queries
-            r"SELECT\s+AVG\(",  # AVG queries
-            r"SELECT\s+SUM\(",  # SUM queries
-        ]
-
-        is_aggregate = any(
-            re.search(pattern, query_upper) for pattern in simple_patterns
-        )
-
-        if not is_aggregate:
-            errors.append(
-                "Query should include LIMIT clause to prevent excessive results"
-            )
+        if not is_aggregate_only:
+            # Strip trailing semicolon, append LIMIT, restore semicolon if needed
+            stripped = query.rstrip()
+            if stripped.endswith(";"):
+                query = stripped[:-1].rstrip() + " LIMIT 100;"
+            else:
+                query = stripped + " LIMIT 100"
+            logger.debug("LIMIT clause missing — auto-appended LIMIT 100")
     else:
-        # Check if LIMIT is reasonable
         limit_match = re.search(r"LIMIT\s+(\d+)", query_upper)
         if limit_match:
             limit_value = int(limit_match.group(1))
@@ -219,26 +224,4 @@ def _check_resource_limits(query: str) -> List[str]:
                     f"LIMIT {limit_value} is too high - maximum allowed is 10000"
                 )
 
-    # Check for potentially expensive operations
-    expensive_patterns = [
-        # (
-        #     r"SELECT\s+\*\s+FROM.*JOIN.*JOIN.*JOIN",
-        #     "Multiple JOINs without specific columns may be expensive",
-        # ),
-        # (r"ORDER\s+BY.*,.*,.*,", "Complex ORDER BY with many columns may be expensive"),
-        # (
-        #     r"GROUP\s+BY.*,.*,.*,.*,",
-        #     "Complex GROUP BY with many columns may be expensive",
-        # ),
-        # # (r'LIKE\s+\'%.*%\'', "Leading wildcard LIKE patterns are expensive"),
-        # (
-        #     r"NOT\s+IN\s+\(SELECT",
-        #     "NOT IN with subquery can be expensive - consider NOT EXISTS",
-        # ),
-    ]
-
-    for pattern, message in expensive_patterns:
-        if re.search(pattern, query_upper):
-            errors.append(f"Performance warning: {message}")
-
-    return errors
+    return query, errors

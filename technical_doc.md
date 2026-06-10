@@ -2566,9 +2566,9 @@ None of the following have a migration script in the repository:
 
 ### TODO List (Prioritized)
 
-#### P0 — Database objects (prerequisite for everything)
+#### P0 — Database objects (prerequisite for everything) ✅
 
-- [ ] Run all SQL from `instruction.txt` in the PostgreSQL business database:
+- [x] Run all SQL from `instruction.txt` in the PostgreSQL business database:
   - `CREATE OR REPLACE VIEW v_sales_summary AS ...` (joins all 5 tables)
   - `CREATE TABLE schema_metadata (...)` + all `INSERT INTO schema_metadata` rows
   - `CREATE TABLE business_glossary (...)` + all `INSERT INTO business_glossary` rows
@@ -2588,21 +2588,132 @@ None of the following have a migration script in the repository:
 
 - [ ] **`router.py:76-78`:** Replace `schema_summary.items()` with `schema_summary.get("tables", [])` loop using `t["table"]` and `t["bussiness_purpose"]`
 
-#### P4 — Fix LIMIT inconsistency
+#### P4 — Fix LIMIT inconsistency ✅ (resolved by P1)
 
-- [ ] **`generate_sql.py:117`:** Change `"max 10 rows"` → `"default LIMIT 100, unless user specifies a count or says 'all'"`
+- [x] **`generate_sql.py:117`:** Hardcoded `"max 10 rows"` removed — P1 rewrote `_create_generation_prompt()` to inject `system_prompt.md` which already contains Rule 5 ("Default LIMIT 100 unless user specifies otherwise"). No separate fix needed.
 
 #### P5 — Re-ingest vector store after P0 + P2
 
 - [ ] After creating the view and fixing the extractor, re-run the full schema setup pipeline:
   1. `GET /schemaJson` — extracts tables + `v_sales_summary` view into `db_schema.json`
   2. `GET /schemaText` — LLM enriches schema into `schema_documentation.yaml`
-  3. `GET /ingest` — embeds and stores in pgvector so semantic search can retrieve the view
+  3. `GET /ingest?force_reset=true` — clears stale rows, embeds and upserts all table/view chunks
+
+---
+
+### P5 — Deep Dive: Re-ingest Vector Store
+
+#### Why This Step Exists
+
+After P0 creates `v_sales_summary` in the database and P2 fixes `SchemaExtractor` to call `get_view_names()`, the pgvector store is still stale — it was ingested before the view existed and has no embedding for it. Until P5 is run, the SQL agent's semantic table discovery (`retrieve_schemas` node) will never surface `v_sales_summary`, so the LLM will keep generating complex multi-table JOINs instead of querying the flat view.
+
+#### The 3-Step Pipeline
+
+**Step 1 — `GET /schemaJson`**
+
+Calls `SchemaExtractor.extract_database_schema()` → now also calls `get_view_names()` + `_extract_view_schema()` (P2 fix). Writes `temp/db_schema.json` containing all 5 tables + the view.
+
+**Step 2 — `GET /schemaText`**
+
+Reads `db_schema.json`, sends each object to the LLM, generates `schema_documentation.yaml` — the enriched description (business purpose, key fields, example questions) that will be embedded.
+
+**Step 3 — `GET /ingest?force_reset=true`**
+
+`force_reset=true` calls `get_vector_store().reset_collection()` first — drops + recreates the pgvector collection to remove any duplicate rows from previous ingest runs. Then upserts 6 clean chunks (5 tables + 1 view) using stable uuid5 IDs.
+
+#### Dependency
+
+P5 cannot run until P0 creates `v_sales_summary` in the database. Order: **P0 → P5**.
+
+---
 
 #### P6 — Runtime glossary injection (enhancement)
 
-- [ ] Add a function that queries `business_glossary` at request time, matches terms present in the user query, and injects matching `(term → sql_meaning)` pairs into the SQL generation prompt as a dynamic hint
-- [ ] Add a function that queries `schema_metadata` for column descriptions of the retrieved tables and appends them to the schema context in the generation prompt
+- [x] Add `glossary_lookup.py` with two functions:
+  - `fetch_glossary_hints(user_query, engine)` — SQL `ILIKE` match of user query against `business_glossary.term`, returns formatted hint block
+  - `fetch_column_hints(table_names, engine)` — queries `schema_metadata` for column descriptions of retrieved tables, returns formatted hint block
+- [x] Update `generate_sql_node` to call both functions and inject hints into `_create_generation_prompt()`
+
+---
+
+### P6 — Deep Dive: Runtime Glossary Injection
+
+#### Problem
+
+The SQL generation LLM has no reliable way to map business language to SQL constructs. When a user says *"show me revenue from active customers this month"*, the LLM must guess:
+- `revenue` → `SUM(quantity * unit_price)` or `grand_total`?
+- `active` → `activation_status = 'ACTIVE'`?
+- `this month` → `WHERE order_date >= date_trunc('month', CURRENT_DATE)`?
+
+Wrong guesses produce syntactically valid but semantically wrong SQL.
+
+#### The Two Lookup Functions
+
+**`fetch_glossary_hints(user_query, engine)`** — `business_glossary` lookup
+
+Runs a single SQL query that matches any `term` from `business_glossary` whose text appears (case-insensitive) in the user's query:
+
+```sql
+SELECT term, sql_meaning
+FROM business_glossary
+WHERE $user_query ILIKE '%' || term || '%'
+```
+
+Returns a formatted block injected into the prompt:
+
+```
+## BUSINESS GLOSSARY (matched to your query)
+- "revenue" → SUM(sales.quantity * sales.unit_price)
+- "active customers" → customers WHERE activation_status = 'ACTIVE'
+- "this month" → WHERE order_date >= date_trunc('month', CURRENT_DATE)
+```
+
+**`fetch_column_hints(table_names, engine)`** — `schema_metadata` lookup
+
+Queries column-level descriptions for the tables the pgvector search returned as relevant:
+
+```sql
+SELECT table_name, column_name, data_type, description, sample_values, is_join_key
+FROM schema_metadata
+WHERE table_name = ANY(:tables) AND column_name IS NOT NULL
+ORDER BY table_name, column_name
+```
+
+Returns a formatted block:
+
+```
+## COLUMN HINTS (for retrieved tables)
+- orders.order_no [VARCHAR, join key]: Unique order number. Referenced by sales.reference_no.
+- orders.grand_total [NUMERIC]: Final order total after discount and delivery fees.
+- sales.reference_no [VARCHAR, join key]: Links sales line to an order via orders.order_no.
+```
+
+#### Where They Are Injected
+
+Both blocks are appended inside `_create_generation_prompt()` in `generate_sql.py`, between the retrieved schema DDL and the user request:
+
+```
+{system_prompt.md content}
+---
+## RETRIEVED SCHEMA CONTEXT
+{DDL from pgvector}
+
+{BUSINESS GLOSSARY block — if any matches}
+
+{COLUMN HINTS block — if any tables matched}
+
+## USER REQUEST
+{user_query}
+```
+
+If the tables don't exist yet (P0 not run), both functions catch the `ProgrammingError` and return an empty string — the prompt degrades gracefully with no crash.
+
+#### Files Changed
+
+| File | Change |
+|---|---|
+| `agent/subgraphs/sql_query/nodes/glossary_lookup.py` | New file — `fetch_glossary_hints()` and `fetch_column_hints()` |
+| `agent/subgraphs/sql_query/nodes/generate_sql.py` | Import and call both lookup functions; pass `engine` + `table_names` to `_create_generation_prompt()` |
 
 ---
 
@@ -3208,5 +3319,153 @@ return sorted(seen.items(), key=lambda x: x[1], reverse=True)
 | 2 — Upsert via IDs | `pgvector_store.py:ingest()` | `add_documents(docs, ids=ids)` → INSERT OR UPDATE | P0 — stops new duplicates |
 | 3 — Reset existing duplicates | `pgvector_store.py` | `reset_collection()` + `force_reset` flag on `/ingest` | P1 — one-time cleanup |
 | 4 — Search deduplication | `pgvector_store.py:search()` | Keep highest score per `table_name` | P1 — safety net |
+
+---
+
+### P3 — Deep Dive: Router Schema Summary `.items()` Bug
+
+#### Summary
+
+The router LLM receives a garbled list of "available tables" — it sees `database_name`, `version`, `tables` as table names instead of the actual business tables (`customer`, `orders`, `sales`, etc.). This breaks intent classification, the answerability check, and the `relevant_tables` hint passed to the SQL subgraph.
+
+---
+
+#### The Full Data Flow
+
+```
+GET /schemaText
+  └── generate_schema_summary()
+        └── writes schema_summary.json  ($SCHEMA_SUMMARY_PATH)
+
+router_node (every user query)
+  └── schema_loader.load_schema_summary()  → returns full JSON dict
+  └── formats dict into text → injected into router LLM prompt
+```
+
+---
+
+#### What `schema_summary.json` Actually Contains
+
+`generate_schema_summary()` in `transform_schema_to_text.py:86–103` writes:
+
+```json
+{
+    "database_name": "ai_chatbot_db",
+    "version": "v1",
+    "tables": [
+        { "table": "customer",  "bussiness_purpose": "Master list of all customers...", "example_questions": [...] },
+        { "table": "orders",    "bussiness_purpose": "Customer orders with status tracking...", "example_questions": [...] },
+        { "table": "sales",     "bussiness_purpose": "Individual line items of each order...", "example_questions": [...] },
+        { "table": "product",   "bussiness_purpose": "Product master catalog...", "example_questions": [...] },
+        { "table": "inventory", "bussiness_purpose": "Current stock levels per product...", "example_questions": [...] }
+    ]
+}
+```
+
+The actual table data is nested inside the `"tables"` key.
+
+---
+
+#### The Bug — `router.py:74-78`
+
+```python
+schema_summary = schema_loader.load_schema_summary()   # returns full dict above
+
+schema_summary_text = "\n".join(
+    [f"- {table}: {desc}" for table, desc in schema_summary.items()]
+)
+```
+
+`.items()` on the top-level dict yields the top-level keys only:
+
+```
+("database_name", "ai_chatbot_db")
+("version",       "v1")
+("tables",        [{"table": "customer", ...}, ...])   ← entire list as one value
+```
+
+So `schema_summary_text` injected into the router prompt becomes:
+
+```
+- database_name: ai_chatbot_db
+- version: v1
+- tables: [{'table': 'customer', 'bussiness_purpose': '...'}, ...]
+```
+
+The router LLM sees `database_name`, `version`, and `tables` as the available "table names".
+
+---
+
+#### Second Bug — `router.py:98` (Same Block)
+
+```python
+response_msg = f"\n\nI can help you with: {', '.join(schema_summary.keys())}."
+```
+
+`schema_summary.keys()` returns `["database_name", "version", "tables"]` — again the top-level keys, not table names. When the router tells the user what data it can help with, it says *"I can help you with: database_name, version, tables"*.
+
+---
+
+#### Impact on Router Behaviour
+
+| Failure | Cause |
+|---|---|
+| `is_answerable: False` for valid queries | LLM sees no `customer`/`orders` table — concludes data is unavailable |
+| `relevant_tables` hint is wrong | LLM returns `["database_name"]` instead of `["customer", "sales"]` — hurts pgvector boost |
+| Out-of-scope guard may break | LLM can't parse garbled list, may mark everything as answerable |
+| Wrong "I can help with" message | Uses top-level JSON keys instead of table names |
+
+---
+
+#### The Fix
+
+**File:** `agent/router.py`
+
+**Fix 1 — lines 74–78: replace `.items()` with nested table loop**
+
+```python
+# Before
+schema_summary_text = "\n".join(
+    [f"- {table}: {desc}" for table, desc in schema_summary.items()]
+)
+
+# After
+schema_summary_text = "\n".join(
+    [
+        f"- {t['table']}: {t['bussiness_purpose']}"
+        for t in schema_summary.get("tables", [])
+    ]
+)
+```
+
+Router prompt now receives:
+
+```
+- customer: Master list of all customers. Each customer has a unique code used across orders and sales.
+- orders: Customer orders with status tracking from PENDING through COMPLETED or VOID.
+- sales: Individual line items of each order. Each row is one product sold in one order.
+- product: Product master catalog with pricing, status, and category information.
+- inventory: Current stock levels per product including on-hand, available, and expected quantities.
+```
+
+**Fix 2 — line 98: replace `.keys()` with actual table names**
+
+```python
+# Before
+response_msg = f"\n\nI can help you with: {', '.join(schema_summary.keys())}."
+
+# After
+table_names = [t["table"] for t in schema_summary.get("tables", [])]
+response_msg = f"\n\nI can help you with: {', '.join(table_names)}."
+```
+
+---
+
+#### Files Changed
+
+| File | Lines | Change |
+|---|---|---|
+| `agent/router.py` | 74–78 | Replace `.items()` with `.get("tables", [])` loop using `t["table"]` and `t["bussiness_purpose"]` |
+| `agent/router.py` | 98 | Replace `.keys()` with list of `t["table"]` from nested tables |
 
 *Generated: 2026-05-29 | Updated: 2026-06-10 | Repository: `ai-agentic-chatbot` | Branch: `develop`*
