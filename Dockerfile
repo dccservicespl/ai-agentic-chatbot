@@ -59,7 +59,7 @@ RUN mkdir -p logs temp
 # PostgreSQL, then execs CMD.
 # -------------------------------------------------------
 COPY entrypoint.sh ./
-RUN chmod +x entrypoint.sh
+RUN sed -i 's/\r$//' entrypoint.sh && chmod +x entrypoint.sh
 
 # -------------------------------------------------------
 # Non-root user — limits blast radius if app is

@@ -32,6 +32,7 @@ from ai_agentic_chatbot.schema_extractor.SchemaExtractionConfig import (
 from ai_agentic_chatbot.schema_extractor.SchemaExtractor import SchemaExtractor
 from ai_agentic_chatbot.application.transform_schema_to_text import (
     transform_schema_to_text,
+    generate_schema_summary,
 )
 from ai_agentic_chatbot.utils.utils import get_db_connection_string
 
@@ -158,6 +159,7 @@ def schema_json():
 def schema_text():
     try:
         transform_schema_to_text()
+        generate_schema_summary()
 
         return {"Schema to text conversion completed"}
     except Exception as exc:

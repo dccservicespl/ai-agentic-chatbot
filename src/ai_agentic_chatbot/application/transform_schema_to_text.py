@@ -12,13 +12,14 @@ from ai_agentic_chatbot.schema_extractor.table_schema_documentation import (
     TableSchemaDocumentation,
 )
 from ai_agentic_chatbot.utils.prompt_loader import load_file_content
-import os
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 SCHEMA_TO_TEXT_PROMPT_PATH = BASE_DIR / "prompts" / "schema_to_text_prompts.md"
 USER_SCHEMA_TO_TEXT_PROMPT_PATH = BASE_DIR / "prompts" / "user_schema_to_text_prompt.md"
 DB_SCHEMA_JSON_PATH = Path(__file__).resolve().parent.parent.parent.parent / "temp" / "db_schema.json"
 YAML_OUT_PATH = Path(__file__).resolve().parent.parent.parent.parent / "temp"
+SCHEMA_DOC_PATH = YAML_OUT_PATH / "schema_documentation.yaml"
+SCHEMA_SUMMARY_PATH = YAML_OUT_PATH / "schema_summary.json"
 
 
 def transform_schema_to_text() -> None:
@@ -83,10 +84,9 @@ logger = get_logger(__name__)
 
 
 def generate_schema_summary() -> None:
-    with open(os.environ["SCHEMA_PATH"], "r") as f:
+    with open(SCHEMA_DOC_PATH, "r") as f:
         schema = yaml.safe_load(f)
 
-    logger.info(schema)
     schema_summary = {
         "database_name": schema.get("database_name"),
         "version": "v1",
@@ -96,15 +96,16 @@ def generate_schema_summary() -> None:
                 "bussiness_purpose": table.get("business_purpose"),
                 "example_questions": table.get("example_questions"),
             }
-            for table in schema.get("tables")
+            for table in schema.get("tables", [])
         ],
     }
-    with open(os.environ["SCHEMA_SUMMARY_PATH"], "w+") as f:
+    SCHEMA_SUMMARY_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(SCHEMA_SUMMARY_PATH, "w") as f:
         json.dump(schema_summary, f)
 
 
 def load_schema_summary() -> str:
-    with open(os.environ["SCHEMA_SUMMARY_PATH"], "r") as f:
+    with open(SCHEMA_SUMMARY_PATH, "r") as f:
         return json.load(f)
 
 

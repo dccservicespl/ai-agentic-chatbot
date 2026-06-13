@@ -2291,27 +2291,108 @@ docker run \
 
 Use `docker-compose.prod.yml` (checked into the repo) to manage the container on the VM. It pulls the pre-built image from ACR, mounts secrets and config from the VM filesystem, and uses named volumes for `logs` and `temp`.
 
+#### Step 1 — Rebuild and push the image (local machine)
+
+> **Important — Windows line endings (CRLF) issue:** `entrypoint.sh` edited on Windows has `\r\n` line endings. Linux cannot execute it because the shebang becomes `#!/bin/sh\r` — an invalid path. The `Dockerfile` strips `\r` via `sed` before `chmod +x`, and `.gitattributes` enforces `eol=lf` for `.sh` files going forward. Always rebuild the image after any change to `entrypoint.sh`.
+
 ```bash
-# Step 1: Copy docker-compose.prod.yml to the VM
-scp docker-compose.prod.yml <user>@<vm-ip>:~/docker-compose.prod.yml
+# On your local Windows machine:
+docker build -t dccglobalregistry.azurecr.io/ai-agentic-chatbot:latest .
+docker push dccglobalregistry.azurecr.io/ai-agentic-chatbot:latest
+```
 
-# Step 2: Start the container
-docker compose -f docker-compose.prod.yml up -d
+#### Step 2 — Copy `docker-compose.prod.yml` to the VM
 
-# Stop the container
-docker compose -f docker-compose.prod.yml down
+Azure VMs use key-based SSH auth (password auth is disabled by default). `scp` requires the `-i` flag pointing to your private key:
+
+```bash
+scp -i ~/.ssh/id_rsa docker-compose.prod.yml <user>@<vm-ip>:~/docker-compose.prod.yml
+```
+
+If `scp` is not available or auth keeps failing, SSH into the VM first and paste the file contents directly:
+
+```bash
+ssh -i ~/.ssh/id_rsa <user>@<vm-ip>
+
+# On the VM — create the file by pasting:
+cat > ~/docker-compose.prod.yml << 'EOF'
+services:
+  app:
+    image: dccglobalregistry.azurecr.io/ai-agentic-chatbot:latest
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file:
+      - /opt/ai-chatbot/.env
+    volumes:
+      - /opt/ai-chatbot/config.yaml:/app/config.yaml:ro
+      - ai-chatbot-logs:/app/logs
+      - ai-chatbot-temp:/app/temp
+
+volumes:
+  ai-chatbot-logs:
+  ai-chatbot-temp:
+EOF
+```
+
+#### Step 3 — Login to ACR and pull the image (on the VM)
+
+```bash
+# Option A — admin credentials
+docker login dccglobalregistry.azurecr.io
+
+# Option B — Azure CLI (managed identity)
+az acr login --name dccglobalregistry
+```
+
+```bash
+docker pull dccglobalregistry.azurecr.io/ai-agentic-chatbot:latest
+```
+
+#### Step 4 — Start the container
+
+```bash
+# Start (detached)
+docker compose -f ~/docker-compose.prod.yml up -d
+
+# Stop
+docker compose -f ~/docker-compose.prod.yml down
+
+# Restart after a new image push
+docker compose -f ~/docker-compose.prod.yml pull
+docker compose -f ~/docker-compose.prod.yml up -d
 
 # Tail live logs
-docker compose -f docker-compose.prod.yml logs -f
+docker compose -f ~/docker-compose.prod.yml logs -f
 ```
 
 > **Note:** `logs` and `temp` use **named Docker volumes** (not bind mounts). The container runs as a non-root `appuser` — bind-mounting a host directory owned by root causes a `PermissionError` when the app tries to write log files. Named volumes are managed by Docker and are writable by the container user automatically.
 >
 > To inspect logs:
 > ```bash
-> docker compose -f docker-compose.prod.yml logs -f   # stdout/stderr
+> docker compose -f ~/docker-compose.prod.yml logs -f       # stdout/stderr
 > docker exec ai-agentic-chatbot-app-1 cat /app/logs/app.log  # file logs
 > ```
+
+#### Troubleshooting — wrong Azure OpenAI endpoint being used
+
+**Symptom:** `/schemaText` (or any endpoint) hits the old URL `https://dcc-azure-openai.cognitiveservices.azure.com/...` even though `config.yaml` has the correct URL `https://dccglobal-ai-services.openai.azure.com/`.
+
+**Cause:** `settings.py` applies env var overrides on top of `config.yaml` at startup. If `AZURE_OPENAI_ENDPOINT` in `/opt/ai-chatbot/.env` on the VM still holds the old URL, it wins over the config file value every time.
+
+**Fix:** Update the env file on the VM and restart:
+
+```bash
+# 1. Edit .env on the VM
+nano /opt/ai-chatbot/.env
+# Set: AZURE_OPENAI_ENDPOINT=https://dccglobal-ai-services.openai.azure.com/
+
+# 2. Restart the container to pick up the change
+docker compose -f ~/docker-compose.prod.yml down
+docker compose -f ~/docker-compose.prod.yml up -d
+```
+
+> **Rule:** `config.yaml` is the source of truth for non-secret settings, but any env var in `.env` silently overrides it. When the app hits an unexpected endpoint, check `/opt/ai-chatbot/.env` on the VM first.
 
 **7.2 — Verify the deployment**
 
