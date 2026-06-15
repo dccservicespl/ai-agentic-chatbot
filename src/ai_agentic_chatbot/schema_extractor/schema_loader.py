@@ -3,9 +3,8 @@
 import json
 import yaml
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Optional
 from ai_agentic_chatbot.logging_config import get_logger
-import os
 
 logger = get_logger(__name__)
 
@@ -29,7 +28,7 @@ class SchemaLoader:
 
     def load_schema_documentation(self) -> Dict:
         """Load the processed schema documentation YAML."""
-        doc_path = Path(os.environ["SCHEMA_PATH"])
+        doc_path = self.temp_dir / "schema_documentation.yaml"
 
         if not doc_path.exists():
             raise FileNotFoundError(f"Schema documentation not found at {doc_path}")
@@ -40,10 +39,7 @@ class SchemaLoader:
     def load_schema_summary(self) -> Dict:
         """Load the schema summary for router hints."""
         try:
-            summary_path = os.environ.get("SCHEMA_SUMMARY_PATH")
-            if not summary_path:
-                raise ValueError("SCHEMA_SUMMARY_PATH environment variable not set")
-
+            summary_path = self.temp_dir / "schema_summary.json"
             with open(summary_path, "r") as f:
                 return json.load(f)
         except Exception as e:

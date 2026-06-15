@@ -34,7 +34,12 @@ class PgVectorSchemaStore:
         )
 
     def ingest(self, table_chunks: List[Dict]) -> None:
-        documents = []
+        """Upsert schema chunks into pgvector using stable deterministic IDs.
+
+        Each chunk must carry an "id" field (uuid5 keyed on table_name) so that
+        repeated /ingest calls UPDATE existing rows instead of inserting duplicates.
+        """
+        documents, ids = [], []
 
         for chunk in table_chunks:
             documents.append(
@@ -43,8 +48,16 @@ class PgVectorSchemaStore:
                     metadata=chunk["metadata"],
                 )
             )
+            ids.append(chunk["id"])
 
-        self._vectorstore.add_documents(documents)
+        self._vectorstore.add_documents(documents, ids=ids)
+        logger.info(f"Upserted {len(documents)} schema chunks into pgvector")
+
+    def reset_collection(self) -> None:
+        """Drop and recreate the collection — use once to clear existing duplicates."""
+        self._vectorstore.delete_collection()
+        self._vectorstore.create_collection()
+        logger.info("pgvector collection reset — all existing schema vectors deleted")
 
     def search(
         self,
@@ -60,6 +73,7 @@ class PgVectorSchemaStore:
         via: relevance = 1.0 - distance. The score_threshold of 0.3 applies directly.
 
         Costs exactly 1 embedding API call regardless of how many tables are stored.
+        Deduplicates results by table_name keeping the highest score per table.
 
         Args:
             query: The user query to search against stored schema embeddings.
@@ -71,16 +85,20 @@ class PgVectorSchemaStore:
         """
         results = self._vectorstore.similarity_search_with_relevance_scores(query, k=k)
 
-        matched = []
+        # Deduplicate by table_name — keep highest score per table as a safety
+        # net against any residual duplicate rows in the collection.
+        best: Dict[str, float] = {}
         for doc, score in results:
-            if score >= score_threshold:
-                table_name = doc.metadata.get("table_name", "")
-                if table_name:
-                    matched.append((table_name, score))
-                else:
-                    logger.warning(f"pgvector document missing table_name in metadata: {doc.metadata}")
+            if score < score_threshold:
+                continue
+            table_name = doc.metadata.get("table_name", "")
+            if not table_name:
+                logger.warning(f"pgvector document missing table_name in metadata: {doc.metadata}")
+                continue
+            if table_name not in best or score > best[table_name]:
+                best[table_name] = score
 
-        matched.sort(key=lambda x: x[1], reverse=True)
+        matched = sorted(best.items(), key=lambda x: x[1], reverse=True)
         logger.debug(f"pgvector search returned {len(matched)} tables above threshold {score_threshold}")
         return matched
 

@@ -74,7 +74,10 @@ class RouterNode:
         schema_loader = SchemaLoader()
         schema_summary = schema_loader.load_schema_summary()
         schema_summary_text = "\n".join(
-            [f"- {table}: {desc}" for table, desc in schema_summary.items()]
+            [
+                f"- {t['table']}: {t['bussiness_purpose']}"
+                for t in schema_summary.get("tables", [])
+            ]
         )
         base_prompt = SystemMessage(content=get_system_prompt())
         prompt = SystemMessage(
@@ -88,8 +91,9 @@ class RouterNode:
             }
 
         if not decision.is_answerable:
+            table_names = [t["table"] for t in schema_summary.get("tables", [])]
             response_msg = (
-                f"\n\nI can help you with: {', '.join(schema_summary.keys())}."
+                f"\n\nI can help you with: {', '.join(table_names)}."
             )
             response_msg += (
                 decision.missing_data_reason or "I don't have the data to answer that."

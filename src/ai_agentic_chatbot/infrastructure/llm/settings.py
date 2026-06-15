@@ -89,9 +89,9 @@ class Settings(BaseModel):
         """Parse configuration data into Settings object."""
         llm_config = config_data.get("llm", {})
 
+        # Keep the full "provider.model" key as-is so both providers can coexist
+        # without collision (e.g. "azure_openai.fast" ≠ "azure_ai_foundry.fast").
         default_model_key = llm_config.get("default", "azure_openai.fast")
-        if "." in default_model_key:
-            default_model_key = default_model_key.split(".", 1)[1]
 
         models = {}
 
@@ -115,7 +115,10 @@ class Settings(BaseModel):
 
                         model_type = cls._determine_model_type(model_key)
 
-                        models[model_key] = ModelConfiguration(
+                        # Store under full key "azure_openai.fast" so providers
+                        # never overwrite each other's entries.
+                        full_key = f"{provider_name}.{model_key}"
+                        models[full_key] = ModelConfiguration(
                             provider=provider,
                             model_type=model_type,
                             config=provider_model_config,

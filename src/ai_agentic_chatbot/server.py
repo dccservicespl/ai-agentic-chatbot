@@ -15,6 +15,7 @@ from ai_agentic_chatbot.application.ingest_vector_schema import (
     ingest_schema,
     SCHEMA_TO_TEXT_PATH,
 )
+from ai_agentic_chatbot.infrastructure.vector_store.pgvector_store import get_vector_store
 from ai_agentic_chatbot.infrastructure.datasource.datasource_init import (
     initialize_datasources,
 )
@@ -31,6 +32,7 @@ from ai_agentic_chatbot.schema_extractor.SchemaExtractionConfig import (
 from ai_agentic_chatbot.schema_extractor.SchemaExtractor import SchemaExtractor
 from ai_agentic_chatbot.application.transform_schema_to_text import (
     transform_schema_to_text,
+    generate_schema_summary,
 )
 from ai_agentic_chatbot.utils.utils import get_db_connection_string
 
@@ -127,7 +129,7 @@ def schema_json():
     try:
         db_engine = get_engine("postgresql.primary")
         config = SchemaExtractionConfig(
-            include_tables=["orders", "customer", "sales", "product", "inventory"]
+            include_tables=["orders", "customer", "sales", "product", "inventory", "v_sales_summary"]
         )
 
         extractor = SchemaExtractor(db_engine, config)
@@ -157,6 +159,7 @@ def schema_json():
 def schema_text():
     try:
         transform_schema_to_text()
+        generate_schema_summary()
 
         return {"Schema to text conversion completed"}
     except Exception as exc:
@@ -179,13 +182,17 @@ def schema_text():
         500: {"description": "Ingestion failed — embedding or database error"},
     },
 )
-def ingest_schema_endpoint():
+def ingest_schema_endpoint(force_reset: bool = False):
     try:
+        if force_reset:
+            get_vector_store().reset_collection()
+            logger.info("force_reset=True: pgvector collection cleared before ingest")
+
         ingest_schema(
             schema_path=SCHEMA_TO_TEXT_PATH,
             pg_conn_str=get_db_connection_string(),
         )
-        return {"Schema to text conversion completed"}
+        return {"status": "ingested", "force_reset": force_reset}
     except Exception as exc:
         raise exc
 

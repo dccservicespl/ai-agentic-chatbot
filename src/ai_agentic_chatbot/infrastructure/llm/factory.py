@@ -54,12 +54,11 @@ class LLMFactory:
             ValueError: If the provider/model combination is not found.
         """
         if provider is None and model is None:
-            model_key = self._settings.default_model
+            model_key = self._settings.default_model        # e.g. "azure_openai.fast"
+        elif provider is not None and model is not None:
+            model_key = f"{provider.value}.{model.value}"   # e.g. "azure_openai.smart"
         else:
-            if model is None:
-                model = ModelType.FAST
-
-            model_key = model.value
+            model_key = f"{(provider or LLMProvider.AZURE_OPENAI).value}.{(model or ModelType.FAST).value}"
 
         if model_key in self._clients:
             return self._clients[model_key]

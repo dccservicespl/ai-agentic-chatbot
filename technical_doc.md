@@ -26,6 +26,7 @@
 18. [Change Log](#18-change-log)
 19. [Known Performance Issue — Excessive Embedding API Calls](#19-known-performance-issue--excessive-embedding-api-calls)
 20. [Dockerize & Deploy to Azure VM — Todo List](#20-dockerize--deploy-to-azure-vm--todo-list)
+21. [NL-to-SQL Accuracy Improvements — Improvement Plan](#21-nl-to-sql-accuracy-improvements--improvement-plan)
 
 ---
 
@@ -1107,29 +1108,121 @@ After setup, the SQL agent uses `SchemaLoader.get_table_docs_for_search()` at qu
 
 ## 12. 📊 Visualization Engine
 
-**File:** `agent/nodes/visualizer.py` — `VisualizationNode`
+**File:** `src/ai_agentic_chatbot/agent/nodes/visualizer.py`
 
-### Chart Type Heuristics
+### Overview
 
-The visualizer analyzes the `query_result` DataFrame and applies these rules in order:
+The Visualization Engine is a **LangGraph node** in the agent pipeline. Its sole responsibility is to receive SQL query results and automatically decide the best chart or display type — KPI card, line chart, bar chart, pie chart, or table. The decision is entirely rule-based (heuristic), with a TODO to upgrade to LLM-assisted selection in a future iteration.
 
-| Condition | Chart Type |
+---
+
+### Structure — `VisualizationNode` Class
+
+#### `determine_visualization(state)` — lines 16–53
+
+The **public entry point** called by LangGraph. It reads three keys from the agent `state` dict:
+
+| Key | Source |
 |---|---|
-| 1 row, 1 column | 🔢 **KPI** (single metric display) |
-| 2 columns: date/time + numeric | 📈 **Line Chart** |
-| 2 columns: categorical + numeric | 📊 **Bar Chart** |
-| 2 columns: column name contains "percent" | 🥧 **Pie Chart** |
-| 3+ columns OR multi-row | 📋 **Table** |
-| Fallback / text response | 💬 **Text** |
+| `query_result` | Rows returned from SQL execution node |
+| `generated_sql` | The SQL string that was executed |
+| `explanation` | LLM-generated plain-English explanation |
 
-### Value Formatting
+**Short-circuit:** if `query_result` is empty, returns a `"text"` type payload immediately with a "No Results" message — no DataFrame analysis occurs.
 
-| Column Name Pattern | Format Applied |
-|---|---|
-| `sales`, `revenue`, `amount`, `price`, `cost` | 💰 Currency (`$1,234,567`) |
-| `percent`, `rate`, `ratio` + value in 0–1 | 📊 Percentage (`12.5%`) |
-| `count`, `number`, `qty`, `total` | 🔢 Integer (`1,234`) |
-| Other numeric | Decimal (`.2f`) |
+Otherwise, converts results to a Pandas DataFrame and delegates to `_apply_heuristics()`.
+
+> **Note:** Line 55 has a redundant module-level `logger = get_logger(__name__)` statement declared inside the class body but outside `__init__`. It runs at class definition time and is harmless but redundant — `logger` is already declared at module level on line 7.
+
+---
+
+#### `_apply_heuristics(df, sql_query, explanation)` — lines 57–174
+
+The **decision engine**. Applies a priority-ordered waterfall of rules against the DataFrame's shape, column types, and column names. The first rule that matches wins.
+
+| Priority | Condition | Visualization Type |
+|---|---|---|
+| 1 | 1 row × 1 column | `kpi` — single metric card |
+| 2 | 2 cols, first col parseable as date/time | `line_chart` — time series |
+| 3 | 2 cols, ≤20 rows, string + numeric columns | `bar_chart` — categorical comparison |
+| 4 | 2 cols, ≤8 rows, second col name contains "percent / share / proportion" | `pie_chart` — distribution |
+| 5 | ≥3 cols, ≤50 rows | `table` — detailed multi-column view |
+| 6 (fallback) | Everything else | `table` — capped at 100 rows, paginated |
+
+**Priority conflict note:** Rules 2 and 3 both check `num_cols == 2`. Since rule 2 is evaluated first, any 2-column dataset where the first column is a date will always produce a `line_chart` — even if the row count is ≤20. This is intentional: time series takes priority over categorical bar charts.
+
+---
+
+### Helper Methods
+
+| Method | File Location | Purpose |
+|---|---|---|
+| `_is_date_column(series)` | line 178 | Guards against numeric series first (`is_numeric_dtype` → `False`), then samples the first 5 values and attempts `pd.to_datetime()`. Returns `True` only if the series is non-numeric and all sampled values parse without error. |
+| `_format_kpi_value(value, column_name)` | line 186 | Formats a raw number for display: `$1,234.56` for money columns, `12.3%` for ratios, `1,234` for counts. Driven by keyword matching on the column name. |
+| `_detect_value_format(value, column_name)` | line 224 | Returns a format type string (`"currency"`, `"percentage"`, `"integer"`, `"decimal"`, `"text"`) consumed by the frontend for CSS/display styling. |
+| `_beautify_column_name(column_name)` | line 254 | Converts snake_case or kebab-case column names to Title Case: `total_sales_amount` → `Total Sales Amount`. |
+| `_create_payload(...)` | line 258 | Builds the standardized output dict returned by every branch: `type`, `title`, `data`, `columns`, `config`, `summary`, `row_count`. |
+
+---
+
+### Value Formatting Rules (`_format_kpi_value` / `_detect_value_format`)
+
+Both methods apply the same keyword-matching logic on the column name:
+
+| Column Name Keywords | Display Format | Format Type String |
+|---|---|---|
+| `sales`, `revenue`, `amount`, `price`, `cost`, `total`, `value` | `$1,234.56` | `"currency"` |
+| `percent`, `rate`, `ratio` (value 0–1) | `12.5%` | `"percentage"` |
+| `percent`, `rate`, `ratio` (value > 1) | `12.5%` (no conversion) | `"percentage"` |
+| `count`, `number`, `qty`, `quantity` | `1,234` (integer) | `"integer"` |
+| Other numeric ≥ 1000 | `1,234.00` | `"decimal"` |
+| Other numeric < 1000 | `0.42` | `"decimal"` |
+| Non-numeric | raw string | `"text"` |
+
+---
+
+### LangGraph Entry Point — `visualizer_node(state)` — lines 278–281
+
+A module-level function that LangGraph registers as a graph node. Instantiates `VisualizationNode` on each call and delegates to `determine_visualization()`.
+
+```python
+def visualizer_node(state: dict) -> dict:
+    visualizer = VisualizationNode()
+    return visualizer.determine_visualization(state)
+```
+
+---
+
+### Data Flow
+
+```
+LangGraph agent state
+    { query_result, generated_sql, explanation }
+         │
+         ▼
+visualizer_node(state)
+         │
+         ▼
+VisualizationNode.determine_visualization()
+         │
+         ├── empty results? → return { type: "text", ... }
+         │
+         ▼
+pd.DataFrame(query_result)  →  shape analysis
+         │
+         ▼
+_apply_heuristics()  —  priority waterfall
+         │
+         ▼
+_create_payload()  →  standardized dict
+         │
+         ▼
+state["visualization"] = {
+    type, title, data, columns, config, summary, row_count
+}
+```
+
+---
 
 ### Visualization Payload Schema
 
@@ -1144,13 +1237,139 @@ The visualizer analyzes the `query_result` DataFrame and applies these rules in 
   "config": {
     "x_axis": "column_a",
     "y_axis": "column_b",
-    "label_column": "column_a",
-    "value_column": "column_b"
+    "x_label": "Column A",
+    "y_label": "Column B"
   },
-  "summary": "One-sentence insight about the data",
+  "summary": "One-sentence insight about the data.",
   "row_count": 10
 }
 ```
+
+**`config` shape by chart type:**
+
+| Chart Type | Config Keys |
+|---|---|
+| `kpi` | `value` (formatted string), `metric` (column name), `format` (type string) |
+| `line_chart` | `x_axis`, `y_axis`, `x_label`, `y_label` |
+| `bar_chart` | `x_axis`, `y_axis`, `x_label`, `y_label` |
+| `pie_chart` | `category`, `value`, `category_label`, `value_label` |
+| `table` | `columns` (list), `highlight_numeric` (bool), `sortable` (bool), `total_rows` (int), `paginated` (bool) |
+
+---
+
+### Known Issues / TODOs
+
+| # | Location | Issue |
+|---|---|---|
+| 1 | line 48 | `# TODO: apply intelligent heuristics using LLMs` — current logic is purely rule-based. Plan is to let an LLM choose the chart type based on data shape + SQL context. |
+| 2 | line 65 | `logger.info("df", df.head())` is a **bug**: `logger.info()` does not accept two positional args like `print()`. This either silently logs the string `"df"` and discards the DataFrame, or raises a `TypeError` depending on the logging handler. Should be `logger.info("df head: %s", df.head())` or `logger.debug(df.head().to_string())`. |
+| 3 | line 55 | Duplicate `logger = get_logger(__name__)` at class-body scope — already declared at module level on line 7. Harmless but should be removed. |
+
+---
+
+### Date Formatting — `dd-mm-yyyy`
+
+**Problem:** PostgreSQL returns date/datetime values as Python `datetime` objects. `_serialize_value()` in `execute_query.py` converts them via `.isoformat()`, producing strings like `2026-01-01T00:00:00+00:00`. These raw ISO strings were passed through to the visualization payload unchanged.
+
+**Fix location:** `visualizer.py` — formatting is applied inside the visualization pipeline only. The raw `query_result` in the agent state still holds the ISO string, so other consumers (raw API callers, retry logic) are unaffected.
+
+#### New method — `_format_date_columns(df, date_flags)` (line 188)
+
+```python
+def _format_date_columns(self, df: pd.DataFrame, date_flags: list) -> pd.DataFrame:
+    """Reformat detected date columns to dd-mm-yyyy, stripping time and timezone."""
+    df = df.copy()
+    for i, is_date in enumerate(date_flags):
+        if is_date:
+            col = df.columns[i]
+            df[col] = (
+                pd.to_datetime(df[col], utc=True, errors="coerce")
+                .dt.strftime("%d-%m-%Y")
+            )
+    return df
+```
+
+- `utc=True` — normalises timezone-aware ISO strings (e.g. `+00:00`, `+05:30`) before formatting.
+- `errors="coerce"` — unparseable values become `NaT` → `None` instead of raising.
+- Time component is always stripped — `2026-01-15T14:35:22+00:00` → `15-01-2026`.
+
+#### Change in `_apply_heuristics()` (lines 65–67 & 90)
+
+```python
+# Before (detect and format happened independently, out of order)
+if self._is_date_column(df.iloc[:, 0]):   # line chart check on raw ISO string
+    ...
+
+# After (detect first on raw data, then format, then use pre-computed flags)
+date_flags = [self._is_date_column(df.iloc[:, i]) for i in range(num_cols)]
+df = self._format_date_columns(df, date_flags)
+
+# line chart branch now uses the pre-computed flag
+if date_flags[0]:
+    ...
+```
+
+**Why detect before format:** After reformatting to `dd-mm-yyyy`, the string `15-01-2026` is ambiguous to `pd.to_datetime()` — pandas may parse it as `YYYY-DD-MM`, causing `_is_date_column()` to return `False` and misclassify a time-series result as a bar chart. Detecting on the original ISO strings ensures correct chart type selection.
+
+#### Result
+
+| Before | After |
+|---|---|
+| `"2026-01-01T00:00:00+00:00"` | `"01-01-2026"` |
+| `"2026-01-15T14:35:22+05:30"` | `"15-01-2026"` |
+
+Applies to all visualization types — table cells, KPI values, and line chart X-axis labels.
+
+---
+
+### Bug Fix — Integer Columns Misidentified as Dates (`_is_date_column`)
+
+**Symptom:** Queries returning integer aggregates such as `COUNT(DISTINCT order_no) AS order_count` showed values like `01-01-1970` instead of the actual count, and the visualization type was `table` instead of `bar_chart`.
+
+**Root cause — 3-bug cascade:**
+
+`pd.to_datetime()` silently accepts plain integers, treating them as **nanoseconds since Unix epoch**. A `COUNT` result like `42` parsed without error:
+
+```
+pd.to_datetime(42) → Timestamp('1970-01-01 00:00:00.000000042')
+```
+
+This caused a cascade across three functions:
+
+| Step | Bug | Effect |
+|---|---|---|
+| 1 | `_is_date_column([42, 38, ...])` → `True` (should be `False`) | Integer column wrongly flagged as a date |
+| 2 | `_format_date_columns()` converts `42` → `"01-01-1970"` | COUNT values replaced with epoch date strings |
+| 3 | Bar chart check: `is_numeric_dtype("01-01-1970")` → `False` | Bar chart skipped, falls through to table |
+
+```
+order_count = [42, 38, 35, ...]   ← integers from COUNT()
+      │
+      ▼  _is_date_column() — pd.to_datetime(42) succeeds → True   ← BUG 1
+      │
+      ▼  _format_date_columns() — 42 → "01-01-1970"               ← BUG 2
+      │
+      ▼  is_numeric_dtype("01-01-1970") → False → bar chart skipped ← BUG 3
+      │
+      ▼  type: "table"   (wrong — should be bar_chart)
+```
+
+**Fix — one guard line added to `_is_date_column()` (line 179):**
+
+```python
+def _is_date_column(self, series) -> bool:
+    if pd.api.types.is_numeric_dtype(series):   # ← added guard
+        return False
+    try:
+        sample_size = min(5, len(series))
+        sample = series.head(sample_size)
+        pd.to_datetime(sample, errors="raise")
+        return True
+    except (ValueError, TypeError):
+        return False
+```
+
+`is_numeric_dtype` returns `True` for both `int` and `float` dtypes, so the guard covers COUNT, SUM, AVG, and any other numeric aggregate. All three cascade bugs resolve from this single change.
 
 ---
 
@@ -2290,27 +2509,108 @@ docker run \
 
 Use `docker-compose.prod.yml` (checked into the repo) to manage the container on the VM. It pulls the pre-built image from ACR, mounts secrets and config from the VM filesystem, and uses named volumes for `logs` and `temp`.
 
+#### Step 1 — Rebuild and push the image (local machine)
+
+> **Important — Windows line endings (CRLF) issue:** `entrypoint.sh` edited on Windows has `\r\n` line endings. Linux cannot execute it because the shebang becomes `#!/bin/sh\r` — an invalid path. The `Dockerfile` strips `\r` via `sed` before `chmod +x`, and `.gitattributes` enforces `eol=lf` for `.sh` files going forward. Always rebuild the image after any change to `entrypoint.sh`.
+
 ```bash
-# Step 1: Copy docker-compose.prod.yml to the VM
-scp docker-compose.prod.yml <user>@<vm-ip>:~/docker-compose.prod.yml
+# On your local Windows machine:
+docker build -t dccglobalregistry.azurecr.io/ai-agentic-chatbot:latest .
+docker push dccglobalregistry.azurecr.io/ai-agentic-chatbot:latest
+```
 
-# Step 2: Start the container
-docker compose -f docker-compose.prod.yml up -d
+#### Step 2 — Copy `docker-compose.prod.yml` to the VM
 
-# Stop the container
-docker compose -f docker-compose.prod.yml down
+Azure VMs use key-based SSH auth (password auth is disabled by default). `scp` requires the `-i` flag pointing to your private key:
+
+```bash
+scp -i ~/.ssh/id_rsa docker-compose.prod.yml <user>@<vm-ip>:~/docker-compose.prod.yml
+```
+
+If `scp` is not available or auth keeps failing, SSH into the VM first and paste the file contents directly:
+
+```bash
+ssh -i ~/.ssh/id_rsa <user>@<vm-ip>
+
+# On the VM — create the file by pasting:
+cat > ~/docker-compose.prod.yml << 'EOF'
+services:
+  app:
+    image: dccglobalregistry.azurecr.io/ai-agentic-chatbot:latest
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file:
+      - /opt/ai-chatbot/.env
+    volumes:
+      - /opt/ai-chatbot/config.yaml:/app/config.yaml:ro
+      - ai-chatbot-logs:/app/logs
+      - ai-chatbot-temp:/app/temp
+
+volumes:
+  ai-chatbot-logs:
+  ai-chatbot-temp:
+EOF
+```
+
+#### Step 3 — Login to ACR and pull the image (on the VM)
+
+```bash
+# Option A — admin credentials
+docker login dccglobalregistry.azurecr.io
+
+# Option B — Azure CLI (managed identity)
+az acr login --name dccglobalregistry
+```
+
+```bash
+docker pull dccglobalregistry.azurecr.io/ai-agentic-chatbot:latest
+```
+
+#### Step 4 — Start the container
+
+```bash
+# Start (detached)
+docker compose -f ~/docker-compose.prod.yml up -d
+
+# Stop
+docker compose -f ~/docker-compose.prod.yml down
+
+# Restart after a new image push
+docker compose -f ~/docker-compose.prod.yml pull
+docker compose -f ~/docker-compose.prod.yml up -d
 
 # Tail live logs
-docker compose -f docker-compose.prod.yml logs -f
+docker compose -f ~/docker-compose.prod.yml logs -f
 ```
 
 > **Note:** `logs` and `temp` use **named Docker volumes** (not bind mounts). The container runs as a non-root `appuser` — bind-mounting a host directory owned by root causes a `PermissionError` when the app tries to write log files. Named volumes are managed by Docker and are writable by the container user automatically.
 >
 > To inspect logs:
 > ```bash
-> docker compose -f docker-compose.prod.yml logs -f   # stdout/stderr
+> docker compose -f ~/docker-compose.prod.yml logs -f       # stdout/stderr
 > docker exec ai-agentic-chatbot-app-1 cat /app/logs/app.log  # file logs
 > ```
+
+#### Troubleshooting — wrong Azure OpenAI endpoint being used
+
+**Symptom:** `/schemaText` (or any endpoint) hits the old URL `https://dcc-azure-openai.cognitiveservices.azure.com/...` even though `config.yaml` has the correct URL `https://dccglobal-ai-services.openai.azure.com/`.
+
+**Cause:** `settings.py` applies env var overrides on top of `config.yaml` at startup. If `AZURE_OPENAI_ENDPOINT` in `/opt/ai-chatbot/.env` on the VM still holds the old URL, it wins over the config file value every time.
+
+**Fix:** Update the env file on the VM and restart:
+
+```bash
+# 1. Edit .env on the VM
+nano /opt/ai-chatbot/.env
+# Set: AZURE_OPENAI_ENDPOINT=https://dccglobal-ai-services.openai.azure.com/
+
+# 2. Restart the container to pick up the change
+docker compose -f ~/docker-compose.prod.yml down
+docker compose -f ~/docker-compose.prod.yml up -d
+```
+
+> **Rule:** `config.yaml` is the source of truth for non-secret settings, but any env var in `.env` silently overrides it. When the app hits an unexpected endpoint, check `/opt/ai-chatbot/.env` on the VM first.
 
 **7.2 — Verify the deployment**
 
@@ -2435,4 +2735,1036 @@ server {
 
 ---
 
-*Generated: 2026-05-29 | Updated: 2026-06-07 | Repository: `ai-agentic-chatbot` | Branch: `develop`*
+---
+
+## 21. 🎯 NL-to-SQL Accuracy Improvements — Improvement Plan
+
+> **Analysis date:** 2026-06-10 | **GitHub Issue:** [#15](https://github.com/dccservicespl/ai-agentic-chatbot/issues/15)
+> **Context:** Fresh audit comparing `instruction.txt` prescriptions, `system_prompt.md`, and the live codebase. Four bugs and missing database objects identified.
+
+---
+
+### What `instruction.txt` Prescribes
+
+The instruction file defines four infrastructure items that form the foundation of accurate NL-to-SQL generation:
+
+| Object | Type | Purpose |
+|---|---|---|
+| `v_sales_summary` | VIEW | Flat denormalized JOIN of all 5 tables — AI generates simpler SQL against one view instead of complex multi-table JOINs |
+| `schema_metadata` | TABLE + inserts | Human-readable descriptions of every table and column with sample values and join key flags |
+| `business_glossary` | TABLE + inserts | Maps plain-English user terms ("revenue", "low stock", "top customers") to exact SQL expressions |
+| 12 indexes | INDEX | Composite indexes on customer, orders, product, inventory — covers the most common NL filter columns |
+
+---
+
+### Current State of `system_prompt.md`
+
+The system prompt is already comprehensive and well-structured. It contains:
+
+- Full column reference for all 5 tables
+- `v_sales_summary` view columns documented (all 43 columns listed)
+- 30+ business definitions (revenue, stock level, order lifecycle terms, date ranges)
+- The 8-stage order lifecycle (PENDING → COMPLETED / VOID)
+- 12 SQL generation rules (ILIKE, COALESCE, LIMIT 100, COUNT DISTINCT, etc.)
+- Intent classification (SQL_QUERY / GREETING / EXPLAIN / OUT_OF_SCOPE / UNKNOWN)
+- 30+ example query pairs across all domains
+
+**The prompt file is in good shape. The gaps are in the code and database — not the prompt.**
+
+---
+
+### Bugs Found
+
+#### BUG 1 — `system_prompt.md` never reaches the SQL generator (Critical)
+
+**File:** `agent/router.py:79` — correctly loads `get_system_prompt()` and passes it to the router LLM.
+
+**File:** `agent/subgraphs/sql_query/nodes/generate_sql.py:_create_generation_prompt()` — uses a **fully hardcoded inline prompt** with no reference to `system_prompt.md`. The SQL generator is blind to:
+
+- `v_sales_summary` preference rule (Rule 8)
+- All 30+ business definitions (revenue, stock level, etc.)
+- All 12 SQL rules (ILIKE, COALESCE, LIMIT 100, COUNT DISTINCT, etc.)
+- The order lifecycle
+- All 30+ example query patterns
+
+**Impact:** The SMART LLM (Llama-3.3-70B) generates SQL without any domain knowledge, business context, or the rules defined in the system prompt.
+
+**Fix:** Call `get_system_prompt()` inside `_create_generation_prompt()` and prepend it to the prompt.
+
+---
+
+#### BUG 2 — `SchemaExtractor` never extracts views (Critical)
+
+**File:** `schema_extractor/SchemaExtractor.py:extract_database_schema()`
+
+Uses only `inspector.get_table_names()`. PostgreSQL views require `inspector.get_view_names()` — a separate call. Even after `v_sales_summary` is created in the database, it will **never appear** in `db_schema.json`, `schema_documentation.yaml`, or the pgvector store. The view is invisible to the semantic retrieval step.
+
+**Fix:** Add `_extract_view_schema()` using `inspector.get_view_names()` and `inspector.get_view_definition()`, included in `extract_database_schema()` output.
+
+---
+
+#### BUG 3 — Router schema_summary iteration is broken
+
+**File:** `agent/router.py:76-78`
+
+```python
+schema_summary = schema_loader.load_schema_summary()   # returns full JSON dict
+schema_summary_text = "\n".join(
+    [f"- {table}: {desc}" for table, desc in schema_summary.items()]
+)
+```
+
+`schema_summary` structure (from `generate_schema_summary()` in `transform_schema_to_text.py`):
+
+```json
+{
+  "database_name": "...",
+  "version": "v1",
+  "tables": [{ "table": "...", "bussiness_purpose": "...", "example_questions": [...] }]
+}
+```
+
+Calling `.items()` on this dict yields the top-level keys `database_name`, `version`, `tables` as "table names". The router prompt receives `"- database_name: ai_chatbot_db"` instead of actual table names and purposes.
+
+**Fix:** Replace `.items()` iteration with `schema_summary.get("tables", [])` loop using `t["table"]` and `t["bussiness_purpose"]`.
+
+---
+
+#### BUG 4 — LIMIT inconsistency: 10 rows in code vs 100 in system prompt
+
+**File:** `agent/subgraphs/sql_query/nodes/generate_sql.py:117`
+
+```
+"Limit results to a reasonable number (max 10 rows)"
+```
+
+**system_prompt.md Rule 5:**
+
+```
+Default LIMIT 100 — unless user says "all", "every", or specifies a number
+```
+
+The SQL generator applies a 10-row cap while the system prompt promises 100.
+
+**Fix:** Update `generate_sql.py:117` to align with the system prompt default.
+
+---
+
+### Missing Database Objects
+
+None of the following have a migration script in the repository:
+
+| Object | Status | Impact if missing |
+|---|---|---|
+| `v_sales_summary` view | ❌ not created | AI generates complex multi-table JOINs instead of querying the optimized view |
+| `schema_metadata` table + inserts | ❌ not created | Column-level business descriptions unavailable for dynamic injection |
+| `business_glossary` table + inserts | ❌ not created | Term → SQL mapping not available at runtime from DB |
+| 12 indexes on customer/orders/product/inventory | ❌ not created | NL queries filtering by date, customer, product run without index support |
+
+---
+
+### TODO List (Prioritized)
+
+#### P0 — Database objects (prerequisite for everything) ✅
+
+- [x] Run all SQL from `instruction.txt` in the PostgreSQL business database:
+  - `CREATE OR REPLACE VIEW v_sales_summary AS ...` (joins all 5 tables)
+  - `CREATE TABLE schema_metadata (...)` + all `INSERT INTO schema_metadata` rows
+  - `CREATE TABLE business_glossary (...)` + all `INSERT INTO business_glossary` rows
+  - All 12 `CREATE INDEX` statements on customer, orders, product, inventory
+- [ ] Add a `migrations/` or `scripts/` folder in the repo with these DDL statements so setup is reproducible
+
+#### P1 — Fix SQL generator not using `system_prompt.md`
+
+- [ ] **`generate_sql.py`:** Call `get_system_prompt()` and inject it at the start of `_create_generation_prompt()` so the SMART LLM knows the view preference, business definitions, SQL rules, and example patterns
+
+#### P2 — Fix `SchemaExtractor` missing views
+
+- [ ] **`SchemaExtractor.py`:** Add `_extract_view_schema()` using `inspector.get_view_names()` + `inspector.get_view_definition()`; include views in `extract_database_schema()` output
+- [ ] **`server.py` (schemaJson config):** Add `schema_metadata` and `business_glossary` to `exclude_tables` in `SchemaExtractionConfig` — these are internal metadata tables the AI should not query directly
+
+#### P3 — Fix router schema_summary bug
+
+- [ ] **`router.py:76-78`:** Replace `schema_summary.items()` with `schema_summary.get("tables", [])` loop using `t["table"]` and `t["bussiness_purpose"]`
+
+#### P4 — Fix LIMIT inconsistency ✅ (resolved by P1)
+
+- [x] **`generate_sql.py:117`:** Hardcoded `"max 10 rows"` removed — P1 rewrote `_create_generation_prompt()` to inject `system_prompt.md` which already contains Rule 5 ("Default LIMIT 100 unless user specifies otherwise"). No separate fix needed.
+
+#### P5 — Re-ingest vector store after P0 + P2
+
+- [ ] After creating the view and fixing the extractor, re-run the full schema setup pipeline:
+  1. `GET /schemaJson` — extracts tables + `v_sales_summary` view into `db_schema.json`
+  2. `GET /schemaText` — LLM enriches schema into `schema_documentation.yaml`
+  3. `GET /ingest?force_reset=true` — clears stale rows, embeds and upserts all table/view chunks
+
+---
+
+### P5 — Deep Dive: Re-ingest Vector Store
+
+#### Why This Step Exists
+
+After P0 creates `v_sales_summary` in the database and P2 fixes `SchemaExtractor` to call `get_view_names()`, the pgvector store is still stale — it was ingested before the view existed and has no embedding for it. Until P5 is run, the SQL agent's semantic table discovery (`retrieve_schemas` node) will never surface `v_sales_summary`, so the LLM will keep generating complex multi-table JOINs instead of querying the flat view.
+
+#### The 3-Step Pipeline
+
+**Step 1 — `GET /schemaJson`**
+
+Calls `SchemaExtractor.extract_database_schema()` → now also calls `get_view_names()` + `_extract_view_schema()` (P2 fix). Writes `temp/db_schema.json` containing all 5 tables + the view.
+
+**Step 2 — `GET /schemaText`**
+
+Reads `db_schema.json`, sends each object to the LLM, generates `schema_documentation.yaml` — the enriched description (business purpose, key fields, example questions) that will be embedded.
+
+**Step 3 — `GET /ingest?force_reset=true`**
+
+`force_reset=true` calls `get_vector_store().reset_collection()` first — drops + recreates the pgvector collection to remove any duplicate rows from previous ingest runs. Then upserts 6 clean chunks (5 tables + 1 view) using stable uuid5 IDs.
+
+#### Dependency
+
+P5 cannot run until P0 creates `v_sales_summary` in the database. Order: **P0 → P5**.
+
+---
+
+#### P6 — Runtime glossary injection (enhancement)
+
+- [x] Add `glossary_lookup.py` with two functions:
+  - `fetch_glossary_hints(user_query, engine)` — SQL `ILIKE` match of user query against `business_glossary.term`, returns formatted hint block
+  - `fetch_column_hints(table_names, engine)` — queries `schema_metadata` for column descriptions of retrieved tables, returns formatted hint block
+- [x] Update `generate_sql_node` to call both functions and inject hints into `_create_generation_prompt()`
+
+---
+
+### P6 — Deep Dive: Runtime Glossary Injection
+
+#### Problem
+
+The SQL generation LLM has no reliable way to map business language to SQL constructs. When a user says *"show me revenue from active customers this month"*, the LLM must guess:
+- `revenue` → `SUM(quantity * unit_price)` or `grand_total`?
+- `active` → `activation_status = 'ACTIVE'`?
+- `this month` → `WHERE order_date >= date_trunc('month', CURRENT_DATE)`?
+
+Wrong guesses produce syntactically valid but semantically wrong SQL.
+
+#### The Two Lookup Functions
+
+**`fetch_glossary_hints(user_query, engine)`** — `business_glossary` lookup
+
+Runs a single SQL query that matches any `term` from `business_glossary` whose text appears (case-insensitive) in the user's query:
+
+```sql
+SELECT term, sql_meaning
+FROM business_glossary
+WHERE $user_query ILIKE '%' || term || '%'
+```
+
+Returns a formatted block injected into the prompt:
+
+```
+## BUSINESS GLOSSARY (matched to your query)
+- "revenue" → SUM(sales.quantity * sales.unit_price)
+- "active customers" → customers WHERE activation_status = 'ACTIVE'
+- "this month" → WHERE order_date >= date_trunc('month', CURRENT_DATE)
+```
+
+**`fetch_column_hints(table_names, engine)`** — `schema_metadata` lookup
+
+Queries column-level descriptions for the tables the pgvector search returned as relevant:
+
+```sql
+SELECT table_name, column_name, data_type, description, sample_values, is_join_key
+FROM schema_metadata
+WHERE table_name = ANY(:tables) AND column_name IS NOT NULL
+ORDER BY table_name, column_name
+```
+
+Returns a formatted block:
+
+```
+## COLUMN HINTS (for retrieved tables)
+- orders.order_no [VARCHAR, join key]: Unique order number. Referenced by sales.reference_no.
+- orders.grand_total [NUMERIC]: Final order total after discount and delivery fees.
+- sales.reference_no [VARCHAR, join key]: Links sales line to an order via orders.order_no.
+```
+
+#### Where They Are Injected
+
+Both blocks are appended inside `_create_generation_prompt()` in `generate_sql.py`, between the retrieved schema DDL and the user request:
+
+```
+{system_prompt.md content}
+---
+## RETRIEVED SCHEMA CONTEXT
+{DDL from pgvector}
+
+{BUSINESS GLOSSARY block — if any matches}
+
+{COLUMN HINTS block — if any tables matched}
+
+## USER REQUEST
+{user_query}
+```
+
+If the tables don't exist yet (P0 not run), both functions catch the `ProgrammingError` and return an empty string — the prompt degrades gracefully with no crash.
+
+#### Files Changed
+
+| File | Change |
+|---|---|
+| `agent/subgraphs/sql_query/nodes/glossary_lookup.py` | New file — `fetch_glossary_hints()` and `fetch_column_hints()` |
+| `agent/subgraphs/sql_query/nodes/generate_sql.py` | Import and call both lookup functions; pass `engine` + `table_names` to `_create_generation_prompt()` |
+
+---
+
+### Status Summary
+
+| Item | `system_prompt.md` | Code | Database |
+|---|---|---|---|
+| `v_sales_summary` columns documented | ✅ all 43 columns listed | ❌ not extracted by `SchemaExtractor` | ❌ view may not exist |
+| Business glossary | ✅ 30+ terms inline | ❌ not injected into SQL gen | ❌ table may not exist |
+| SQL rules (ILIKE, LIMIT, COALESCE) | ✅ 12 rules defined | ❌ SQL gen uses inline hardcoded prompt | — |
+| 12 indexes | — | — | ❌ not created |
+| `schema_metadata` | — | ❌ not used anywhere | ❌ not created |
+| Router schema summary | ✅ feeds router intent | ❌ BUG — `.items()` gives wrong keys | — |
+| `system_prompt.md` in router | ✅ | ✅ `router.py:79` | — |
+| `system_prompt.md` in SQL gen | ✅ | ❌ `generate_sql.py` ignores it | — |
+
+**Highest-leverage fixes:** P1 (inject system prompt into SQL generator) + P0 (create DB objects). Together these will immediately improve SQL accuracy and view utilisation.
+
+---
+
+### P2 — Deep Dive: Fix `SchemaExtractor` to Extract Views
+
+#### The Core Problem
+
+The schema setup pipeline runs in 3 steps:
+
+```
+GET /schemaJson  →  GET /schemaText  →  GET /ingest
+  (extract)            (enrich)         (embed into pgvector)
+```
+
+**Step 1 (`/schemaJson`)** calls `SchemaExtractor.extract_database_schema()` which uses SQLAlchemy's inspector. The inspector has **two separate methods** for tables and views — but only one is ever called:
+
+```python
+inspector.get_table_names()   # called  → ['customer', 'orders', 'sales', 'product', 'inventory']
+inspector.get_view_names()    # never called → ['v_sales_summary']  ❌
+```
+
+Because `get_view_names()` is never called, `v_sales_summary` is completely invisible to the entire pipeline. It never enters `db_schema.json`, never gets enriched into YAML, and never gets embedded into pgvector.
+
+The result: even though P1 (system prompt injection) tells the SQL generator to *prefer* `v_sales_summary`, when the semantic retrieval step searches for relevant tables, there is no pgvector entry for the view — it can never be retrieved and passed to the LLM.
+
+---
+
+#### What Needs to Change — 2 Things
+
+**Thing 1 — Extract `v_sales_summary` as a view**
+
+Add a view extraction loop alongside the existing table loop in `SchemaExtractor.extract_database_schema()`. For each view, the inspector's `get_columns()` call works identically to tables in PostgreSQL, so column extraction is free. `get_view_definition()` returns the raw `SELECT ... FROM ...` DDL that defines the view.
+
+The DDL stored in pgvector for `v_sales_summary` will look like:
+
+```sql
+CREATE OR REPLACE VIEW public.v_sales_summary AS
+SELECT s.id AS sales_id, s.order_date, s.quantity * s.unit_price AS line_total,
+       c.customer_name, c.code AS customer_code, c.activation_status AS customer_status,
+       o.order_no, o.order_status, o.grand_total,
+       p.product_name, p.product_code, p.status AS product_status,
+       i.on_hand, i.available_quantity, i.expected_quantity, ...
+FROM sales s
+LEFT JOIN customer c ON s.customer_code = c.code
+LEFT JOIN orders o ON s.reference_no = o.order_no
+LEFT JOIN product p ON s.product_code = p.product_code
+LEFT JOIN inventory i ON s.product_code = i.product_code
+```
+
+Once this is embedded, a query like *"top customers by revenue"* will match `v_sales_summary` in pgvector with a high similarity score. The retrieved DDL is then passed to the SQL generator, which (post-P1) also has the system prompt telling it to prefer this view. Both signals align.
+
+**Thing 2 — Exclude `schema_metadata` and `business_glossary`**
+
+After P0 creates these tables in the database, `get_table_names()` will pick them up on the next `/schemaJson` call. That causes two problems:
+
+- The LLM enrichment step (`/schemaText`) wastes API calls generating "business purpose" docs for internal system tables
+- They get embedded into pgvector and could appear as candidates for semantic search — queries like *"show descriptions"* might retrieve `schema_metadata` instead of a business table
+
+**Fix:** Since `include_tables` in `SchemaExtractionConfig` already acts as a whitelist, `schema_metadata` and `business_glossary` are implicitly excluded from the table loop. The same whitelist is applied to the new view loop via `_table_allowed()`. No extra `exclude_tables` entry is needed as long as `v_sales_summary` is added to `include_tables`.
+
+---
+
+#### Files That Change
+
+| File | Change |
+|---|---|
+| `schema_extractor/SchemaModels.py` | Add `object_type: str = "table"` and `view_definition: str \| None = None` to `TableSchema` dataclass |
+| `schema_extractor/SchemaExtractor.py` | Add view extraction loop in `extract_database_schema()` + new `_extract_view_schema()` method |
+| `server.py` | Add `"v_sales_summary"` to `include_tables` in the `/schemaJson` endpoint config |
+
+---
+
+#### Current Code vs After Fix
+
+**`SchemaExtractor.py` — `extract_database_schema()` before:**
+
+```python
+def extract_database_schema(self) -> DatabaseSchema:
+    tables = []
+    for schema_name in self._get_schemas():
+        if not self._schema_allowed(schema_name):
+            continue
+        for table_name in self.inspector.get_table_names(schema=schema_name):
+            if not self._table_allowed(table_name):
+                continue
+            tables.append(self._extract_table_schema(schema_name, table_name))
+            # views never extracted ❌
+    return DatabaseSchema(database_name=..., tables=tables)
+```
+
+**After:**
+
+```python
+def extract_database_schema(self) -> DatabaseSchema:
+    tables = []
+    for schema_name in self._get_schemas():
+        if not self._schema_allowed(schema_name):
+            continue
+        for table_name in self.inspector.get_table_names(schema=schema_name):
+            if not self._table_allowed(table_name):
+                continue
+            tables.append(self._extract_table_schema(schema_name, table_name))
+        # new: extract views (v_sales_summary)
+        for view_name in self.inspector.get_view_names(schema=schema_name):
+            if not self._table_allowed(view_name):
+                continue
+            tables.append(self._extract_view_schema(schema_name, view_name))
+    return DatabaseSchema(database_name=..., tables=tables)
+
+def _extract_view_schema(self, schema_name: str, view_name: str) -> TableSchema:
+    columns = self._extract_columns(schema_name, view_name)
+    view_definition = self.inspector.get_view_definition(view_name, schema=schema_name)
+    return TableSchema(
+        schema_name=schema_name,
+        table_name=view_name,
+        columns=columns,
+        primary_keys=[],
+        foreign_keys=[],
+        object_type="view",
+        view_definition=view_definition,
+    )
+```
+
+**`server.py` — `/schemaJson` config before:**
+
+```python
+config = SchemaExtractionConfig(
+    include_tables=["orders", "customer", "sales", "product", "inventory"]
+)
+```
+
+**After:**
+
+```python
+config = SchemaExtractionConfig(
+    include_tables=["orders", "customer", "sales", "product", "inventory", "v_sales_summary"]
+)
+```
+
+---
+
+#### After P2 Is Done — Re-run the Setup Pipeline
+
+P2 only changes the extraction code. To make the view available for semantic search, the 3-step pipeline must be re-run once:
+
+```
+GET /schemaJson   → db_schema.json now includes v_sales_summary
+GET /schemaText   → LLM generates business-context YAML for the view
+GET /ingest       → v_sales_summary embedded into pgvector, retrievable by semantic search
+```
+
+From that point: a query like *"show revenue by customer"* → semantic search returns `v_sales_summary` → DDL injected into generation prompt → LLM generates `SELECT ... FROM v_sales_summary` instead of a 3-table JOIN.
+
+---
+
+### P1 — Deep Dive: Injecting `system_prompt.md` into the SQL Generator
+
+#### The Problem in Plain English
+
+The system makes two LLM calls per query. Only the first one receives `system_prompt.md`:
+
+```
+Router LLM (FAST model — DeepSeek-V4-Flash)     → gets system_prompt.md  ✅
+SQL Generator LLM (SMART model — Llama-3.3-70B) → gets hardcoded generic prompt ❌
+```
+
+The router uses the system prompt to classify intent and identify relevant tables. But when actual SQL is generated — the most critical step — the LLM has no domain knowledge: no business definitions, no view preference, no SQL rules, no example patterns.
+
+---
+
+#### What the SQL Generator Currently Receives
+
+`generate_sql.py:_create_generation_prompt()` (lines 103–138) sends only this to the SMART LLM:
+
+```
+You are an expert SQL query generator...
+
+DATABASE SCHEMA:
+-- Table: sales (Relevance: 0.91)
+CREATE TABLE sales (...)      ← raw DDL from vector store
+
+USER REQUEST:
+show me top customers this year
+
+REQUIREMENTS:
+1. Generate ONLY SELECT queries
+2. Use proper JOIN syntax
+3. Include WHERE clauses
+4. Use GROUP BY when needed
+5. Limit results to max 10 rows   ← conflicts with system_prompt.md rule (should be 100)
+6. Use PostgreSQL syntax
+...
+```
+
+The LLM must infer joins, business term meanings, and query patterns from raw DDL alone.
+
+---
+
+#### What the SQL Generator Should Receive After the Fix
+
+After prepending `system_prompt.md`, the SMART LLM receives full domain context:
+
+```
+# NL-to-SQL System Prompt — Sales Order Management & Inventory System
+
+## ROLE
+You are a PostgreSQL SQL query generator...
+
+## PREFERRED VIEW
+Use v_sales_summary for any query involving more than one table.
+
+## FULL COLUMN REFERENCE
+[all 5 tables with every column and type documented]
+
+## v_sales_summary VIEW COLUMNS
+sales_id, order_date, ..., customer_name, ..., product_name, ..., on_hand, ...
+
+## BUSINESS DEFINITIONS
+"revenue"       → SUM(sales.quantity * sales.unit_price)
+"top customers" → GROUP BY customer_name ORDER BY SUM(quantity * unit_price) DESC
+"this year"     → WHERE order_date >= date_trunc('year', CURRENT_DATE)
+"pending orders"→ orders.order_status = 'PENDING'
+...
+
+## ORDER LIFECYCLE
+PENDING → ORDERED → PROCESSING → PROCESSED → POSTED → DELIVERED → COMPLETED
+
+## SQL GENERATION RULES
+1. SELECT only — never INSERT/UPDATE/DELETE/DROP
+2. Always use aliases (customer c, orders o, sales s, ...)
+3. GROUP BY required for any aggregation
+4. Default LIMIT 100
+5. ILIKE for text search — never LIKE
+6. Prefer v_sales_summary for multi-table queries
+7. COALESCE for nulls in aggregations
+8. COUNT DISTINCT for orders
+...
+
+## EXAMPLE QUERY PAIRS
+Q: Top 10 customers by revenue this year
+→ SELECT customer_name, SUM(quantity * unit_price) AS revenue
+  FROM v_sales_summary
+  WHERE order_date >= date_trunc('year', CURRENT_DATE)
+  GROUP BY customer_name ORDER BY revenue DESC LIMIT 10;
+[30+ more examples]
+
+--- [dynamic section appended below] ---
+
+## RETRIEVED SCHEMA CONTEXT
+-- Table: v_sales_summary (Relevance: 0.94)
+CREATE TABLE v_sales_summary (...)
+
+## USER REQUEST
+show me top customers this year
+```
+
+---
+
+#### The Concrete Code Change
+
+**File:** `src/ai_agentic_chatbot/agent/subgraphs/sql_query/nodes/generate_sql.py`
+
+**Step 1 — Add import at the top of the file:**
+
+```python
+from ai_agentic_chatbot.utils.prompt_loader import get_system_prompt
+```
+
+**Step 2 — Update `_create_generation_prompt()` to prepend the system prompt:**
+
+```python
+# Before
+def _create_generation_prompt(schema_text, user_query, previous_error, generation_attempts):
+    base_prompt = f"""You are an expert SQL query generator...
+
+DATABASE SCHEMA:
+{schema_text}
+
+USER REQUEST:
+{user_query}
+
+REQUIREMENTS:
+...
+Limit results to a reasonable number (max 10 rows)   ← wrong
+..."""
+    return base_prompt
+
+# After
+def _create_generation_prompt(schema_text, user_query, previous_error, generation_attempts):
+    system_context = get_system_prompt()   # loads system_prompt.md at call time
+
+    base_prompt = f"""{system_context}
+
+---
+
+## RETRIEVED SCHEMA CONTEXT
+The following tables were retrieved as most relevant to the user's request:
+
+{schema_text}
+
+## USER REQUEST
+{user_query}
+
+Generate the SQL query following all rules and business definitions above.
+Return ONLY the JSON object — no markdown, no explanation outside the JSON."""
+    return base_prompt
+```
+
+No other files change. The retry logic (appending `previous_error` on subsequent attempts) is added after `base_prompt` exactly as it is today.
+
+---
+
+#### Impact by Query Type
+
+| User Query | Without P1 | With P1 |
+|---|---|---|
+| "show revenue this month" | LLM guesses formula | Knows `revenue = SUM(quantity * unit_price)` from BUSINESS DEFINITIONS |
+| "top customers this year" | Writes 3-table JOIN | Uses `v_sales_summary`, correct GROUP BY pattern from examples |
+| "pending orders" | May use `'pending'` (wrong case) | Knows `order_status = 'PENDING'` from definitions |
+| "find customer abc" | Uses `LIKE '%abc%'` | Uses `ILIKE '%abc%'` (Rule 6) |
+| "sales this month" | May hardcode a date | Uses `date_trunc('month', CURRENT_DATE)` (Rule 12 + examples) |
+| Row limit | Returns 10 rows | Returns 100 rows (Rule 5) |
+| "gross profit" | Unknown — may error | Knows `SUM((sell_for - base_cost) * quantity)` |
+
+---
+
+#### Token Budget Consideration
+
+`system_prompt.md` is ~930 lines (~5,000 tokens). Combined with retrieved schema DDL (~500 tokens), the total input per SQL generation call increases from ~800 tokens to ~5,800 tokens.
+
+| | Current | After P1 |
+|---|---|---|
+| Input tokens per SQL call | ~800 | ~5,800 |
+| Output tokens per SQL call | ~200 | ~200 (unchanged) |
+| Context window used | <1% of 128k | ~4.5% of 128k |
+| Latency impact | baseline | negligible — input tokens are fast |
+
+Llama-3.3-70B is configured with `max_tokens: 20000` and a 128k context window. The larger input is well within limits and does not affect output speed meaningfully.
+
+---
+
+---
+
+### P7 — Deep Dive: LLM Provider Resolution Bug — `provider` Argument Silently Ignored
+
+> **GitHub Issue:** [#15](https://github.com/dccservicespl/ai-agentic-chatbot/issues/15)
+
+#### Summary
+
+Despite `config.yaml` having `default: azure_openai.fast` and call sites explicitly passing `LLMProvider.AZURE_OPENAI`, the app was actually running **Azure AI Foundry models** (DeepSeek-V4-Flash / Llama-3.3-70B) for all LLM calls. The `provider` argument to `get_llm()` was silently discarded and the `default` setting had no effect.
+
+---
+
+#### Three Bugs Working Together
+
+**Bug 1 — `settings.py` strips the provider prefix from the default key (line 93–94)**
+
+```python
+default_model_key = llm_config.get("default", "azure_openai.fast")
+if "." in default_model_key:
+    default_model_key = default_model_key.split(".", 1)[1]   # "azure_openai.fast" → "fast"
+```
+
+The provider portion `"azure_openai"` is thrown away immediately. Only `"fast"` survives.
+
+**Bug 2 — Both providers stored under the same short key — last one parsed wins**
+
+`_parse_config()` builds a flat `models` dict keyed by `"fast"`, `"smart"`, `"embedding"`. Both `azure_openai` and `azure_ai_foundry` define `fast` and `smart`. Since `azure_ai_foundry` appears second in `config.yaml`, it silently overwrites the azure_openai entries:
+
+```
+models["fast"]  = AZURE_OPENAI (gpt-4o-mini)      ← stored first
+models["smart"] = AZURE_OPENAI (gpt-4.1)           ← stored first
+models["fast"]  = AZURE_AI_FOUNDRY (DeepSeek)      ← overwrites ❌
+models["smart"] = AZURE_AI_FOUNDRY (Llama-3.3-70B) ← overwrites ❌
+```
+
+**Bug 3 — `factory.py` ignores the `provider` argument entirely (lines 56–71)**
+
+```python
+def get_llm(self, provider=None, model=None):
+    ...
+    model_key = model.value   # just "fast" or "smart" — provider never used
+    model_config = self._settings.get_model_config(model_key)
+    # provider argument is discarded — get_llm(AZURE_OPENAI, SMART)
+    # and get_llm(AZURE_AI_FOUNDRY, SMART) return identical results
+```
+
+---
+
+#### Actual Models Used Before Fix
+
+| Call site | Code says | Key resolved | Model actually used |
+|---|---|---|---|
+| `router.py:62` | `get_llm()` | `"fast"` → AZURE_AI_FOUNDRY | **DeepSeek-V4-Flash** ❌ |
+| `graph.py:13` | `get_llm(AZURE_OPENAI, FAST)` | `"fast"` → AZURE_AI_FOUNDRY | **DeepSeek-V4-Flash** ❌ |
+| `generate_sql.py:50` | `get_llm(AZURE_OPENAI, SMART)` | `"smart"` → AZURE_AI_FOUNDRY | **Llama-3.3-70B** ❌ |
+| `embedding` | `get_embedding()` | `"embedding"` → AZURE_OPENAI | **text-embedding-3-small** ✅ |
+
+---
+
+#### The Fix — Full Provider-Qualified Keys Throughout
+
+The `config.yaml` design (`default: azure_openai.fast`, separate provider blocks) is correct. The fix is to stop stripping the provider prefix and use full keys `"azure_openai.fast"`, `"azure_openai.smart"`, `"azure_ai_foundry.fast"` etc. everywhere so both providers coexist without collision.
+
+**`settings.py` changes:**
+
+1. Keep the full default key — do not strip the provider prefix
+2. Store models under full keys `"{provider}.{model_key}"` instead of just `"{model_key}"`
+
+```python
+# Before
+default_model_key = default.split(".", 1)[1]          # "fast"
+models["fast"] = ModelConfiguration(AZURE_OPENAI, ...) # overwritten by foundry
+
+# After
+default_model_key = default                            # "azure_openai.fast"
+models["azure_openai.fast"]      = ModelConfiguration(AZURE_OPENAI, FAST, ...)
+models["azure_openai.smart"]     = ModelConfiguration(AZURE_OPENAI, SMART, ...)
+models["azure_ai_foundry.fast"]  = ModelConfiguration(AZURE_AI_FOUNDRY, FAST, ...)
+models["azure_ai_foundry.smart"] = ModelConfiguration(AZURE_AI_FOUNDRY, SMART, ...)
+```
+
+**`factory.py` changes:**
+
+Build the lookup key from provider + model when both are supplied:
+
+```python
+# Before — provider ignored
+model_key = model.value   # "smart"
+
+# After — uses provider to build full key
+if provider is not None and model is not None:
+    model_key = f"{provider.value}.{model.value}"   # "azure_openai.smart"
+elif model is not None:
+    model_key = model.value                          # short key fallback (shouldn't occur)
+else:
+    model_key = self._settings.default_model        # "azure_openai.fast" from config
+```
+
+---
+
+#### Models After Fix
+
+| Call | Key resolved | Model used |
+|---|---|---|
+| `get_llm()` | `"azure_openai.fast"` (default) | gpt-4o-mini ✅ |
+| `get_llm(AZURE_OPENAI, FAST)` | `"azure_openai.fast"` | gpt-4o-mini ✅ |
+| `get_llm(AZURE_OPENAI, SMART)` | `"azure_openai.smart"` | gpt-4.1 ✅ |
+| `get_llm(AZURE_AI_FOUNDRY, FAST)` | `"azure_ai_foundry.fast"` | DeepSeek-V4-Flash ✅ |
+| `get_llm(AZURE_AI_FOUNDRY, SMART)` | `"azure_ai_foundry.smart"` | Llama-3.3-70B ✅ |
+
+Both providers coexist. Each call site gets exactly the model it requests. Switching a call site from one provider to another is a one-argument change.
+
+---
+
+#### Files Changed
+
+| File | Change |
+|---|---|
+| `infrastructure/llm/settings.py` | Keep full key as default; store models under `"{provider}.{model_key}"` |
+| `infrastructure/llm/factory.py` | Build lookup key as `"{provider.value}.{model.value}"` when provider is supplied |
+
+---
+
+### P8 — Deep Dive: `/ingest` Duplicates Schema Rows on Every Run
+
+#### Summary
+
+Every call to `GET /ingest` **always inserts new rows** into the pgvector table — it never updates or replaces existing ones. After N ingest runs with 5 tables, the collection holds N×5 rows. Semantic search returns duplicate entries for the same table, consuming the top-k budget and crowding out other relevant tables.
+
+---
+
+#### Root Cause — Three Missing Pieces
+
+**1. No stable document IDs in `VectorSchemaBuilder`**
+
+`vector_schema_builder.py:build_all_tables()` returns chunks with no `id` field:
+
+```python
+{
+    "table_name": "sales",
+    "content": "...",
+    "metadata": { "table_name": "sales", ... }
+    # no "id" field ❌
+}
+```
+
+Without an ID, LangChain generates a **random UUID** per document on every call. Same table ingested 5 times → 5 different UUIDs → 5 separate rows.
+
+**2. `add_documents()` called without `ids=` — upsert never fires**
+
+`pgvector_store.py:47`:
+
+```python
+self._vectorstore.add_documents(documents)   # no ids= argument ❌
+```
+
+LangChain PGVector supports upsert when `ids=` is passed — it executes `INSERT ... ON CONFLICT (id) DO UPDATE`. Without IDs the conflict check never fires and every call is a pure `INSERT`.
+
+**3. No pre-ingest cleanup**
+
+There is no `delete_collection()`, filter-based delete, or any cleanup before inserting. Old rows accumulate indefinitely.
+
+---
+
+#### Impact on Search Quality
+
+After multiple ingest runs, `search()` returns duplicate `table_name` values:
+
+```
+[("sales", 0.91), ("sales", 0.90), ("sales", 0.89), ("customer", 0.88), ("customer", 0.87)]
+```
+
+The top-k limit (`k=5`) is consumed by duplicates of the same table, crowding out other relevant tables. Every downstream step — router hint boost, `_expand_related_tables()`, SQL generation — operates on this polluted result set.
+
+---
+
+#### Fix 1 — Stable Deterministic IDs in `VectorSchemaBuilder`
+
+**File:** `schema_extractor/vector_schema_builder.py`
+
+Use `uuid.uuid5(uuid.NAMESPACE_DNS, table_name)` — produces the **same UUID for the same table name on every run**. Add it to every chunk in `build_all_tables()`:
+
+```python
+import uuid
+
+chunk["id"] = str(uuid.uuid5(uuid.NAMESPACE_DNS, table["table_name"]))
+```
+
+This is the prerequisite for Fix 2 — without stable IDs, upsert has nothing to key on.
+
+---
+
+#### Fix 2 — Pass `ids=` to `add_documents()` to Enable Upsert
+
+**File:** `infrastructure/vector_store/pgvector_store.py:ingest()`
+
+Extract IDs from chunks and pass them explicitly. PGVector then executes `INSERT ... ON CONFLICT (id) DO UPDATE SET embedding=..., document=..., cmetadata=...`:
+
+```python
+def ingest(self, table_chunks: List[Dict]) -> None:
+    documents, ids = [], []
+    for chunk in table_chunks:
+        documents.append(Document(page_content=chunk["content"], metadata=chunk["metadata"]))
+        ids.append(chunk["id"])
+    self._vectorstore.add_documents(documents, ids=ids)
+```
+
+---
+
+#### Fix 3 — `reset_collection()` to Clean Up Existing Duplicates
+
+**File:** `infrastructure/vector_store/pgvector_store.py`
+
+If `/ingest` was called multiple times before this fix, the collection already has duplicates. Add a `reset_collection()` method that drops and recreates the collection, and expose a `force_reset` flag on the `/ingest` endpoint for one-time cleanup:
+
+```python
+def reset_collection(self) -> None:
+    self._vectorstore.delete_collection()
+    self._vectorstore.create_collection()
+```
+
+---
+
+#### Fix 4 — Deduplicate by `table_name` in `search()` (Safety Net)
+
+**File:** `infrastructure/vector_store/pgvector_store.py:search()`
+
+Even with upsert working correctly, add a deduplication step that keeps only the highest-scoring entry per `table_name`. Guards against any future accidental duplicates:
+
+```python
+seen: Dict[str, float] = {}
+for table_name, score in all_results:
+    if table_name not in seen or score > seen[table_name]:
+        seen[table_name] = score
+return sorted(seen.items(), key=lambda x: x[1], reverse=True)
+```
+
+---
+
+#### TODO Summary
+
+| Fix | File | What it does | Priority |
+|---|---|---|---|
+| 1 — Stable IDs | `vector_schema_builder.py` | `uuid.uuid5` per table — same ID every run | P0 — prerequisite |
+| 2 — Upsert via IDs | `pgvector_store.py:ingest()` | `add_documents(docs, ids=ids)` → INSERT OR UPDATE | P0 — stops new duplicates |
+| 3 — Reset existing duplicates | `pgvector_store.py` | `reset_collection()` + `force_reset` flag on `/ingest` | P1 — one-time cleanup |
+| 4 — Search deduplication | `pgvector_store.py:search()` | Keep highest score per `table_name` | P1 — safety net |
+
+---
+
+### P3 — Deep Dive: Router Schema Summary `.items()` Bug
+
+#### Summary
+
+The router LLM receives a garbled list of "available tables" — it sees `database_name`, `version`, `tables` as table names instead of the actual business tables (`customer`, `orders`, `sales`, etc.). This breaks intent classification, the answerability check, and the `relevant_tables` hint passed to the SQL subgraph.
+
+---
+
+#### The Full Data Flow
+
+```
+GET /schemaText
+  └── generate_schema_summary()
+        └── writes schema_summary.json  ($SCHEMA_SUMMARY_PATH)
+
+router_node (every user query)
+  └── schema_loader.load_schema_summary()  → returns full JSON dict
+  └── formats dict into text → injected into router LLM prompt
+```
+
+---
+
+#### What `schema_summary.json` Actually Contains
+
+`generate_schema_summary()` in `transform_schema_to_text.py:86–103` writes:
+
+```json
+{
+    "database_name": "ai_chatbot_db",
+    "version": "v1",
+    "tables": [
+        { "table": "customer",  "bussiness_purpose": "Master list of all customers...", "example_questions": [...] },
+        { "table": "orders",    "bussiness_purpose": "Customer orders with status tracking...", "example_questions": [...] },
+        { "table": "sales",     "bussiness_purpose": "Individual line items of each order...", "example_questions": [...] },
+        { "table": "product",   "bussiness_purpose": "Product master catalog...", "example_questions": [...] },
+        { "table": "inventory", "bussiness_purpose": "Current stock levels per product...", "example_questions": [...] }
+    ]
+}
+```
+
+The actual table data is nested inside the `"tables"` key.
+
+---
+
+#### The Bug — `router.py:74-78`
+
+```python
+schema_summary = schema_loader.load_schema_summary()   # returns full dict above
+
+schema_summary_text = "\n".join(
+    [f"- {table}: {desc}" for table, desc in schema_summary.items()]
+)
+```
+
+`.items()` on the top-level dict yields the top-level keys only:
+
+```
+("database_name", "ai_chatbot_db")
+("version",       "v1")
+("tables",        [{"table": "customer", ...}, ...])   ← entire list as one value
+```
+
+So `schema_summary_text` injected into the router prompt becomes:
+
+```
+- database_name: ai_chatbot_db
+- version: v1
+- tables: [{'table': 'customer', 'bussiness_purpose': '...'}, ...]
+```
+
+The router LLM sees `database_name`, `version`, and `tables` as the available "table names".
+
+---
+
+#### Second Bug — `router.py:98` (Same Block)
+
+```python
+response_msg = f"\n\nI can help you with: {', '.join(schema_summary.keys())}."
+```
+
+`schema_summary.keys()` returns `["database_name", "version", "tables"]` — again the top-level keys, not table names. When the router tells the user what data it can help with, it says *"I can help you with: database_name, version, tables"*.
+
+---
+
+#### Impact on Router Behaviour
+
+| Failure | Cause |
+|---|---|
+| `is_answerable: False` for valid queries | LLM sees no `customer`/`orders` table — concludes data is unavailable |
+| `relevant_tables` hint is wrong | LLM returns `["database_name"]` instead of `["customer", "sales"]` — hurts pgvector boost |
+| Out-of-scope guard may break | LLM can't parse garbled list, may mark everything as answerable |
+| Wrong "I can help with" message | Uses top-level JSON keys instead of table names |
+
+---
+
+#### The Fix
+
+**File:** `agent/router.py`
+
+**Fix 1 — lines 74–78: replace `.items()` with nested table loop**
+
+```python
+# Before
+schema_summary_text = "\n".join(
+    [f"- {table}: {desc}" for table, desc in schema_summary.items()]
+)
+
+# After
+schema_summary_text = "\n".join(
+    [
+        f"- {t['table']}: {t['bussiness_purpose']}"
+        for t in schema_summary.get("tables", [])
+    ]
+)
+```
+
+Router prompt now receives:
+
+```
+- customer: Master list of all customers. Each customer has a unique code used across orders and sales.
+- orders: Customer orders with status tracking from PENDING through COMPLETED or VOID.
+- sales: Individual line items of each order. Each row is one product sold in one order.
+- product: Product master catalog with pricing, status, and category information.
+- inventory: Current stock levels per product including on-hand, available, and expected quantities.
+```
+
+**Fix 2 — line 98: replace `.keys()` with actual table names**
+
+```python
+# Before
+response_msg = f"\n\nI can help you with: {', '.join(schema_summary.keys())}."
+
+# After
+table_names = [t["table"] for t in schema_summary.get("tables", [])]
+response_msg = f"\n\nI can help you with: {', '.join(table_names)}."
+```
+
+---
+
+#### Files Changed
+
+| File | Lines | Change |
+|---|---|---|
+| `agent/router.py` | 74–78 | Replace `.items()` with `.get("tables", [])` loop using `t["table"]` and `t["bussiness_purpose"]` |
+| `agent/router.py` | 98 | Replace `.keys()` with list of `t["table"]` from nested tables |
+
+*Generated: 2026-05-29 | Updated: 2026-06-10 | Repository: `ai-agentic-chatbot` | Branch: `develop`*
