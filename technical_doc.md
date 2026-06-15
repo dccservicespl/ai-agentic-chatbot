@@ -1108,29 +1108,121 @@ After setup, the SQL agent uses `SchemaLoader.get_table_docs_for_search()` at qu
 
 ## 12. 📊 Visualization Engine
 
-**File:** `agent/nodes/visualizer.py` — `VisualizationNode`
+**File:** `src/ai_agentic_chatbot/agent/nodes/visualizer.py`
 
-### Chart Type Heuristics
+### Overview
 
-The visualizer analyzes the `query_result` DataFrame and applies these rules in order:
+The Visualization Engine is a **LangGraph node** in the agent pipeline. Its sole responsibility is to receive SQL query results and automatically decide the best chart or display type — KPI card, line chart, bar chart, pie chart, or table. The decision is entirely rule-based (heuristic), with a TODO to upgrade to LLM-assisted selection in a future iteration.
 
-| Condition | Chart Type |
+---
+
+### Structure — `VisualizationNode` Class
+
+#### `determine_visualization(state)` — lines 16–53
+
+The **public entry point** called by LangGraph. It reads three keys from the agent `state` dict:
+
+| Key | Source |
 |---|---|
-| 1 row, 1 column | 🔢 **KPI** (single metric display) |
-| 2 columns: date/time + numeric | 📈 **Line Chart** |
-| 2 columns: categorical + numeric | 📊 **Bar Chart** |
-| 2 columns: column name contains "percent" | 🥧 **Pie Chart** |
-| 3+ columns OR multi-row | 📋 **Table** |
-| Fallback / text response | 💬 **Text** |
+| `query_result` | Rows returned from SQL execution node |
+| `generated_sql` | The SQL string that was executed |
+| `explanation` | LLM-generated plain-English explanation |
 
-### Value Formatting
+**Short-circuit:** if `query_result` is empty, returns a `"text"` type payload immediately with a "No Results" message — no DataFrame analysis occurs.
 
-| Column Name Pattern | Format Applied |
-|---|---|
-| `sales`, `revenue`, `amount`, `price`, `cost` | 💰 Currency (`$1,234,567`) |
-| `percent`, `rate`, `ratio` + value in 0–1 | 📊 Percentage (`12.5%`) |
-| `count`, `number`, `qty`, `total` | 🔢 Integer (`1,234`) |
-| Other numeric | Decimal (`.2f`) |
+Otherwise, converts results to a Pandas DataFrame and delegates to `_apply_heuristics()`.
+
+> **Note:** Line 55 has a redundant module-level `logger = get_logger(__name__)` statement declared inside the class body but outside `__init__`. It runs at class definition time and is harmless but redundant — `logger` is already declared at module level on line 7.
+
+---
+
+#### `_apply_heuristics(df, sql_query, explanation)` — lines 57–174
+
+The **decision engine**. Applies a priority-ordered waterfall of rules against the DataFrame's shape, column types, and column names. The first rule that matches wins.
+
+| Priority | Condition | Visualization Type |
+|---|---|---|
+| 1 | 1 row × 1 column | `kpi` — single metric card |
+| 2 | 2 cols, first col parseable as date/time | `line_chart` — time series |
+| 3 | 2 cols, ≤20 rows, string + numeric columns | `bar_chart` — categorical comparison |
+| 4 | 2 cols, ≤8 rows, second col name contains "percent / share / proportion" | `pie_chart` — distribution |
+| 5 | ≥3 cols, ≤50 rows | `table` — detailed multi-column view |
+| 6 (fallback) | Everything else | `table` — capped at 100 rows, paginated |
+
+**Priority conflict note:** Rules 2 and 3 both check `num_cols == 2`. Since rule 2 is evaluated first, any 2-column dataset where the first column is a date will always produce a `line_chart` — even if the row count is ≤20. This is intentional: time series takes priority over categorical bar charts.
+
+---
+
+### Helper Methods
+
+| Method | File Location | Purpose |
+|---|---|---|
+| `_is_date_column(series)` | line 178 | Guards against numeric series first (`is_numeric_dtype` → `False`), then samples the first 5 values and attempts `pd.to_datetime()`. Returns `True` only if the series is non-numeric and all sampled values parse without error. |
+| `_format_kpi_value(value, column_name)` | line 186 | Formats a raw number for display: `$1,234.56` for money columns, `12.3%` for ratios, `1,234` for counts. Driven by keyword matching on the column name. |
+| `_detect_value_format(value, column_name)` | line 224 | Returns a format type string (`"currency"`, `"percentage"`, `"integer"`, `"decimal"`, `"text"`) consumed by the frontend for CSS/display styling. |
+| `_beautify_column_name(column_name)` | line 254 | Converts snake_case or kebab-case column names to Title Case: `total_sales_amount` → `Total Sales Amount`. |
+| `_create_payload(...)` | line 258 | Builds the standardized output dict returned by every branch: `type`, `title`, `data`, `columns`, `config`, `summary`, `row_count`. |
+
+---
+
+### Value Formatting Rules (`_format_kpi_value` / `_detect_value_format`)
+
+Both methods apply the same keyword-matching logic on the column name:
+
+| Column Name Keywords | Display Format | Format Type String |
+|---|---|---|
+| `sales`, `revenue`, `amount`, `price`, `cost`, `total`, `value` | `$1,234.56` | `"currency"` |
+| `percent`, `rate`, `ratio` (value 0–1) | `12.5%` | `"percentage"` |
+| `percent`, `rate`, `ratio` (value > 1) | `12.5%` (no conversion) | `"percentage"` |
+| `count`, `number`, `qty`, `quantity` | `1,234` (integer) | `"integer"` |
+| Other numeric ≥ 1000 | `1,234.00` | `"decimal"` |
+| Other numeric < 1000 | `0.42` | `"decimal"` |
+| Non-numeric | raw string | `"text"` |
+
+---
+
+### LangGraph Entry Point — `visualizer_node(state)` — lines 278–281
+
+A module-level function that LangGraph registers as a graph node. Instantiates `VisualizationNode` on each call and delegates to `determine_visualization()`.
+
+```python
+def visualizer_node(state: dict) -> dict:
+    visualizer = VisualizationNode()
+    return visualizer.determine_visualization(state)
+```
+
+---
+
+### Data Flow
+
+```
+LangGraph agent state
+    { query_result, generated_sql, explanation }
+         │
+         ▼
+visualizer_node(state)
+         │
+         ▼
+VisualizationNode.determine_visualization()
+         │
+         ├── empty results? → return { type: "text", ... }
+         │
+         ▼
+pd.DataFrame(query_result)  →  shape analysis
+         │
+         ▼
+_apply_heuristics()  —  priority waterfall
+         │
+         ▼
+_create_payload()  →  standardized dict
+         │
+         ▼
+state["visualization"] = {
+    type, title, data, columns, config, summary, row_count
+}
+```
+
+---
 
 ### Visualization Payload Schema
 
@@ -1145,13 +1237,139 @@ The visualizer analyzes the `query_result` DataFrame and applies these rules in 
   "config": {
     "x_axis": "column_a",
     "y_axis": "column_b",
-    "label_column": "column_a",
-    "value_column": "column_b"
+    "x_label": "Column A",
+    "y_label": "Column B"
   },
-  "summary": "One-sentence insight about the data",
+  "summary": "One-sentence insight about the data.",
   "row_count": 10
 }
 ```
+
+**`config` shape by chart type:**
+
+| Chart Type | Config Keys |
+|---|---|
+| `kpi` | `value` (formatted string), `metric` (column name), `format` (type string) |
+| `line_chart` | `x_axis`, `y_axis`, `x_label`, `y_label` |
+| `bar_chart` | `x_axis`, `y_axis`, `x_label`, `y_label` |
+| `pie_chart` | `category`, `value`, `category_label`, `value_label` |
+| `table` | `columns` (list), `highlight_numeric` (bool), `sortable` (bool), `total_rows` (int), `paginated` (bool) |
+
+---
+
+### Known Issues / TODOs
+
+| # | Location | Issue |
+|---|---|---|
+| 1 | line 48 | `# TODO: apply intelligent heuristics using LLMs` — current logic is purely rule-based. Plan is to let an LLM choose the chart type based on data shape + SQL context. |
+| 2 | line 65 | `logger.info("df", df.head())` is a **bug**: `logger.info()` does not accept two positional args like `print()`. This either silently logs the string `"df"` and discards the DataFrame, or raises a `TypeError` depending on the logging handler. Should be `logger.info("df head: %s", df.head())` or `logger.debug(df.head().to_string())`. |
+| 3 | line 55 | Duplicate `logger = get_logger(__name__)` at class-body scope — already declared at module level on line 7. Harmless but should be removed. |
+
+---
+
+### Date Formatting — `dd-mm-yyyy`
+
+**Problem:** PostgreSQL returns date/datetime values as Python `datetime` objects. `_serialize_value()` in `execute_query.py` converts them via `.isoformat()`, producing strings like `2026-01-01T00:00:00+00:00`. These raw ISO strings were passed through to the visualization payload unchanged.
+
+**Fix location:** `visualizer.py` — formatting is applied inside the visualization pipeline only. The raw `query_result` in the agent state still holds the ISO string, so other consumers (raw API callers, retry logic) are unaffected.
+
+#### New method — `_format_date_columns(df, date_flags)` (line 188)
+
+```python
+def _format_date_columns(self, df: pd.DataFrame, date_flags: list) -> pd.DataFrame:
+    """Reformat detected date columns to dd-mm-yyyy, stripping time and timezone."""
+    df = df.copy()
+    for i, is_date in enumerate(date_flags):
+        if is_date:
+            col = df.columns[i]
+            df[col] = (
+                pd.to_datetime(df[col], utc=True, errors="coerce")
+                .dt.strftime("%d-%m-%Y")
+            )
+    return df
+```
+
+- `utc=True` — normalises timezone-aware ISO strings (e.g. `+00:00`, `+05:30`) before formatting.
+- `errors="coerce"` — unparseable values become `NaT` → `None` instead of raising.
+- Time component is always stripped — `2026-01-15T14:35:22+00:00` → `15-01-2026`.
+
+#### Change in `_apply_heuristics()` (lines 65–67 & 90)
+
+```python
+# Before (detect and format happened independently, out of order)
+if self._is_date_column(df.iloc[:, 0]):   # line chart check on raw ISO string
+    ...
+
+# After (detect first on raw data, then format, then use pre-computed flags)
+date_flags = [self._is_date_column(df.iloc[:, i]) for i in range(num_cols)]
+df = self._format_date_columns(df, date_flags)
+
+# line chart branch now uses the pre-computed flag
+if date_flags[0]:
+    ...
+```
+
+**Why detect before format:** After reformatting to `dd-mm-yyyy`, the string `15-01-2026` is ambiguous to `pd.to_datetime()` — pandas may parse it as `YYYY-DD-MM`, causing `_is_date_column()` to return `False` and misclassify a time-series result as a bar chart. Detecting on the original ISO strings ensures correct chart type selection.
+
+#### Result
+
+| Before | After |
+|---|---|
+| `"2026-01-01T00:00:00+00:00"` | `"01-01-2026"` |
+| `"2026-01-15T14:35:22+05:30"` | `"15-01-2026"` |
+
+Applies to all visualization types — table cells, KPI values, and line chart X-axis labels.
+
+---
+
+### Bug Fix — Integer Columns Misidentified as Dates (`_is_date_column`)
+
+**Symptom:** Queries returning integer aggregates such as `COUNT(DISTINCT order_no) AS order_count` showed values like `01-01-1970` instead of the actual count, and the visualization type was `table` instead of `bar_chart`.
+
+**Root cause — 3-bug cascade:**
+
+`pd.to_datetime()` silently accepts plain integers, treating them as **nanoseconds since Unix epoch**. A `COUNT` result like `42` parsed without error:
+
+```
+pd.to_datetime(42) → Timestamp('1970-01-01 00:00:00.000000042')
+```
+
+This caused a cascade across three functions:
+
+| Step | Bug | Effect |
+|---|---|---|
+| 1 | `_is_date_column([42, 38, ...])` → `True` (should be `False`) | Integer column wrongly flagged as a date |
+| 2 | `_format_date_columns()` converts `42` → `"01-01-1970"` | COUNT values replaced with epoch date strings |
+| 3 | Bar chart check: `is_numeric_dtype("01-01-1970")` → `False` | Bar chart skipped, falls through to table |
+
+```
+order_count = [42, 38, 35, ...]   ← integers from COUNT()
+      │
+      ▼  _is_date_column() — pd.to_datetime(42) succeeds → True   ← BUG 1
+      │
+      ▼  _format_date_columns() — 42 → "01-01-1970"               ← BUG 2
+      │
+      ▼  is_numeric_dtype("01-01-1970") → False → bar chart skipped ← BUG 3
+      │
+      ▼  type: "table"   (wrong — should be bar_chart)
+```
+
+**Fix — one guard line added to `_is_date_column()` (line 179):**
+
+```python
+def _is_date_column(self, series) -> bool:
+    if pd.api.types.is_numeric_dtype(series):   # ← added guard
+        return False
+    try:
+        sample_size = min(5, len(series))
+        sample = series.head(sample_size)
+        pd.to_datetime(sample, errors="raise")
+        return True
+    except (ValueError, TypeError):
+        return False
+```
+
+`is_numeric_dtype` returns `True` for both `int` and `float` dtypes, so the guard covers COUNT, SUM, AVG, and any other numeric aggregate. All three cascade bugs resolve from this single change.
 
 ---
 

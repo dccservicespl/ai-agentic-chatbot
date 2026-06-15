@@ -62,7 +62,10 @@ class VisualizationNode:
         columns = df.columns.tolist()
         sql_lower = sql_query.lower()
 
-        logger.info("df", df.head())
+        # Detect date columns before formatting (dd-mm-yyyy strings won't pass _is_date_column)
+        date_flags = [self._is_date_column(df.iloc[:, i]) for i in range(num_cols)]
+        df = self._format_date_columns(df, date_flags)
+
         # Single Value (KPI)
         if num_rows == 1 and num_cols == 1:
             column_name = columns[0]
@@ -84,8 +87,7 @@ class VisualizationNode:
 
         # 2. Time Series Detection (Date + Metric) -> Line Chart
         if num_cols == 2:
-            first_col_data = df.iloc[:, 0]
-            if self._is_date_column(first_col_data):
+            if date_flags[0]:
                 return self._create_payload(
                     type="line_chart",
                     title=f"{self._beautify_column_name(columns[1])} over Time",
@@ -175,6 +177,8 @@ class VisualizationNode:
 
     def _is_date_column(self, series) -> bool:
         """Check if a pandas series contains datetime-like data."""
+        if pd.api.types.is_numeric_dtype(series):
+            return False
         try:
             sample_size = min(5, len(series))
             sample = series.head(sample_size)
@@ -182,6 +186,18 @@ class VisualizationNode:
             return True
         except (ValueError, TypeError):
             return False
+
+    def _format_date_columns(self, df: pd.DataFrame, date_flags: list) -> pd.DataFrame:
+        """Reformat detected date columns to dd-mm-yyyy, stripping time and timezone."""
+        df = df.copy()
+        for i, is_date in enumerate(date_flags):
+            if is_date:
+                col = df.columns[i]
+                df[col] = (
+                    pd.to_datetime(df[col], utc=True, errors="coerce")
+                    .dt.strftime("%d-%m-%Y")
+                )
+        return df
 
     def _format_kpi_value(self, value: Any, column_name: str) -> str:
         """Format KPI values based on column name context."""

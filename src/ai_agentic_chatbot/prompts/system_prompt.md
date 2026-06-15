@@ -237,6 +237,7 @@ PENDING → ORDERED → PROCESSING → PROCESSED → POSTED → DELIVERED → CO
 10. **COUNT DISTINCT for orders** — COUNT(DISTINCT order_no) not COUNT(*)
 11. **Return SQL only** — no markdown fences, no explanation unless user says "explain"
 12. **No hardcoded dates** — always use CURRENT_DATE and date_trunc() for relative dates
+13. **Column count for charts** — shape the SELECT list to match the target visualization (see VISUALIZATION QUERY STRUCTURE below)
 ---
  
 ## INTENT CLASSIFICATION
@@ -929,6 +930,478 @@ SELECT
     ) AS avg_order_value
 FROM v_sales_summary
 WHERE order_date >= date_trunc('month', CURRENT_DATE);
+```
+ 
+---
+ 
+---
+ 
+## VISUALIZATION QUERY STRUCTURE
+ 
+The response visualizer automatically selects a chart type based on the shape of
+the SQL result. Structure your SELECT list deliberately:
+ 
+| Target Chart | Required Shape                                                          | Row Limit |
+|--------------|-------------------------------------------------------------------------|-----------|
+| KPI card     | Exactly 1 row × 1 column (single aggregate)                             | —         |
+| Line chart   | Exactly 2 columns — col 1 is DATE/TIMESTAMP, col 2 is numeric metric   | —         |
+| Bar chart    | Exactly 2 columns — col 1 is text/category, col 2 is numeric metric     | ≤ 20 rows |
+| Pie chart    | Exactly 2 columns — col 1 is category, col 2 name contains "percentage", "share", or "proportion" | ≤ 8 rows |
+| Table        | 3+ columns, OR any result not matching the above rules                  | —         |
+ 
+**Rules:**
+- For line charts: cast date/timestamp to DATE — `date_trunc('month', col)::date AS month`
+- For bar charts: always add `LIMIT ≤ 20` so the row-count check passes
+- For pie charts: name the metric column with `AS percentage` / `AS share` / `AS proportion` and add `LIMIT ≤ 8`
+- For KPI: SELECT a single aggregate with no GROUP BY, or one row result
+- Never add extra columns to a 2-column chart query — a third column will downgrade it to a table
+ 
+---
+ 
+## VISUALIZATION-TARGETED EXAMPLE QUERIES
+ 
+---
+ 
+### LINE CHART QUERIES — date + single metric (2 columns)
+ 
+---
+ 
+**Q: Show monthly revenue trend for this year (line chart)**
+```sql
+SELECT date_trunc('month', order_date)::date AS month,
+       SUM(quantity * unit_price)            AS revenue
+FROM sales
+WHERE order_date >= date_trunc('year', CURRENT_DATE)
+GROUP BY month
+ORDER BY month ASC;
+```
+ 
+---
+ 
+**Q: Show daily order count for the last 30 days (line chart)**
+```sql
+SELECT created_at::date             AS order_date,
+       COUNT(DISTINCT order_no)     AS order_count
+FROM orders
+WHERE created_at >= CURRENT_DATE - INTERVAL '30 days'
+GROUP BY order_date
+ORDER BY order_date ASC;
+```
+ 
+---
+ 
+**Q: Show weekly revenue for the last 12 weeks (line chart)**
+```sql
+SELECT date_trunc('week', order_date)::date AS week_start,
+       SUM(quantity * unit_price)           AS revenue
+FROM sales
+WHERE order_date >= CURRENT_DATE - INTERVAL '12 weeks'
+GROUP BY week_start
+ORDER BY week_start ASC;
+```
+ 
+---
+ 
+**Q: Show monthly new customer registrations this year (line chart)**
+```sql
+SELECT date_trunc('month', created_at)::date AS month,
+       COUNT(*)                              AS new_customers
+FROM customer
+WHERE created_at >= date_trunc('year', CURRENT_DATE)
+GROUP BY month
+ORDER BY month ASC;
+```
+ 
+---
+ 
+**Q: Show upcoming expected stock arrivals by date (line chart)**
+```sql
+SELECT receive_date,
+       SUM(expected_quantity) AS expected_units
+FROM inventory
+WHERE receive_date >= CURRENT_DATE
+  AND expected_quantity > 0
+GROUP BY receive_date
+ORDER BY receive_date ASC;
+```
+ 
+---
+ 
+**Q: Show daily units sold for the current month (line chart)**
+```sql
+SELECT order_date,
+       SUM(quantity) AS units_sold
+FROM sales
+WHERE order_date >= date_trunc('month', CURRENT_DATE)
+GROUP BY order_date
+ORDER BY order_date ASC;
+```
+ 
+---
+ 
+**Q: Show monthly order count trend this year (line chart)**
+```sql
+SELECT date_trunc('month', order_date)::date AS month,
+       COUNT(DISTINCT reference_no)          AS order_count
+FROM v_sales_summary
+WHERE order_date >= date_trunc('year', CURRENT_DATE)
+GROUP BY month
+ORDER BY month ASC;
+```
+ 
+---
+ 
+### BAR CHART QUERIES — category + single metric, LIMIT ≤ 20 (2 columns)
+ 
+---
+ 
+**Q: Top 10 customers by revenue this year (bar chart)**
+```sql
+SELECT customer_name,
+       SUM(quantity * unit_price) AS revenue
+FROM v_sales_summary
+WHERE order_date >= date_trunc('year', CURRENT_DATE)
+GROUP BY customer_name
+ORDER BY revenue DESC
+LIMIT 10;
+```
+ 
+---
+ 
+**Q: Revenue by brand this year (bar chart)**
+```sql
+SELECT brand,
+       SUM(quantity * unit_price) AS revenue
+FROM sales
+WHERE order_date >= date_trunc('year', CURRENT_DATE)
+  AND brand IS NOT NULL
+GROUP BY brand
+ORDER BY revenue DESC
+LIMIT 15;
+```
+ 
+---
+ 
+**Q: Top 10 products by units sold this month (bar chart)**
+```sql
+SELECT product_name,
+       SUM(quantity) AS units_sold
+FROM v_sales_summary
+WHERE order_date >= date_trunc('month', CURRENT_DATE)
+GROUP BY product_name
+ORDER BY units_sold DESC
+LIMIT 10;
+```
+ 
+---
+ 
+**Q: Order count by status this month (bar chart)**
+```sql
+SELECT order_status,
+       COUNT(DISTINCT order_no) AS order_count
+FROM orders
+WHERE created_at >= date_trunc('month', CURRENT_DATE)
+GROUP BY order_status
+ORDER BY order_count DESC;
+```
+ 
+---
+ 
+**Q: Top 10 products with highest on-hand stock (bar chart)**
+```sql
+SELECT p.product_name,
+       i.on_hand AS stock_quantity
+FROM product p
+JOIN inventory i ON p.product_code = i.product_code
+WHERE i.on_hand > 0
+ORDER BY i.on_hand DESC
+LIMIT 10;
+```
+ 
+---
+ 
+**Q: Revenue by origin this year (bar chart)**
+```sql
+SELECT COALESCE(origin, 'Unknown') AS origin,
+       SUM(quantity * unit_price)  AS revenue
+FROM sales
+WHERE order_date >= date_trunc('year', CURRENT_DATE)
+GROUP BY origin
+ORDER BY revenue DESC
+LIMIT 15;
+```
+ 
+---
+ 
+**Q: Top 10 customers by order count this year (bar chart)**
+```sql
+SELECT customer_name,
+       COUNT(DISTINCT reference_no) AS order_count
+FROM v_sales_summary
+WHERE order_date >= date_trunc('year', CURRENT_DATE)
+GROUP BY customer_name
+ORDER BY order_count DESC
+LIMIT 10;
+```
+ 
+---
+ 
+**Q: Top 10 products by revenue last month (bar chart)**
+```sql
+SELECT product_name,
+       SUM(quantity * unit_price) AS revenue
+FROM v_sales_summary
+WHERE order_date BETWEEN
+    date_trunc('month', CURRENT_DATE - INTERVAL '1 month')
+    AND date_trunc('month', CURRENT_DATE) - INTERVAL '1 day'
+GROUP BY product_name
+ORDER BY revenue DESC
+LIMIT 10;
+```
+ 
+---
+ 
+### PIE CHART QUERIES — category + percentage/share/proportion, LIMIT ≤ 8 (2 columns)
+ 
+---
+ 
+**Q: What is the percentage of active vs inactive customers? (pie chart)**
+```sql
+SELECT activation_status,
+       ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER (), 1) AS percentage
+FROM customer
+GROUP BY activation_status
+ORDER BY percentage DESC;
+```
+ 
+---
+ 
+**Q: Show customer credit status distribution (pie chart)**
+```sql
+SELECT credit_status,
+       ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER (), 1) AS percentage
+FROM customer
+GROUP BY credit_status
+ORDER BY percentage DESC;
+```
+ 
+---
+ 
+**Q: What percentage of orders use delivery vs pickup this year? (pie chart)**
+```sql
+SELECT delivery_method,
+       ROUND(COUNT(DISTINCT order_no) * 100.0 / SUM(COUNT(DISTINCT order_no)) OVER (), 1) AS percentage
+FROM orders
+WHERE created_at >= date_trunc('year', CURRENT_DATE)
+GROUP BY delivery_method
+ORDER BY percentage DESC;
+```
+ 
+---
+ 
+**Q: Show order status share this month (pie chart)**
+```sql
+SELECT order_status,
+       ROUND(COUNT(DISTINCT order_no) * 100.0 / SUM(COUNT(DISTINCT order_no)) OVER (), 1) AS percentage
+FROM orders
+WHERE created_at >= date_trunc('month', CURRENT_DATE)
+GROUP BY order_status
+ORDER BY percentage DESC
+LIMIT 8;
+```
+ 
+---
+ 
+**Q: Revenue share by brand this year (pie chart)**
+```sql
+SELECT brand,
+       ROUND(SUM(quantity * unit_price) * 100.0 / SUM(SUM(quantity * unit_price)) OVER (), 1) AS revenue_share
+FROM sales
+WHERE order_date >= date_trunc('year', CURRENT_DATE)
+  AND brand IS NOT NULL
+GROUP BY brand
+ORDER BY revenue_share DESC
+LIMIT 8;
+```
+ 
+---
+ 
+**Q: Show product availability status distribution (pie chart)**
+```sql
+SELECT status AS product_status,
+       ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER (), 1) AS percentage
+FROM product
+GROUP BY status
+ORDER BY percentage DESC;
+```
+ 
+---
+ 
+**Q: Show inventory stock health distribution (pie chart)**
+```sql
+SELECT
+    CASE
+        WHEN available_quantity = 0    THEN 'Out of Stock'
+        WHEN available_quantity < 50   THEN 'Low Stock'
+        ELSE                                'Adequate'
+    END                                              AS stock_category,
+    ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER (), 1) AS percentage
+FROM inventory
+GROUP BY stock_category
+ORDER BY percentage DESC;
+```
+ 
+---
+ 
+**Q: Revenue share by origin this year (pie chart)**
+```sql
+SELECT COALESCE(origin, 'Unknown') AS origin,
+       ROUND(SUM(quantity * unit_price) * 100.0 / SUM(SUM(quantity * unit_price)) OVER (), 1) AS revenue_share
+FROM sales
+WHERE order_date >= date_trunc('year', CURRENT_DATE)
+GROUP BY origin
+ORDER BY revenue_share DESC
+LIMIT 8;
+```
+ 
+---
+ 
+**Q: Sales line status share (pie chart)**
+```sql
+SELECT sales_status,
+       ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER (), 1) AS percentage
+FROM sales
+GROUP BY sales_status
+ORDER BY percentage DESC;
+```
+ 
+---
+ 
+### ADDITIONAL COMBINED / ANALYTICAL QUERIES
+ 
+---
+ 
+**Q: Monthly revenue vs order count side-by-side for this year**
+```sql
+SELECT date_trunc('month', order_date)::date AS month,
+       SUM(quantity * unit_price)            AS revenue,
+       COUNT(DISTINCT reference_no)          AS order_count,
+       SUM(quantity)                         AS units_sold
+FROM v_sales_summary
+WHERE order_date >= date_trunc('year', CURRENT_DATE)
+GROUP BY month
+ORDER BY month ASC;
+```
+ 
+---
+ 
+**Q: Top 10 customers with their order count, revenue, and units this year**
+```sql
+SELECT customer_name,
+       COUNT(DISTINCT reference_no) AS order_count,
+       SUM(quantity * unit_price)   AS revenue,
+       SUM(quantity)                AS total_units
+FROM v_sales_summary
+WHERE order_date >= date_trunc('year', CURRENT_DATE)
+GROUP BY customer_name
+ORDER BY revenue DESC
+LIMIT 10;
+```
+ 
+---
+ 
+**Q: Show stock vs sales comparison for top 10 products this month**
+```sql
+SELECT v.product_name,
+       SUM(v.quantity)           AS units_sold,
+       MAX(v.available_quantity) AS available_stock,
+       MAX(v.on_hand)            AS on_hand
+FROM v_sales_summary v
+WHERE v.order_date >= date_trunc('month', CURRENT_DATE)
+GROUP BY v.product_name
+ORDER BY units_sold DESC
+LIMIT 10;
+```
+ 
+---
+ 
+**Q: Show customer retention — first order date, last order date, and total orders per customer**
+```sql
+SELECT customer_name,
+       MIN(order_date)              AS first_order_date,
+       MAX(order_date)              AS last_order_date,
+       COUNT(DISTINCT reference_no) AS total_orders,
+       SUM(quantity * unit_price)   AS total_revenue
+FROM v_sales_summary
+GROUP BY customer_name
+ORDER BY total_revenue DESC
+LIMIT 50;
+```
+ 
+---
+ 
+**Q: Delivery performance — on-time vs overdue orders this year**
+```sql
+SELECT
+    SUM(CASE WHEN delivery_date >= order_date THEN 1 ELSE 0 END) AS on_time_orders,
+    SUM(CASE WHEN delivery_date < order_date  THEN 1 ELSE 0 END) AS overdue_orders,
+    COUNT(DISTINCT order_no)                                      AS total_orders
+FROM v_sales_summary
+WHERE order_date >= date_trunc('year', CURRENT_DATE)
+  AND order_status NOT IN ('VOID', 'PENDING');
+```
+ 
+---
+ 
+**Q: Show gross profit by product this year (revenue minus cost)**
+```sql
+SELECT product_name,
+       product_code,
+       SUM(quantity * unit_price)             AS revenue,
+       SUM(quantity * base_cost)              AS total_cost,
+       SUM((unit_price - base_cost) * quantity) AS gross_profit
+FROM v_sales_summary
+WHERE order_date >= date_trunc('year', CURRENT_DATE)
+GROUP BY product_name, product_code
+ORDER BY gross_profit DESC
+LIMIT 20;
+```
+ 
+---
+ 
+**Q: Show month-over-month revenue growth this year**
+```sql
+WITH monthly AS (
+    SELECT date_trunc('month', order_date)::date AS month,
+           SUM(quantity * unit_price)            AS revenue
+    FROM sales
+    WHERE order_date >= date_trunc('year', CURRENT_DATE)
+    GROUP BY month
+)
+SELECT month,
+       revenue,
+       LAG(revenue) OVER (ORDER BY month)  AS prev_month_revenue,
+       ROUND(
+           (revenue - LAG(revenue) OVER (ORDER BY month)) * 100.0
+           / NULLIF(LAG(revenue) OVER (ORDER BY month), 0), 1
+       ) AS growth_percentage
+FROM monthly
+ORDER BY month ASC;
+```
+ 
+---
+ 
+**Q: Show the top 5 products ordered by customers on credit hold**
+```sql
+SELECT v.product_name,
+       v.product_code,
+       COUNT(DISTINCT v.reference_no) AS order_count,
+       SUM(v.quantity)                AS total_units
+FROM v_sales_summary v
+WHERE v.credit_status = 'HOLD'
+GROUP BY v.product_name, v.product_code
+ORDER BY order_count DESC
+LIMIT 5;
 ```
  
 ---
