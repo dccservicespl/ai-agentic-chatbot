@@ -3995,17 +3995,33 @@ Confirmed with stakeholder: real greetings (`"hi"`, `"thanks"`) keep their LLM-g
 
 ### Fix / TODO List
 
-- [ ] **`agent/router.py` — `RouterNode.classify()`:** every return branch includes `"visualization": None, "relevant_tables": None` so each new turn starts clean. `sql_query_node` runs after the router within the same turn, so it still overwrites these with real values when the turn is a SQL query.
-- [ ] **`server.py:260-265`:** only attach `visualization` to the SSE payload when the turn's final state indicates a SQL turn, instead of unconditionally echoing `accumulated_state.get("visualization")`.
-- [ ] **`agent/router.py` (`RouterDecision.intent`) + `prompts/router_prompts.md`:** add a real `out_of_scope` value distinct from `greeting`, and align the prompt's category descriptions with the actual enum values.
-- [ ] **`agent/graph.py`:** wire `out_of_scope` to a new static node — fixed redirect text, **no `fast_llm.invoke()` call**. Apply the same static treatment to `fallback_node` (true gibberish/nonsense), since neither case needs a generative answer. `greeting_node` keeps calling `fast_llm` unchanged for real greetings.
-- [ ] **Regression test** (same `thread_id`): chart-producing SQL query → `"how are you"` (static reply, `visualization: null`, no LLM call) → `"hi"` (LLM-generated greeting, `visualization: null`) → gibberish (static fallback, `visualization: null`).
-- [ ] **`agent/router.py`:** defensively reset `next_step` in the same way as `visualization`/`relevant_tables`, for the same class of risk if the graph grows additional branches later.
+- [x] **`agent/router.py` — `RouterNode.classify()`:** every return branch includes `"visualization": None, "relevant_tables": None` so each new turn starts clean. `sql_query_node` runs after the router within the same turn, so it still overwrites these with real values when the turn is a SQL query.
+- [x] **`server.py:260-265`:** only attach `visualization` to the SSE payload when the turn's final state indicates a SQL turn, instead of unconditionally echoing `accumulated_state.get("visualization")`.
+- [x] **`agent/router.py` (`RouterDecision.intent`) + `prompts/router_prompts.md`:** add a real `out_of_scope` value distinct from `greeting`, and align the prompt's category descriptions with the actual enum values.
+- [x] **`agent/graph.py`:** wire `out_of_scope` (and `nonsense`) to a static, no-LLM path. `greeting_node` keeps calling `fast_llm` unchanged for real greetings.
+- [x] **Regression test** (same `thread_id`): chart-producing SQL query → `"how are you"` (static reply, `visualization: null`, no LLM call) → `"hi"` (LLM-generated greeting, `visualization: null`) → gibberish (static fallback, `visualization: null`).
+- [x] **`agent/router.py`:** defensively reset `next_step` in the same way as `visualization`/`relevant_tables`, for the same class of risk if the graph grows additional branches later.
+
+### Implementation Notes
+
+- **Point 4 deviated slightly from the original plan.** The plan called for "a new static node" for `out_of_scope`. In practice, `RouterNode.classify()`'s `out_of_scope` branch (point 3) already attaches a complete, schema-aware `AIMessage` and routes to the existing `next_step: "nonsense"` — so `fallback_node` just needed to stop calling the LLM, not gain new logic. It was changed to a no-op (`return {}`), matching the pre-existing `clarification_node` pattern exactly. This also fixed a second, previously-unnoticed bug: `fallback_node`'s old LLM call was stacking a **second, generic** "please rephrase" reply after the router's specific one on every `nonsense`/`out_of_scope` turn.
+- **Point 6 is future-proofing, not a live bug fix.** Every current branch in `classify()` already sets `next_step` explicitly, so `reset_state["next_step"] = None` is always immediately overridden today. The value is in what happens if a future branch is added without setting it: routing fails loudly with a missing-edge error on the next turn, instead of silently replaying whatever `next_step` the previous turn left in the checkpoint.
+
+### Tests Added
+
+| File | Covers |
+|---|---|
+| `tests/test_router_node.py` | All `RouterNode.classify()` branches (greeting, out_of_scope, not-answerable, ambiguous, clean sql_query) reset `visualization`/`relevant_tables` correctly; `out_of_scope` routes safely even if `is_answerable` is mis-set |
+| `tests/test_server_stream_response.py` | `build_stream_response_data()` only forwards `visualization` when `next_step == "end"` |
+| `tests/test_graph_nodes.py` | `fallback_node` makes no LLM call and returns `{}`; `greeting_node` still calls the LLM |
+| `tests/test_agent_graph_e2e.py` | Full 4-turn scenario through the real compiled graph + checkpointer: SQL chart → chit-chat → greeting → gibberish, asserting no stale chart and no unwanted LLM calls at each step |
+
+Each fix was verified to actually catch the bug it targets by reverting the corresponding source change and re-running its test (all failed as expected — `KeyError`, `ImportError`, or `ValidationError` depending on the change — then passed again once restored).
 
 ### Status
 
-🔲 **Planned — not yet implemented.** Tracked for follow-up after this analysis; see corresponding GitHub issue.
+✅ **Completed.** All 6 items implemented and tested; see GitHub issue #19.
 
 ---
 
-*Generated: 2026-05-29 | Updated: 2026-06-16 | Repository: `ai-agentic-chatbot` | Branch: `17-feat-improve-visualization-type-prediction`*
+*Generated: 2026-05-29 | Updated: 2026-06-16 | Repository: `ai-agentic-chatbot` | Branch: `19-fix-visualization-state-leaks-across-conversation`*

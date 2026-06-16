@@ -88,7 +88,16 @@ class RouterNode:
 
         # Every branch starts from this reset so a chart/table hint from a
         # prior SQL turn never leaks into an unrelated turn's response.
-        reset_state = {"visualization": None, "relevant_tables": None}
+        # next_step defaults to None too: every branch below overrides it
+        # explicitly, but if a future branch ever forgot to, routing_policy
+        # would hit a missing-edge KeyError immediately instead of silently
+        # replaying whatever next_step the previous turn happened to leave
+        # in the checkpoint.
+        reset_state = {
+            "visualization": None,
+            "relevant_tables": None,
+            "next_step": None,
+        }
 
         if decision.intent == "greeting":
             return {
