@@ -28,6 +28,7 @@
 20. [Dockerize & Deploy to Azure VM — Todo List](#20-dockerize--deploy-to-azure-vm--todo-list)
 21. [NL-to-SQL Accuracy Improvements — Improvement Plan](#21-nl-to-sql-accuracy-improvements--improvement-plan)
 22. [Visualization State Leak on Non-Contextual Queries — Bug Fix Plan](#22-visualization-state-leak-on-non-contextual-queries--bug-fix-plan)
+23. [ROUND() on `double precision` Crashes Revenue-Share Pie Chart Queries](#23-round-on-double-precision-crashes-revenue-share-pie-chart-queries)
 
 ---
 
@@ -4021,6 +4022,83 @@ Each fix was verified to actually catch the bug it targets by reverting the corr
 ### Status
 
 ✅ **Completed.** All 6 items implemented and tested; see GitHub issue #19.
+
+---
+
+## 23. 🐛 ROUND() on `double precision` Crashes Revenue-Share Pie Chart Queries
+
+**Files:** `prompts/system_prompt.md`
+
+### Observed Behaviour
+
+User query *"Revenue share by brand this year"* generates:
+
+```sql
+SELECT brand,
+ROUND(SUM(quantity * unit_price) * 100.0 / SUM(SUM(quantity * unit_price)) OVER (), 1) AS revenue_share
+FROM sales
+WHERE order_date >= date_trunc('year', CURRENT_DATE)
+AND brand IS NOT NULL
+GROUP BY brand
+ORDER BY revenue_share desc;
+```
+
+This fails when executed against PostgreSQL:
+
+```
+ERROR: function round(double precision, integer) does not exist
+HINT: No function matches the given name and argument types. You might need to add explicit type casts.
+```
+
+---
+
+### Root Cause — A Verbatim Shipped Prompt Example, Not a Model Error
+
+PostgreSQL only defines `round(numeric, integer)` — there is **no** `round(double precision, integer)` overload.
+
+- `sales.quantity` is `BIGINT`, `sales.unit_price` is `DOUBLE PRECISION` (confirmed in `temp/db_schema.json:604,616`, `instructions/instruction.txt:131-132`, and `system_prompt.md:82-83` itself).
+- `quantity * unit_price` → `double precision`. `SUM(double precision)` **stays** `double precision` — unlike `SUM(bigint)`, which PostgreSQL promotes to `numeric`.
+- So the expression inside `ROUND(...)` ends up `double precision`, which has no two-argument `round()` overload, and the query errors.
+
+This isn't the model improvising — the exact broken pattern is a few-shot example baked into the prompt itself:
+
+- `system_prompt.md:1215-1225` — **"Revenue share by brand this year"** (essentially identical to the failing query)
+- `system_prompt.md:1256-1265` — **"Revenue share by origin this year"** (identical bug, second copy)
+
+Both were added in commit `bc1c405` (#15) and are still present on `HEAD`.
+
+The other 7 pie-chart percentage examples in the same `### PIE CHART QUERIES` section (lines 1171, 1182, 1193, 1205, 1232, 1248, 1272) don't break, because they use `COUNT(*)`/`COUNT(DISTINCT ...)` — `bigint`, which `SUM()` promotes to `numeric` automatically. Only the two `SUM(quantity * unit_price)` variants touch a `double precision` column, and they're missing the `::NUMERIC` cast already used correctly elsewhere in the same file:
+
+```sql
+-- system_prompt.md:578-580 — correct pattern, already in use
+SELECT ROUND(
+    SUM(quantity * unit_price)::NUMERIC / COUNT(DISTINCT reference_no), 2
+) AS avg_revenue_per_order
+```
+
+---
+
+### Impact
+
+| Dimension | Effect |
+|---|---|
+| **Correctness** | Any "revenue/sales share by X" pie-chart query fails outright with a SQL error instead of returning a chart |
+| **Scope** | Affects exactly 2 of the 9 pie-chart few-shot examples — only the ones involving `SUM(quantity * unit_price)` — plus any new query the model writes by following that example |
+| **Detectability** | Silent until a user asks a revenue-share question; not caught by any existing test, since prompt examples aren't executed against a real database in CI |
+
+---
+
+### Fix / TODO List
+
+- [x] **`system_prompt.md:1218`** — cast both `SUM(quantity * unit_price)` occurrences to `::NUMERIC` in the "Revenue share by brand" example, matching the style at line 579
+- [x] **`system_prompt.md:1259`** — same fix for "Revenue share by origin" (identical bug; fixed in the same edit as the brand example above)
+- [x] **`system_prompt.md` SQL GENERATION RULES (lines 226-241)** — added rule 14: always cast aggregate expressions to `::NUMERIC` before passing them to `ROUND()` when the underlying column may be `double precision`/`real` (e.g. `unit_price`); `COUNT()`-based aggregates don't need it
+- [x] **Audit pass** — grepped the rest of `system_prompt.md` for `ROUND(`/`round(` calls. Found and fixed a **third instance** at `system_prompt.md:1377` ("Show month-over-month revenue growth this year"): the CTE computed `SUM(quantity * unit_price) AS revenue` without a cast, and `revenue` then flowed through `LAG()`, subtraction, and division into `ROUND(..., 1)` at line 1385 — same root cause, since `double precision` propagates through arithmetic with a `numeric` literal (`numeric → float8` is an implicit cast in Postgres, but not the reverse) all the way to the `ROUND()` call. Fixed by casting at the source: `SUM(quantity * unit_price)::NUMERIC AS revenue` in the CTE. All other `ROUND(SUM(...))`/`ROUND(COUNT(...))` call sites in the file were confirmed already safe (either `COUNT()`-based, which `SUM()` promotes to `numeric` automatically, or already carrying an explicit `::NUMERIC` cast).
+- [ ] *(Optional, separate follow-up)* Consider migrating `sales.unit_price` to `NUMERIC(12,2)` at the schema level to eliminate this class of bug entirely — requires a real migration + schema re-extraction + pgvector re-ingestion, out of scope for this fix
+
+### Status
+
+✅ **Implemented.** All required fixes (4 of 5 TODO items) are done; only the optional schema-migration follow-up remains open. See GitHub issue #21.
 
 ---
 

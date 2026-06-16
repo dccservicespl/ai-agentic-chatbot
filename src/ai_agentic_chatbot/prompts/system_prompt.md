@@ -238,6 +238,7 @@ PENDING → ORDERED → PROCESSING → PROCESSED → POSTED → DELIVERED → CO
 11. **Return SQL only** — no markdown fences, no explanation unless user says "explain"
 12. **No hardcoded dates** — always use CURRENT_DATE and date_trunc() for relative dates
 13. **Column count for charts** — shape the SELECT list to match the target visualization (see VISUALIZATION QUERY STRUCTURE below)
+14. **Cast before ROUND()** — PostgreSQL has no `round(double precision, integer)` overload, only `round(numeric, integer)`. Any aggregate over a `double precision`/`real` column (e.g. `unit_price`) — `SUM(quantity * unit_price)`, `AVG(unit_price)`, etc. — must be cast with `::NUMERIC` before being passed to `ROUND()`, e.g. `ROUND(SUM(quantity * unit_price)::NUMERIC, 2)`. `COUNT()`-based aggregates don't need it — `SUM(COUNT(*))` is already `numeric`.
 ---
  
 ## INTENT CLASSIFICATION
@@ -1215,7 +1216,7 @@ LIMIT 8;
 **Q: Revenue share by brand this year (pie chart)**
 ```sql
 SELECT brand,
-       ROUND(SUM(quantity * unit_price) * 100.0 / SUM(SUM(quantity * unit_price)) OVER (), 1) AS revenue_share
+       ROUND(SUM(quantity * unit_price)::NUMERIC * 100.0 / SUM(SUM(quantity * unit_price)::NUMERIC) OVER (), 1) AS revenue_share
 FROM sales
 WHERE order_date >= date_trunc('year', CURRENT_DATE)
   AND brand IS NOT NULL
@@ -1256,7 +1257,7 @@ ORDER BY percentage DESC;
 **Q: Revenue share by origin this year (pie chart)**
 ```sql
 SELECT COALESCE(origin, 'Unknown') AS origin,
-       ROUND(SUM(quantity * unit_price) * 100.0 / SUM(SUM(quantity * unit_price)) OVER (), 1) AS revenue_share
+       ROUND(SUM(quantity * unit_price)::NUMERIC * 100.0 / SUM(SUM(quantity * unit_price)::NUMERIC) OVER (), 1) AS revenue_share
 FROM sales
 WHERE order_date >= date_trunc('year', CURRENT_DATE)
 GROUP BY origin
@@ -1373,7 +1374,7 @@ LIMIT 20;
 ```sql
 WITH monthly AS (
     SELECT date_trunc('month', order_date)::date AS month,
-           SUM(quantity * unit_price)            AS revenue
+           SUM(quantity * unit_price)::NUMERIC   AS revenue
     FROM sales
     WHERE order_date >= date_trunc('year', CURRENT_DATE)
     GROUP BY month
