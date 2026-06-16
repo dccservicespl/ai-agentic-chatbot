@@ -85,8 +85,13 @@ class RouterNode:
         )
         decision = structured_llm.invoke([base_prompt, prompt] + msgs)
 
+        # Every branch starts from this reset so a chart/table hint from a
+        # prior SQL turn never leaks into an unrelated turn's response.
+        reset_state = {"visualization": None, "relevant_tables": None}
+
         if decision.intent == "greeting":
             return {
+                **reset_state,
                 "next_step": "greeting",
             }
 
@@ -99,6 +104,7 @@ class RouterNode:
                 decision.missing_data_reason or "I don't have the data to answer that."
             )
             return {
+                **reset_state,
                 "next_step": "nonsense",
                 "messages": [AIMessage(content=response_msg)],
             }
@@ -109,6 +115,7 @@ class RouterNode:
             and decision.clarification.is_ambiguous
         ):
             return {
+                **reset_state,
                 "next_step": "ask_clarification",
                 "messages": [
                     AIMessage(content=decision.clarification.clarification_question),
@@ -116,6 +123,7 @@ class RouterNode:
             }
 
         return {
+            **reset_state,
             "next_step": decision.intent,
             "relevant_tables": decision.relevant_tables,
         }
