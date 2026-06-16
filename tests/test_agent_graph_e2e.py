@@ -134,4 +134,5 @@ def test_chart_then_chitchat_then_greeting_then_gibberish(graph_mocks):
         {"messages": [HumanMessage(content="asdkjasdj")]}, config=config
     )
     assert state4["visualization"] is None
+    assert "I can help you with" in state4["messages"][-1].content
     mock_fast_llm.invoke.assert_not_called()
