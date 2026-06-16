@@ -197,6 +197,23 @@ def ingest_schema_endpoint(force_reset: bool = False):
         raise exc
 
 
+def build_stream_response_data(content: str, accumulated_state: dict) -> dict:
+    """Build the SSE payload for one streamed turn.
+
+    sql_query_node is the only graph branch that sets next_step to "end";
+    greeting/fallback/clarification never produce a chart. Gating on that
+    flag stops a chart from an earlier turn lingering in accumulated_state
+    from being echoed back on an unrelated turn.
+    """
+    went_through_sql_node = accumulated_state.get("next_step") == "end"
+    return {
+        "content": content,
+        "visualization": (
+            accumulated_state.get("visualization") if went_through_sql_node else None
+        ),
+    }
+
+
 @app.post(
     "/stream",
     tags=["Chat"],
@@ -257,12 +274,9 @@ async def stream_endpoint(stream_request: StreamRequest):
                         if isinstance(last_message, AIMessage):
                             content = last_message.content
                             if content:
-                                response_data = {
-                                    "content": content,
-                                    "visualization": accumulated_state.get(
-                                        "visualization"
-                                    ),
-                                }
+                                response_data = build_stream_response_data(
+                                    content, accumulated_state
+                                )
 
                                 import json
 
