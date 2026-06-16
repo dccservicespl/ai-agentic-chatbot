@@ -27,6 +27,7 @@
 19. [Known Performance Issue — Excessive Embedding API Calls](#19-known-performance-issue--excessive-embedding-api-calls)
 20. [Dockerize & Deploy to Azure VM — Todo List](#20-dockerize--deploy-to-azure-vm--todo-list)
 21. [NL-to-SQL Accuracy Improvements — Improvement Plan](#21-nl-to-sql-accuracy-improvements--improvement-plan)
+22. [Visualization State Leak on Non-Contextual Queries — Bug Fix Plan](#22-visualization-state-leak-on-non-contextual-queries--bug-fix-plan)
 
 ---
 
@@ -3920,4 +3921,107 @@ response_msg = f"\n\nI can help you with: {', '.join(table_names)}."
 | `agent/router.py` | 74–78 | Replace `.items()` with `.get("tables", [])` loop using `t["table"]` and `t["bussiness_purpose"]` |
 | `agent/router.py` | 98 | Replace `.keys()` with list of `t["table"]` from nested tables |
 
-*Generated: 2026-05-29 | Updated: 2026-06-10 | Repository: `ai-agentic-chatbot` | Branch: `develop`*
+---
+
+## 22. 🐛 Visualization State Leak on Non-Contextual Queries — Bug Fix Plan
+
+**Files:** `agent/state.py`, `agent/router.py`, `agent/graph.py`, `server.py`, `prompts/router_prompts.md`
+
+### Observed Behaviour
+
+After running a SQL query that produced a chart, asking an unrelated conversational question in the **same `thread_id`** (e.g. `"how are you"`) returns the previous chart again instead of `null`:
+
+```json
+{
+  "content": "I'm just a program, but I'm here and ready to help you! How can I assist you today?",
+  "visualization": {
+    "type": "pie_chart",
+    "title": "Distribution of Delivery Method",
+    "data": [
+      {"delivery_method": "DELIVERY", "percentage": 94.2},
+      {"delivery_method": "PICKUP", "percentage": 5.8}
+    ],
+    "columns": ["delivery_method", "percentage"],
+    "config": {"category": "delivery_method", "value": "percentage", "category_label": "Delivery Method", "value_label": "Percentage"},
+    "summary": "Distribution across 2 categories.",
+    "row_count": 2
+  }
+}
+```
+
+This `pie_chart` is leftover from a prior turn's SQL query — `"how are you"` never touched the database.
+
+---
+
+### Root Cause — Two Compounding Bugs + One Contributing Factor
+
+**Bug 1 — `visualization` has no reducer and the graph is checkpointed per `thread_id`**
+
+`AgentState.visualization` (`agent/state.py:9`) is a plain optional field with no `Annotated` reducer. `build_graph()` compiles with `MemorySaver` (`agent/graph.py:416`), so the **full state persists across turns** within a `thread_id`. `greeting_node`, `fallback_node`, and `clarification_node` (`agent/graph.py:20-37`) never return a `visualization` key — and in LangGraph, a key that a node doesn't return is left untouched in the checkpoint, not cleared. So whatever the *last* `sql_query_node` wrote stays in state indefinitely until another SQL query overwrites it.
+
+**Bug 2 — `server.py` republishes the last known visualization unconditionally**
+
+```python
+# server.py:260-265
+response_data = {
+    "content": content,
+    "visualization": accumulated_state.get("visualization"),  # always attached, regardless of intent
+}
+```
+
+Every SSE chunk attaches `accumulated_state.get("visualization")` no matter what the current turn's intent was.
+
+**Contributing factor — router schema/prompt mismatch**
+
+`router_prompts.md:12` describes a third intent, `out_of_scope`, but `RouterDecision.intent` (`agent/router.py:32`) only allows `Literal["greeting", "sql_query", "nonsense"]`. There is no enum value matching the prompt's instructions, so casual chit-chat with no data intent (`"how are you"`, `"tell me a joke"`) gets folded into `greeting` by the structured-output LLM, which is why it received a chatty LLM-generated reply rather than a scoped one.
+
+---
+
+### Impact
+
+| Dimension | Effect |
+|---|---|
+| **Correctness** | Stale chart from an earlier, unrelated query is shown alongside an unrelated text reply — misleading to the user |
+| **Trust** | Users may believe the new message ("how are you") legitimately produced that data, or that the system is malfunctioning |
+| **Cost** | Every non-SQL turn (including pure chit-chat) still invokes `fast_llm` via `greeting_node` or `fallback_node`, even when a static reply would suffice |
+
+---
+
+### Decision — Greeting vs. Chit-Chat Behaviour
+
+Confirmed with stakeholder: real greetings (`"hi"`, `"thanks"`) keep their LLM-generated warm reply via `greeting_node`. Only genuine chit-chat/off-topic/nonsense input (`"how are you"`, `"tell me a joke"`, gibberish) should get a **static, no-LLM-call** redirect message — these never need a generative answer.
+
+---
+
+### Fix / TODO List
+
+- [x] **`agent/router.py` — `RouterNode.classify()`:** every return branch includes `"visualization": None, "relevant_tables": None` so each new turn starts clean. `sql_query_node` runs after the router within the same turn, so it still overwrites these with real values when the turn is a SQL query.
+- [x] **`server.py:260-265`:** only attach `visualization` to the SSE payload when the turn's final state indicates a SQL turn, instead of unconditionally echoing `accumulated_state.get("visualization")`.
+- [x] **`agent/router.py` (`RouterDecision.intent`) + `prompts/router_prompts.md`:** add a real `out_of_scope` value distinct from `greeting`, and align the prompt's category descriptions with the actual enum values.
+- [x] **`agent/graph.py`:** wire `out_of_scope` (and `nonsense`) to a static, no-LLM path. `greeting_node` keeps calling `fast_llm` unchanged for real greetings.
+- [x] **Regression test** (same `thread_id`): chart-producing SQL query → `"how are you"` (static reply, `visualization: null`, no LLM call) → `"hi"` (LLM-generated greeting, `visualization: null`) → gibberish (static fallback, `visualization: null`).
+- [x] **`agent/router.py`:** defensively reset `next_step` in the same way as `visualization`/`relevant_tables`, for the same class of risk if the graph grows additional branches later.
+
+### Implementation Notes
+
+- **Point 4 deviated slightly from the original plan.** The plan called for "a new static node" for `out_of_scope`. In practice, `RouterNode.classify()`'s `out_of_scope` branch (point 3) already attaches a complete, schema-aware `AIMessage` and routes to the existing `next_step: "nonsense"` — so `fallback_node` just needed to stop calling the LLM, not gain new logic. It was changed to a no-op (`return {}`), matching the pre-existing `clarification_node` pattern exactly. This also fixed a second, previously-unnoticed bug: `fallback_node`'s old LLM call was stacking a **second, generic** "please rephrase" reply after the router's specific one on every `nonsense`/`out_of_scope` turn.
+- **Point 6 is future-proofing, not a live bug fix.** Every current branch in `classify()` already sets `next_step` explicitly, so `reset_state["next_step"] = None` is always immediately overridden today. The value is in what happens if a future branch is added without setting it: routing fails loudly with a missing-edge error on the next turn, instead of silently replaying whatever `next_step` the previous turn left in the checkpoint.
+
+### Tests Added
+
+| File | Covers |
+|---|---|
+| `tests/test_router_node.py` | All `RouterNode.classify()` branches (greeting, out_of_scope, not-answerable, ambiguous, clean sql_query) reset `visualization`/`relevant_tables` correctly; `out_of_scope` routes safely even if `is_answerable` is mis-set |
+| `tests/test_server_stream_response.py` | `build_stream_response_data()` only forwards `visualization` when `next_step == "end"` |
+| `tests/test_graph_nodes.py` | `fallback_node` makes no LLM call and returns `{}`; `greeting_node` still calls the LLM |
+| `tests/test_agent_graph_e2e.py` | Full 4-turn scenario through the real compiled graph + checkpointer: SQL chart → chit-chat → greeting → gibberish, asserting no stale chart and no unwanted LLM calls at each step |
+
+Each fix was verified to actually catch the bug it targets by reverting the corresponding source change and re-running its test (all failed as expected — `KeyError`, `ImportError`, or `ValidationError` depending on the change — then passed again once restored).
+
+### Status
+
+✅ **Completed.** All 6 items implemented and tested; see GitHub issue #19.
+
+---
+
+*Generated: 2026-05-29 | Updated: 2026-06-16 | Repository: `ai-agentic-chatbot` | Branch: `19-fix-visualization-state-leaks-across-conversation`*

@@ -26,11 +26,11 @@ def greeting_node(state: AgentState) -> dict:
 
 
 def fallback_node(state: AgentState) -> dict:
-    prompt = SystemMessage(
-        "You are a helpful chat assistant. User has sent a message that does not make sense. Ask them to rephrase."
-    )
-    response = fast_llm.invoke([prompt, *state["messages"]])
-    return {"messages": [AIMessage(content=response.content)]}
+    # router_node already attaches the full user-facing message for the
+    # "nonsense" next_step (covers both gibberish/nonsense and out_of_scope
+    # chit-chat) — calling the LLM here would just stack a second, generic
+    # reply on top of it.
+    return {}
 
 
 def clarification_node(state: AgentState) -> dict:

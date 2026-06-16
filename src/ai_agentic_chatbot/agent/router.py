@@ -29,11 +29,12 @@ class ClarificationDecision(BaseModel):
 class RouterDecision(BaseModel):
     """Router classification schema with strict validation."""
 
-    intent: Literal["greeting", "sql_query", "nonsense"] = Field(
+    intent: Literal["greeting", "sql_query", "nonsense", "out_of_scope"] = Field(
         description=(
-            "greeting: User is saying hi/hello or introducing themselves. "
-            "sql_query: User wants data, charts, analysis, or specific help. That can be achieved by running a SQL query."
-            "nonsense: Input is gibberish, spam, offensive, or completely irrelevant."
+            "greeting: User is saying hi/hello/thanks or introducing themselves — genuine social pleasantries only. "
+            "sql_query: User wants data, charts, analysis, or specific help. That can be achieved by running a SQL query. "
+            "out_of_scope: User's message is coherent but unrelated to the available data — small talk (e.g. 'how are you', jokes, weather), general knowledge, or questions about tables we don't have. "
+            "nonsense: Input is gibberish, spam, offensive, or otherwise impossible to interpret."
         )
     )
     reasoning: str = Field(
@@ -85,9 +86,32 @@ class RouterNode:
         )
         decision = structured_llm.invoke([base_prompt, prompt] + msgs)
 
+        # Every branch starts from this reset so a chart/table hint from a
+        # prior SQL turn never leaks into an unrelated turn's response.
+        # next_step defaults to None too: every branch below overrides it
+        # explicitly, but if a future branch ever forgot to, routing_policy
+        # would hit a missing-edge KeyError immediately instead of silently
+        # replaying whatever next_step the previous turn happened to leave
+        # in the checkpoint.
+        reset_state = {
+            "visualization": None,
+            "relevant_tables": None,
+            "next_step": None,
+        }
+
         if decision.intent == "greeting":
             return {
+                **reset_state,
                 "next_step": "greeting",
+            }
+
+        if decision.intent == "out_of_scope":
+            table_names = [t["table"] for t in schema_summary.get("tables", [])]
+            response_msg = f"\n\nI can help you with: {', '.join(table_names)}."
+            return {
+                **reset_state,
+                "next_step": "nonsense",
+                "messages": [AIMessage(content=response_msg)],
             }
 
         if not decision.is_answerable:
@@ -99,6 +123,7 @@ class RouterNode:
                 decision.missing_data_reason or "I don't have the data to answer that."
             )
             return {
+                **reset_state,
                 "next_step": "nonsense",
                 "messages": [AIMessage(content=response_msg)],
             }
@@ -109,6 +134,7 @@ class RouterNode:
             and decision.clarification.is_ambiguous
         ):
             return {
+                **reset_state,
                 "next_step": "ask_clarification",
                 "messages": [
                     AIMessage(content=decision.clarification.clarification_question),
@@ -116,6 +142,7 @@ class RouterNode:
             }
 
         return {
+            **reset_state,
             "next_step": decision.intent,
             "relevant_tables": decision.relevant_tables,
         }
