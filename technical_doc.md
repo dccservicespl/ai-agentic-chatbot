@@ -1373,6 +1373,159 @@ def _is_date_column(self, series) -> bool:
 
 ---
 
+### Visualization Type Prediction — Improvement Plan
+
+**GitHub Issue:** [#17](https://github.com/dccservicespl/ai-agentic-chatbot/issues/17)
+
+The current heuristic is a **shape-only waterfall** — it looks exclusively at row count, column count, and column data types. Four richer signal sources already available in the pipeline are currently unused:
+
+| Signal Source | Available | Currently Used |
+|---|---|---|
+| SQL query structure (`sql_lower`) | Yes — computed at line 63 | No — dead variable |
+| LLM explanation (`explanation`) | Yes — passed into the method | No — never read |
+| Data values (cardinality, sum, distribution) | Yes — DataFrame is present | Partial — dtype only |
+| User's original NL question | Yes — in agent state | No — not passed to visualizer |
+
+#### Known problems in the current heuristic
+
+| # | Problem | Impact |
+|---|---|---|
+| 1 | Pie chart rule runs **after** bar chart rule — both require 2 cols + numeric second col, so bar chart always wins first | Pie chart is structurally unreachable for real data |
+| 2 | `sql_lower` is computed but never read | Temporal grouping, percentage calculation, ranking patterns are ignored |
+| 3 | No data-value analysis | Values summing to ≈100, low cardinality, and distribution shape are never checked |
+| 4 | No NL intent analysis | `explanation` field arrives in the method but is never read |
+| 5 | Bar chart is the only real 2-column selector | Ranking, comparison, status breakdown, and distribution all produce bar chart — no distinction |
+
+---
+
+#### P1 — Fix structural ordering + expand pie chart triggers
+
+**Status:** ✅ Complete
+
+**What:** Move the pie chart rule before the bar chart rule. Expand pie chart detection beyond column-name keyword matching by adding two new signals — SQL percentage keywords and data-value sum analysis.
+
+**Why:** The current rule order makes pie chart unreachable. Bar chart fires first for any 2-column string + numeric result, regardless of whether the data represents a distribution or a ranking.
+
+**Final rule order after P1:**
+
+```
+KPI       → 1 row × 1 col
+Line      → 2 cols, first col is date
+Pie       → 2 cols, ≤ 8 rows, (keyword OR sum ≈ 100 OR SQL signal)
+Bar       → 2 cols, ≤ 20 rows, string + numeric
+Table     → 3+ cols or fallback
+```
+
+##### P1 — TODO List
+
+---
+
+**TODO 1 — Add `sql_has_percentage` signal in `_apply_heuristics()`** ✅
+
+Location: `_apply_heuristics()` — after `sql_lower = sql_query.lower()` (line 63)
+
+Compute a boolean from the SQL text that flags whether the query is calculating a percentage. Keywords detected: `"100.0"`, `"* 100"`, `"*100"`, `"/ sum"`, `"/sum"`, `"percent"`.
+
+---
+
+**TODO 2 — Add `_is_percentage_data(series)` helper method** ✅
+
+Location: new method, added after `_is_date_column()`
+
+Logic: if the numeric values in the series sum to between `99.0` and `101.0`, the column is a percentage distribution. Numeric type guard added — non-numeric series returns `False` immediately. `dropna()` applied before sum to handle NULLs from the DB.
+
+> **Edge case noted:** COUNT values that coincidentally sum to 100 (e.g., a table with exactly 100 rows split into 2 categories: 80 / 20) will also trigger this check. Rare in practice and the behaviour is acceptable, but worth knowing.
+
+---
+
+**TODO 3 — Move pie chart block BEFORE bar chart block** ✅
+
+Location: lines 104–145 (original)
+
+Swapped the position of the two blocks — no logic inside either block changed, only the order:
+
+```
+Before:  line → bar → pie → table
+After:   line → pie → bar → table
+```
+
+---
+
+**TODO 4 — Expand pie chart trigger conditions** ✅
+
+Location: inside the pie chart block
+
+Replaced the single column-name keyword check with three OR-connected conditions:
+
+| # | Condition | Signal type |
+|---|---|---|
+| A | Column name contains `percent` / `percentage` / `share` / `proportion` | Existing — kept |
+| B | `_is_percentage_data(second_col)` returns True | New — values sum to ≈ 100 |
+| C | `sql_has_percentage` is True | New — SQL has percentage calculation |
+
+All three still require `num_cols == 2` and `num_rows <= 8`. Row limit unchanged — more than 8 pie slices is unreadable regardless.
+
+---
+
+**TODO 5 — Verify bar chart is unaffected** ✅
+
+Traced through 5 real-world scenarios — no adjustment to the bar chart block was needed:
+
+| Scenario | rows | Pie fires? | Result |
+|---|---|---|---|
+| Top 10 customers by revenue | 10 | No (> 8 rows) | Bar chart ✓ |
+| Revenue share by brand (sum ≈ 100) | 5 | Yes (`is_percentage_named`) | Pie chart ✓ |
+| Activation status % | 2 | Yes (`is_percentage_named`) | Pie chart ✓ |
+| Order count by status (sum = 320) | 5 | No (all signals False) | Bar chart ✓ |
+| Monthly revenue (date col) | N | Line fires first | Line chart ✓ |
+
+---
+
+**Execution order completed**
+
+```
+TODO 1 ✅ → TODO 2 ✅ → TODO 3 ✅ → TODO 4 ✅ → TODO 5 ✅
+(signal)     (helper)    (reorder)   (expand)    (verify)
+```
+
+---
+
+#### P2 — Use NL intent from the explanation field
+
+**Status:** Pending — to be planned after P1 is complete
+
+**What:** The LLM-generated `explanation` already arrives in `_apply_heuristics()` as a parameter but is never read. Extract intent keywords from it to guide chart selection before shape analysis runs.
+
+**Intent keyword map (draft):**
+
+| Keywords in explanation | Chart hint |
+|---|---|
+| "trend", "over time", "monthly", "weekly", "daily" | Line chart |
+| "top N", "best", "worst", "rank", "highest", "lowest" | Bar chart |
+| "breakdown", "distribution", "share", "portion", "split" | Pie chart |
+| "compare", "vs", "versus", "compared to" | Bar chart |
+| "list", "all", "details", "full", "show" | Table |
+
+---
+
+#### P3 — Use SQL structural patterns
+
+**Status:** Pending — to be planned after P1 is complete
+
+**What:** `sql_lower` is computed at line 63 but never read beyond P1's percentage signal. Extend its use to detect broader structural patterns in the SQL.
+
+**Pattern map (draft):**
+
+| SQL Pattern | Chart hint |
+|---|---|
+| `date_trunc`, `interval`, `extract` | Line chart (temporal grouping) |
+| `order by ... desc limit` | Bar chart (ranking) |
+| `100.0`, `/ sum`, `* 100` | Pie chart (percentage) |
+| `select count(*) from ... (no group by)` | KPI |
+| Multiple aggregates in SELECT | Table |
+
+---
+
 ## 13. 📋 Logging System
 
 **File:** `logging_config.py`
