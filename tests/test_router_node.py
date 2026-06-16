@@ -94,6 +94,36 @@ def test_ambiguous_sql_query_resets_visualization_and_tables(router_prompt_path)
     assert result["relevant_tables"] is None
 
 
+def test_out_of_scope_routes_to_nonsense_static_path(router_prompt_path):
+    # "how are you" — coherent, not data-related, must not fall into the
+    # 'greeting' branch (the original bug) and must not crash routing by
+    # producing a next_step the graph doesn't know about.
+    decision = make_decision(
+        intent="out_of_scope",
+        is_answerable=False,
+        missing_data_reason="Casual chit-chat, no data requested.",
+    )
+    result = classify_with(decision, router_prompt_path)
+
+    assert result["next_step"] == "nonsense"
+    assert result["visualization"] is None
+    assert result["relevant_tables"] is None
+
+
+def test_out_of_scope_with_is_answerable_true_still_routes_safely(
+    router_prompt_path,
+):
+    # Defensive case: even if the LLM mis-sets is_answerable=True for
+    # out_of_scope chit-chat, next_step must still resolve to a graph edge
+    # that exists ("nonsense"), not the raw "out_of_scope" string.
+    decision = make_decision(intent="out_of_scope", is_answerable=True)
+    result = classify_with(decision, router_prompt_path)
+
+    assert result["next_step"] == "nonsense"
+    assert result["visualization"] is None
+    assert result["relevant_tables"] is None
+
+
 def test_clean_sql_query_resets_visualization_but_keeps_relevant_tables(
     router_prompt_path,
 ):

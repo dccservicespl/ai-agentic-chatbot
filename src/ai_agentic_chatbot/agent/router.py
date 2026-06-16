@@ -29,11 +29,12 @@ class ClarificationDecision(BaseModel):
 class RouterDecision(BaseModel):
     """Router classification schema with strict validation."""
 
-    intent: Literal["greeting", "sql_query", "nonsense"] = Field(
+    intent: Literal["greeting", "sql_query", "nonsense", "out_of_scope"] = Field(
         description=(
-            "greeting: User is saying hi/hello or introducing themselves. "
-            "sql_query: User wants data, charts, analysis, or specific help. That can be achieved by running a SQL query."
-            "nonsense: Input is gibberish, spam, offensive, or completely irrelevant."
+            "greeting: User is saying hi/hello/thanks or introducing themselves — genuine social pleasantries only. "
+            "sql_query: User wants data, charts, analysis, or specific help. That can be achieved by running a SQL query. "
+            "out_of_scope: User's message is coherent but unrelated to the available data — small talk (e.g. 'how are you', jokes, weather), general knowledge, or questions about tables we don't have. "
+            "nonsense: Input is gibberish, spam, offensive, or otherwise impossible to interpret."
         )
     )
     reasoning: str = Field(
@@ -93,6 +94,15 @@ class RouterNode:
             return {
                 **reset_state,
                 "next_step": "greeting",
+            }
+
+        if decision.intent == "out_of_scope":
+            table_names = [t["table"] for t in schema_summary.get("tables", [])]
+            response_msg = f"\n\nI can help you with: {', '.join(table_names)}."
+            return {
+                **reset_state,
+                "next_step": "nonsense",
+                "messages": [AIMessage(content=response_msg)],
             }
 
         if not decision.is_answerable:
