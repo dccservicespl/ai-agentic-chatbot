@@ -62,6 +62,10 @@ class VisualizationNode:
         columns = df.columns.tolist()
         sql_lower = sql_query.lower()
 
+        sql_has_percentage = any(k in sql_lower for k in [
+            "100.0", "* 100", "*100", "/ sum", "/sum", "percent"
+        ])
+
         # Detect date columns before formatting (dd-mm-yyyy strings won't pass _is_date_column)
         date_flags = [self._is_date_column(df.iloc[:, i]) for i in range(num_cols)]
         df = self._format_date_columns(df, date_flags)
@@ -101,6 +105,32 @@ class VisualizationNode:
                     },
                 )
 
+        # Distribution/Percentage Data -> Pie Chart
+        if num_cols == 2 and num_rows <= 8:
+            second_col = df.iloc[:, 1]
+            second_col_name = columns[1].lower()
+
+            is_percentage_named = any(
+                keyword in second_col_name
+                for keyword in ["percent", "percentage", "share", "proportion"]
+            )
+            is_percentage_data = self._is_percentage_data(second_col)
+            is_percentage_sql = sql_has_percentage
+
+            if is_percentage_named or is_percentage_data or is_percentage_sql:
+                return self._create_payload(
+                    type="pie_chart",
+                    title=f"Distribution of {self._beautify_column_name(columns[0])}",
+                    data=df.to_dict("records"),
+                    summary=f"Distribution across {num_rows} categories.",
+                    config={
+                        "category": columns[0],
+                        "value": columns[1],
+                        "category_label": self._beautify_column_name(columns[0]),
+                        "value_label": self._beautify_column_name(columns[1]),
+                    },
+                )
+
         # Categorical Comparison (String + Numeric) -> Bar Chart
         if num_cols == 2 and num_rows <= 20:
             first_col = df.iloc[:, 0]
@@ -121,26 +151,6 @@ class VisualizationNode:
                         "y_axis": columns[1],
                         "x_label": self._beautify_column_name(columns[0]),
                         "y_label": self._beautify_column_name(columns[1]),
-                    },
-                )
-
-        # Distribution/Percentage Data -> Pie Chart
-        if num_cols == 2 and num_rows <= 8:
-            second_col_name = columns[1].lower()
-            if any(
-                keyword in second_col_name
-                for keyword in ["percent", "percentage", "share", "proportion"]
-            ):
-                return self._create_payload(
-                    type="pie_chart",
-                    title=f"Distribution of {self._beautify_column_name(columns[0])}",
-                    data=df.to_dict("records"),
-                    summary=f"Distribution across {num_rows} categories.",
-                    config={
-                        "category": columns[0],
-                        "value": columns[1],
-                        "category_label": self._beautify_column_name(columns[0]),
-                        "value_label": self._beautify_column_name(columns[1]),
                     },
                 )
 
@@ -185,6 +195,16 @@ class VisualizationNode:
             pd.to_datetime(sample, errors="raise")
             return True
         except (ValueError, TypeError):
+            return False
+
+    def _is_percentage_data(self, series) -> bool:
+        """Check if numeric values represent a percentage distribution (sum ≈ 100)."""
+        if not pd.api.types.is_numeric_dtype(series):
+            return False
+        try:
+            total = series.dropna().sum()
+            return 99.0 <= float(total) <= 101.0
+        except Exception:
             return False
 
     def _format_date_columns(self, df: pd.DataFrame, date_flags: list) -> pd.DataFrame:
