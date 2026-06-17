@@ -29,6 +29,7 @@
 21. [NL-to-SQL Accuracy Improvements — Improvement Plan](#21-nl-to-sql-accuracy-improvements--improvement-plan)
 22. [Visualization State Leak on Non-Contextual Queries — Bug Fix Plan](#22-visualization-state-leak-on-non-contextual-queries--bug-fix-plan)
 23. [ROUND() on `double precision` Crashes Revenue-Share Pie Chart Queries](#23-round-on-double-precision-crashes-revenue-share-pie-chart-queries)
+24. [`/stream` Doesn't Surface Intermediate Progress — Analysis & Plan](#24-stream-doesnt-surface-intermediate-progress--analysis--plan)
 
 ---
 
@@ -4102,4 +4103,56 @@ SELECT ROUND(
 
 ---
 
-*Generated: 2026-05-29 | Updated: 2026-06-16 | Repository: `ai-agentic-chatbot` | Branch: `19-fix-visualization-state-leaks-across-conversation`*
+## 24. 🔍 `/stream` Doesn't Surface Intermediate Progress — Analysis & Plan
+
+**Files:** `server.py`, `agent/graph.py`, `agent/subgraphs/sql_query/graph.py`, `agent/subgraphs/sql_query/nodes/*.py`, `agent/schema.py`
+
+### Observed Behaviour
+
+`POST /stream` sends exactly one SSE event per turn for SQL queries — the final `{content, visualization}` payload. There is no intermediate signal while the agent is calling the LLM, generating SQL, validating it, or executing it against PostgreSQL. For longer-running turns the client just waits with no feedback.
+
+### Root Cause — 3 Layers, All Need to Change Together
+
+**Layer 1 — `sql_query_node` hides the subgraph from the stream (`agent/graph.py:40-113`)**
+It calls `sql_subgraph.invoke(subgraph_input)` — synchronous, blocking, and **no `config` is passed through**. LangGraph treats this as one opaque node. The subgraph itself was explicitly built "one action per node... for proper streaming support" (`subgraphs/sql_query/graph.py:39-43`), but that intent is defeated by the wrapping function: the parent graph has no visibility into `retrieve_schemas` → `generate_sql` → `validate_query` → `execute_query` finishing individually.
+
+**Layer 2 — the parent stream call uses the wrong mode (`server.py:265-267`)**
+`graph.astream(inputs, config, stream_mode="values")` only emits a snapshot when a *top-level* node finishes. Since `sql_query_node` is one top-level node that internally blocks until everything is done, exactly one snapshot appears for the entire SQL flow.
+
+**Layer 3 — the event filter only forwards `AIMessage` chunks (`server.py:271-274`)**
+`if "messages" in chunk and chunk["messages"]: ... if isinstance(last_message, AIMessage)`. Intermediate nodes don't append `AIMessage`s — they mutate state fields like `generated_sql`, `query_result`. Even a more granular stream would be silently dropped by this filter today.
+
+There's also no schema for a "progress" event — the SSE payload (`build_stream_response_data`, `server.py:200-214`) is shaped only for the final answer, with no `type`/`stage` discriminator a client could use to tell a progress ping apart from the real answer.
+
+### Feasibility
+
+**Confirmed possible — no rewrite required.** LangGraph natively supports nested-subgraph streaming (`stream_mode="updates", subgraphs=True`) and fine-grained node/LLM events (`astream_events`). The code just isn't wired to use either; all 4 subgraph nodes are already sync functions with no async I/O wiring (`retrieve_schemas_node` already accepts `config: RunnableConfig`, so the plumbing point exists).
+
+### TODO List (Deferred)
+
+**Subgraph invocation (`agent/graph.py`)**
+- [ ] Make `sql_query_node` `async def` and accept `config: RunnableConfig`
+- [ ] Replace `sql_subgraph.invoke(subgraph_input)` with `await sql_subgraph.ainvoke(subgraph_input, config=config)` (or `astream`) so callbacks/run context propagate into the subgraph instead of being swallowed
+- [ ] Convert the 4 subgraph node functions (`retrieve_schemas_node`, `generate_sql_node`, `validate_query_node`, `execute_query_node`) to `async def` where they call I/O (LLM calls, DB calls) so they play well with `ainvoke`/`astream`
+
+**Stream mode (`server.py`)**
+- [ ] Switch `graph.astream(...)` to `stream_mode="updates"` (or add `astream_events()` as a parallel path) so per-node completions are visible, not just full-state snapshots
+- [ ] Define a node-name → human-readable progress message map (e.g. `retrieve_schemas` → "Looking up relevant tables…", `generate_sql` → "Generating SQL query…", `validate_query` → "Validating query…", `execute_query` → "Running query…")
+- [ ] Update `event_generator()` to emit a progress event on each relevant node completion, not just when an `AIMessage` appears
+
+**SSE contract**
+- [ ] Add a `type` discriminator to the SSE payload, e.g. `{"type": "progress", "stage": "generate_sql", "message": "..."}` vs `{"type": "final", "content": ..., "visualization": ...}`, so clients can tell pings apart from the answer
+- [ ] Update the `/stream` endpoint's OpenAPI `description` to describe both event types
+- [ ] Flag to the frontend team that this is a breaking change to the SSE event shape — any existing client parsing `{content, visualization}` directly needs to start checking `type` first
+
+**Out of scope / optional**
+- [ ] Cancellation/timeout handling per stage if a step (e.g. LLM call) hangs
+- [ ] Retry-loop visibility: `execute_query` can route back to `generate_sql` (`routes.py` / `route_after_execution`) — decide whether a retry should re-emit "Generating SQL…" or a distinct "Retrying…" message
+
+### Status
+
+⏸️ **Deferred.** Analysis and plan only — not yet implemented. Project is currently focused on the POC; revisit once the POC is validated.
+
+---
+
+*Generated: 2026-05-29 | Updated: 2026-06-16 | Repository: `ai-agentic-chatbot` | Branch: `21-fix-round-crashes-on-double-precision-postgressql`*
