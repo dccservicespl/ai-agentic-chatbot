@@ -4305,8 +4305,210 @@ Top data:
 
 ### Status
 
-⏸️ **Planned.** Analysis and TODO list complete — not yet implemented.
+✅ **Completed.** Analysis and TODO list complete — implemented.
 
 ---
 
-*Generated: 2026-05-29 | Updated: 2026-06-25 | Repository: `ai-agentic-chatbot` | Branch: `21-fix-round-crashes-on-double-precision-postgressql`*
+---
+
+## 26. 🔐 User Authentication Module — Implementation Plan
+
+**Files affected:** `src/ai_agentic_chatbot/auth/` (new package), `src/ai_agentic_chatbot/infrastructure/database.py` (new), `src/ai_agentic_chatbot/infrastructure/db_depency.py`, `src/ai_agentic_chatbot/server.py`, `pyproject.toml`, `alembic/` (new), `.env`
+
+### Problem Statement
+
+The application currently has no authentication layer. All API endpoints — including the main `/stream` chat endpoint and the admin schema pipeline (`/schemaJson`, `/schemaText`, `/ingest`) — are fully public. Any client with network access can call them without credentials. A user login module is required to:
+
+- Allow users to log in via username + password from the UI
+- Issue JWT access tokens for authenticated sessions
+- Protect all sensitive endpoints behind token validation
+
+---
+
+### Architecture Overview
+
+```
+POST /auth/login  (public)
+        │  OAuth2PasswordRequestForm (form-encoded)
+        ▼
+  authenticate_user()
+        │  passlib bcrypt verify
+        ▼
+  create_access_token()
+        │  python-jose JWT, signed with JWT_SECRET_KEY
+        ▼
+  Token { access_token, token_type: "bearer" }
+
+─────────────────────────────────────────────
+
+Protected Endpoint (e.g. POST /stream)
+        │  Authorization: Bearer <token>
+        ▼
+  get_current_active_user()  ← FastAPI Depends
+        │  decode_access_token() → username
+        │  get_user_by_username(db) → User ORM
+        ▼
+  Endpoint handler runs
+```
+
+---
+
+### New Package Structure
+
+```
+src/ai_agentic_chatbot/auth/
+├── __init__.py
+├── dependencies.py      # get_current_user, get_current_active_user, get_current_superuser
+├── jwt_utils.py         # create_access_token, decode_access_token
+├── models.py            # User SQLAlchemy ORM model (users table)
+├── password.py          # hash_password, verify_password (bcrypt)
+├── repository.py        # get_user_by_username, get_user_by_email, create_user
+├── router.py            # POST /auth/login, POST /auth/register, GET /auth/me
+├── schemas.py           # UserCreate, UserResponse, Token, TokenData (Pydantic v2)
+├── seed.py              # First superuser bootstrap script
+└── service.py           # authenticate_user, create_user_account
+
+src/ai_agentic_chatbot/infrastructure/
+└── database.py          # SQLAlchemy DeclarativeBase → Base (new — shared by all ORM models)
+```
+
+---
+
+### Database — `users` Table
+
+| Column | Type | Constraints |
+|---|---|---|
+| `id` | `BigInteger` | `Identity()`, primary key |
+| `username` | `String(100)` | unique, not null, indexed |
+| `email` | `String(255)` | unique, not null |
+| `hashed_password` | `Text` | not null |
+| `is_active` | `Boolean` | not null, server default `true` |
+| `is_superuser` | `Boolean` | not null, server default `false` |
+| `created_at` | `DateTime(timezone=True)` | not null, server default `func.now()` |
+| `updated_at` | `DateTime(timezone=True)` | not null, server default + `onupdate` |
+
+Migration managed by **Alembic** (`alembic upgrade head`).
+
+---
+
+### Auth Endpoints
+
+| Method | Path | Auth Required | Description |
+|---|---|---|---|
+| `POST` | `/auth/login` | Public | Form-encoded `username` + `password` → returns `Token` |
+| `POST` | `/auth/register` | Superuser only | JSON `UserCreate` body → creates new user |
+| `GET` | `/auth/me` | Active user | Returns `UserResponse` for current session |
+
+---
+
+### Endpoint Protection
+
+| Endpoint | Protection Level |
+|---|---|
+| `POST /stream` | `get_current_active_user` |
+| `GET /schemaJson` | `get_current_superuser` |
+| `GET /schemaText` | `get_current_superuser` |
+| `GET /ingest` | `get_current_superuser` |
+| `GET /health` | Public (liveness probe) |
+| `GET /db-health` | Public (internal probe) |
+
+---
+
+### Dependencies Added
+
+| Package | Purpose |
+|---|---|
+| `python-jose[cryptography]` | JWT encode/decode |
+| `passlib[bcrypt]` | bcrypt password hashing |
+| `python-multipart` | FastAPI `OAuth2PasswordRequestForm` body parsing |
+| `alembic` | Database migration runner |
+
+---
+
+### Configuration
+
+New environment variables (`.env` only — never in `config.yaml`):
+
+```
+JWT_SECRET_KEY=<generate: python -c "import secrets; print(secrets.token_hex(32))">
+JWT_ALGORITHM=HS256
+JWT_ACCESS_TOKEN_EXPIRE_MINUTES=60
+
+# Only needed for initial seed run
+SEED_USERNAME=
+SEED_EMAIL=
+SEED_PASSWORD=
+```
+
+---
+
+### Bootstrap Flow (first deployment)
+
+```
+1. alembic upgrade head          → creates users table
+2. Set SEED_* env vars
+3. python -m ai_agentic_chatbot.auth.seed   → inserts first superuser
+4. POST /auth/login              → get access token
+5. POST /auth/register           → create additional users (superuser token required)
+```
+
+---
+
+### Frontend Integration Notes
+
+- Login endpoint uses `application/x-www-form-urlencoded` (NOT JSON):
+  ```javascript
+  const form = new URLSearchParams({ username, password });
+  fetch('/auth/login', { method: 'POST', body: form });
+  ```
+- Store token in `sessionStorage` (cleared on tab close — better XSS posture than `localStorage`)
+- Attach `Authorization: Bearer <token>` to every subsequent API call
+- Intercept `401` responses globally → redirect to login page
+- On page reload, call `GET /auth/me` to verify token is still valid
+
+---
+
+### Key Design Decisions
+
+| Decision | Rationale |
+|---|---|
+| JWT (stateless) over sessions | No server-side session store needed; works across multiple instances |
+| `get_auth_db()` as a generator with `finally: session.close()` | Existing `get_db_session()` never closes the session — auth introduces the correct FastAPI `Depends` generator pattern |
+| No `auth` in `config.yaml` | JWT secret must not be committed; reads from `.env` via `os.environ.get()` |
+| `POST /auth/register` requires superuser | Prevents open self-registration; new users created only by an admin |
+| Alembic for migrations | Consistent with SQLAlchemy ecosystem; autogenerate detects model changes |
+
+---
+
+### TODO List
+
+| Step | Phase | File | Action |
+|---|---|---|---|
+| 1 | Dependencies | `pyproject.toml` | Add `python-jose`, `passlib`, `python-multipart`, `alembic` |
+| 2 | Config | `.env` / `.env.example` | Add `JWT_SECRET_KEY`, `JWT_ALGORITHM`, `JWT_ACCESS_TOKEN_EXPIRE_MINUTES` |
+| 3 | Migration | `alembic/` | `alembic init alembic`; configure `alembic.ini` |
+| 4 | ORM Base | `infrastructure/database.py` | Create `Base = DeclarativeBase()` |
+| 5 | User Model | `auth/models.py` | `User` ORM model mapping to `users` table |
+| 6 | Alembic env | `alembic/env.py` | Import `Base` + `auth.models`; set `target_metadata`; read DB URL from env |
+| 7 | Migration | `alembic/versions/` | `alembic revision --autogenerate` → `alembic upgrade head` |
+| 8 | Password | `auth/password.py` | `hash_password`, `verify_password` via `passlib` |
+| 9 | JWT | `auth/jwt_utils.py` | `create_access_token`, `decode_access_token` via `python-jose` |
+| 10 | Schemas | `auth/schemas.py` | `UserCreate`, `UserResponse`, `Token`, `TokenData` (Pydantic v2) |
+| 11 | Repository | `auth/repository.py` | `get_user_by_username`, `get_user_by_email`, `create_user` |
+| 12 | Service | `auth/service.py` | `authenticate_user`, `create_user_account` |
+| 13 | DB Dep | `infrastructure/db_depency.py` | Add `get_auth_db()` generator with `yield` + `finally` |
+| 14 | FastAPI Dep | `auth/dependencies.py` | `get_current_user`, `get_current_active_user`, `get_current_superuser` |
+| 15 | Router | `auth/router.py` | `POST /auth/login`, `POST /auth/register`, `GET /auth/me` |
+| 16 | Register | `server.py` | `app.include_router(auth_router)` |
+| 17 | Secure APIs | `server.py` | Add `Depends(...)` to `/stream`, `/schemaJson`, `/schemaText`, `/ingest` |
+| 18 | Seed | `auth/seed.py` | First superuser bootstrap script |
+| 19 | Package | `auth/__init__.py` | Empty package marker |
+| 20 | Frontend | UI code | Form-encoded login, `sessionStorage`, auth header, 401 handler |
+
+### Status
+
+⏸️ **Planned.** Design and TODO list complete — not yet implemented.
+
+---
+
+*Generated: 2026-05-29 | Updated: 2026-06-26 | Repository: `ai-agentic-chatbot` | Branch: `21-fix-round-crashes-on-double-precision-postgressql`*
