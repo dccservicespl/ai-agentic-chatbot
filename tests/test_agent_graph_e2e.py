@@ -57,7 +57,7 @@ def router_prompt_path(tmp_path, monkeypatch):
 def graph_mocks(router_prompt_path):
     """Build the real compiled graph with only network boundaries mocked."""
     with patch("ai_agentic_chatbot.agent.router.get_llm") as mock_get_llm, patch(
-        "ai_agentic_chatbot.agent.router.SchemaLoader"
+            "ai_agentic_chatbot.agent.router.SchemaLoader"
     ) as mock_schema_loader_cls, patch(
         "ai_agentic_chatbot.agent.router.get_system_prompt", return_value="SYSTEM"
     ), patch(
@@ -90,6 +90,8 @@ def test_chart_then_chitchat_then_greeting_then_gibberish(graph_mocks):
     config = {"configurable": {"thread_id": f"e2e-{uuid.uuid4()}"}}
 
     # Turn 1 — SQL query that produces a pie chart.
+    mock_fast_llm.invoke.return_value = AIMessage(
+        content="DELIVERY accounts for 94.2% of all shipments, making it the dominant fulfilment method.")
     mock_structured_llm.invoke.return_value = make_decision(
         intent="sql_query", relevant_tables=["orders"]
     )
@@ -98,11 +100,13 @@ def test_chart_then_chitchat_then_greeting_then_gibberish(graph_mocks):
     )
     assert state1["next_step"] == "end"
     assert state1["visualization"]["type"] == "pie_chart"
+    assert state1.get("analysis") and len(state1["analysis"]) > 0
     mock_sql_subgraph.invoke.assert_called_once()
-    mock_fast_llm.invoke.assert_not_called()
+    mock_fast_llm.invoke.assert_called_once()
 
     # Turn 2 — "how are you" (out_of_scope): must NOT echo turn 1's chart,
     # and must not call the LLM for the reply (router already wrote it).
+    mock_fast_llm.invoke.reset_mock()
     mock_structured_llm.invoke.return_value = make_decision(
         intent="out_of_scope",
         is_answerable=False,
@@ -112,14 +116,18 @@ def test_chart_then_chitchat_then_greeting_then_gibberish(graph_mocks):
         {"messages": [HumanMessage(content="how are you")]}, config=config
     )
     assert state2["visualization"] is None
+    assert state2.get("analysis") is None
     assert state2["next_step"] == "nonsense"
     assert "I can't help with that" in state2["messages"][-1].content
     mock_fast_llm.invoke.assert_not_called()
 
     # Turn 3 — "hi" (real greeting): gets an LLM-generated reply, no chart.
+    mock_fast_llm.invoke.reset_mock()
+    mock_fast_llm.invoke.return_value = AIMessage(content="Hello! How can I help you today?")
     mock_structured_llm.invoke.return_value = make_decision(intent="greeting")
     state3 = graph.invoke({"messages": [HumanMessage(content="hi")]}, config=config)
     assert state3["visualization"] is None
+    assert state3.get("analysis") is None
     assert state3["messages"][-1].content == "Hello! How can I help you today?"
     mock_fast_llm.invoke.assert_called_once()
 
@@ -134,5 +142,6 @@ def test_chart_then_chitchat_then_greeting_then_gibberish(graph_mocks):
         {"messages": [HumanMessage(content="asdkjasdj")]}, config=config
     )
     assert state4["visualization"] is None
+    assert state4.get("analysis") is None
     assert "I don't have the data to answer that" in state4["messages"][-1].content
     mock_fast_llm.invoke.assert_not_called()

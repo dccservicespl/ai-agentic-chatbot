@@ -7,3 +7,4 @@ class AgentState(MessagesState):
     next_step: str
     relevant_tables: Optional[list[str]]
     visualization: Optional[Dict[str, Any]]
+    analysis: Optional[str]

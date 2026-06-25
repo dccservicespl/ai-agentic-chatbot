@@ -95,6 +95,7 @@ class RouterNode:
         # in the checkpoint.
         reset_state = {
             "visualization": None,
+            "analysis": None,
             "relevant_tables": None,
             "next_step": None,
         }

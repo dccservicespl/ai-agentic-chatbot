@@ -1,3 +1,6 @@
+import json
+from pathlib import Path
+
 from langchain_core.messages import SystemMessage
 from langgraph.constants import START, END
 from langgraph.graph import StateGraph
@@ -9,8 +12,13 @@ from ai_agentic_chatbot.infrastructure.llm import get_llm
 from ai_agentic_chatbot.infrastructure.llm.types import LLMProvider, ModelType
 from ai_agentic_chatbot.agent.subgraphs.sql_query.graph import sql_subgraph
 from ai_agentic_chatbot.agent.nodes.visualizer import visualizer_node
+from ai_agentic_chatbot.utils.prompt_loader import load_file_content
 
 fast_llm = get_llm(provider=LLMProvider.AZURE_OPENAI, model=ModelType.FAST)
+
+_ANALYSIS_PROMPT_PATH = (
+        Path(__file__).resolve().parent.parent / "prompts" / "analysis_prompt.md"
+)
 
 
 def router(state: AgentState) -> dict:
@@ -76,6 +84,8 @@ def sql_query_node(state: AgentState) -> dict:
                     AIMessage(content=f"I encountered an error:\n{error_msg}")
                 ],
                 "next_step": "end",
+                "visualization": None,
+                "analysis": None,
             }
 
         if subgraph_result.get("execution_error"):
@@ -85,6 +95,8 @@ def sql_query_node(state: AgentState) -> dict:
                     AIMessage(content=f"Query execution failed:\n{error_msg}")
                 ],
                 "next_step": "end",
+                "visualization": None,
+                "analysis": None,
             }
 
         # Add visualization analysis to the state
@@ -97,9 +109,29 @@ def sql_query_node(state: AgentState) -> dict:
         visualization = viz_result.get("visualization", {})
         content = _generate_brief_content(visualization)
 
+        # Generate LLM analysis of the result
+        analysis = None
+        try:
+            prompt_template = load_file_content(_ANALYSIS_PROMPT_PATH)
+            analysis_prompt = prompt_template.format(
+                user_query=state["messages"][-1].content,
+                viz_type=visualization.get("type", ""),
+                viz_title=visualization.get("title", ""),
+                row_count=visualization.get("row_count", 0),
+                first_3_rows_as_json=json.dumps(
+                    visualization.get("data", [])[:3], indent=2, default=str
+                ),
+            )
+            response = fast_llm.invoke([SystemMessage(content=analysis_prompt)])
+            analysis = response.content
+        except Exception as exc:
+            logger.warning(f"Analysis generation failed, falling back to explanation: {exc}")
+            analysis = subgraph_result.get("explanation", "")
+
         return {
             "messages": [AIMessage(content=content)],
             "visualization": visualization,
+            "analysis": analysis,
             "next_step": "end",
         }
 
@@ -110,6 +142,8 @@ def sql_query_node(state: AgentState) -> dict:
                 AIMessage(content=f"I encountered an unexpected error: {str(e)}")
             ],
             "next_step": "end",
+            "visualization": None,
+            "analysis": None,
         }
 
 
@@ -148,7 +182,7 @@ def _generate_brief_content(visualization: dict) -> str:
 
 
 def format_sql_response_with_visualization(
-    subgraph_result: dict, viz_result: dict
+        subgraph_result: dict, viz_result: dict
 ) -> str:
     """Format the SQL query results with visualization data for frontend consumption."""
     import json
@@ -198,7 +232,7 @@ def format_sql_response_with_visualization(
         if len(data) > 10:
             response += f"\n\n_Showing 10 of {len(data)} rows_"
     elif visualization.get("type") == "kpi" and visualization.get("config", {}).get(
-        "value"
+            "value"
     ):
         # For KPI, show the formatted value prominently
         kpi_value = visualization["config"]["value"]
@@ -301,15 +335,15 @@ def _analyze_for_visualizations(data: list, sql: str) -> list:
 
     # Check if it's aggregated data (good for charts)
     if any(
-        keyword in sql_lower
-        for keyword in ["sum(", "count(", "avg(", "max(", "min(", "group by"]
+            keyword in sql_lower
+            for keyword in ["sum(", "count(", "avg(", "max(", "min(", "group by"]
     ):
         suggestions.append("Bar Chart")
         suggestions.append("Pie Chart")
 
     # Check for time series data
     if any(
-        keyword in sql_lower for keyword in ["date", "time", "year", "month", "day"]
+            keyword in sql_lower for keyword in ["date", "time", "year", "month", "day"]
     ):
         suggestions.append("Line Chart")
         suggestions.append("Time Series")
@@ -342,20 +376,20 @@ def _format_data_values(data: list) -> list:
             if isinstance(value, float):
                 # Check if it looks like currency (large numbers)
                 if value > 1000 and any(
-                    keyword in key.lower()
-                    for keyword in [
-                        "sales",
-                        "revenue",
-                        "amount",
-                        "price",
-                        "cost",
-                        "total",
-                    ]
+                        keyword in key.lower()
+                        for keyword in [
+                            "sales",
+                            "revenue",
+                            "amount",
+                            "price",
+                            "cost",
+                            "total",
+                        ]
                 ):
                     formatted_row[key] = f"${value:,.2f}"
                 # Check if it looks like a percentage
                 elif 0 <= value <= 1 and any(
-                    keyword in key.lower() for keyword in ["rate", "percent", "ratio"]
+                        keyword in key.lower() for keyword in ["rate", "percent", "ratio"]
                 ):
                     formatted_row[key] = f"{value:.2%}"
                 else:

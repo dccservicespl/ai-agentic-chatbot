@@ -114,11 +114,11 @@ graph = build_graph()
     tags=["SchemaExtractor"],
     summary="Extract database schema to JSON",
     description=(
-        "Introspects the PostgreSQL database using SQLAlchemy and extracts the structural schema "
-        "(tables, columns, primary keys, foreign keys) for the configured table whitelist: "
-        "`orders`, `customer`, `sales`, `product`, `inventory`. "
-        "The result is serialised to `temp/db_schema.json` and the file path is returned. "
-        "\n\n**Run this as Step 1 of the schema setup pipeline** before calling `/schemaText` or `/ingest`."
+            "Introspects the PostgreSQL database using SQLAlchemy and extracts the structural schema "
+            "(tables, columns, primary keys, foreign keys) for the configured table whitelist: "
+            "`orders`, `customer`, `sales`, `product`, `inventory`. "
+            "The result is serialised to `temp/db_schema.json` and the file path is returned. "
+            "\n\n**Run this as Step 1 of the schema setup pipeline** before calling `/schemaText` or `/ingest`."
     ),
     responses={
         200: {"description": "Schema extracted successfully — returns path to the JSON file"},
@@ -146,10 +146,10 @@ def schema_json():
     tags=["SchemaExtractor"],
     summary="Convert schema JSON to LLM-enriched documentation",
     description=(
-        "Reads the schema JSON produced by `/schemaJson` and sends each table to the LLM, "
-        "which generates a human-readable `TableSchemaDocumentation` (business purpose, key fields, "
-        "relationships, example questions). The output is saved as `schema_documentation.yaml`. "
-        "\n\n**Run this as Step 2 of the schema setup pipeline** after `/schemaJson` and before `/ingest`."
+            "Reads the schema JSON produced by `/schemaJson` and sends each table to the LLM, "
+            "which generates a human-readable `TableSchemaDocumentation` (business purpose, key fields, "
+            "relationships, example questions). The output is saved as `schema_documentation.yaml`. "
+            "\n\n**Run this as Step 2 of the schema setup pipeline** after `/schemaJson` and before `/ingest`."
     ),
     responses={
         200: {"description": "Schema converted to text documentation successfully"},
@@ -171,11 +171,11 @@ def schema_text():
     tags=["SchemaExtractor"],
     summary="Ingest schema into vector store",
     description=(
-        "Reads the LLM-generated schema documentation (`schema_documentation.yaml`), chunks it per table, "
-        "embeds each chunk using Azure OpenAI embeddings, and upserts the vectors into the pgvector store in PostgreSQL. "
-        "After this step the SQL agent can perform semantic table discovery at query time. "
-        "\n\n**Run this as Step 3 of the schema setup pipeline** after `/schemaText`. "
-        "Re-run whenever the database schema changes."
+            "Reads the LLM-generated schema documentation (`schema_documentation.yaml`), chunks it per table, "
+            "embeds each chunk using Azure OpenAI embeddings, and upserts the vectors into the pgvector store in PostgreSQL. "
+            "After this step the SQL agent can perform semantic table discovery at query time. "
+            "\n\n**Run this as Step 3 of the schema setup pipeline** after `/schemaText`. "
+            "Re-run whenever the database schema changes."
     ),
     responses={
         200: {"description": "Schema ingested into pgvector successfully"},
@@ -211,6 +211,9 @@ def build_stream_response_data(content: str, accumulated_state: dict) -> dict:
         "visualization": (
             accumulated_state.get("visualization") if went_through_sql_node else None
         ),
+        "analysis": (
+            accumulated_state.get("analysis") if went_through_sql_node else None
+        ),
     }
 
 
@@ -219,13 +222,13 @@ def build_stream_response_data(content: str, accumulated_state: dict) -> dict:
     tags=["Chat"],
     summary="Stream agent response via SSE",
     description=(
-        "Main chat endpoint. Accepts a user message and a session `thread_id`, runs the full "
-        "LangGraph agent workflow (intent routing → schema retrieval → SQL generation → execution → visualisation), "
-        "and streams the response as **Server-Sent Events (SSE)**. "
-        "\n\nEach SSE event is a JSON object: `{ \"content\": \"...\", \"visualization\": { ... } }`. "
-        "The `visualization` field is `null` for non-SQL responses (greetings, clarifications) and "
-        "contains chart config (type, data, axes, summary) for SQL query results. "
-        "\n\nPass the same `thread_id` across turns to maintain multi-turn conversation memory."
+            "Main chat endpoint. Accepts a user message and a session `thread_id`, runs the full "
+            "LangGraph agent workflow (intent routing → schema retrieval → SQL generation → execution → visualisation), "
+            "and streams the response as **Server-Sent Events (SSE)**. "
+            "\n\nEach SSE event is a JSON object: `{ \"content\": \"...\", \"visualization\": { ... } }`. "
+            "The `visualization` field is `null` for non-SQL responses (greetings, clarifications) and "
+            "contains chart config (type, data, axes, summary) for SQL query results. "
+            "\n\nPass the same `thread_id` across turns to maintain multi-turn conversation memory."
     ),
     responses={
         200: {"description": "SSE stream — JSON events with content and optional visualization"},
@@ -263,7 +266,7 @@ async def stream_endpoint(stream_request: StreamRequest):
                 accumulated_state = {}
 
                 async for chunk in graph.astream(
-                    inputs, config=config, stream_mode="values"
+                        inputs, config=config, stream_mode="values"
                 ):
                     # Update accumulated state with new chunk data
                     accumulated_state.update(chunk)
