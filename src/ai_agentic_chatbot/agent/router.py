@@ -106,8 +106,10 @@ class RouterNode:
             }
 
         if decision.intent == "out_of_scope":
-            table_names = [t["table"] for t in schema_summary.get("tables", [])]
-            response_msg = f"\n\nI can help you with: {', '.join(table_names)}."
+            response_msg = (
+                "I'm sorry, I can't help with that. "
+                "I can only assist with questions related to sales, orders, inventory, products, and customers."
+            )
             return {
                 **reset_state,
                 "next_step": "nonsense",
@@ -115,13 +117,8 @@ class RouterNode:
             }
 
         if not decision.is_answerable:
-            table_names = [t["table"] for t in schema_summary.get("tables", [])]
-            response_msg = (
-                f"\n\nI can help you with: {', '.join(table_names)}."
-            )
-            response_msg += (
-                decision.missing_data_reason or "I don't have the data to answer that."
-            )
+            missing_reason = decision.missing_data_reason or "This information is not available in the system."
+            response_msg = f"I'm sorry, I don't have the data to answer that. {missing_reason}"
             return {
                 **reset_state,
                 "next_step": "nonsense",

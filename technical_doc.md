@@ -30,6 +30,7 @@
 22. [Visualization State Leak on Non-Contextual Queries — Bug Fix Plan](#22-visualization-state-leak-on-non-contextual-queries--bug-fix-plan)
 23. [ROUND() on `double precision` Crashes Revenue-Share Pie Chart Queries](#23-round-on-double-precision-crashes-revenue-share-pie-chart-queries)
 24. [`/stream` Doesn't Surface Intermediate Progress — Analysis & Plan](#24-stream-doesnt-surface-intermediate-progress--analysis--plan)
+25. [Visualization Analysis — Feature Plan](#25-visualization-analysis--feature-plan)
 
 ---
 
@@ -4155,4 +4156,157 @@ There's also no schema for a "progress" event — the SSE payload (`build_stream
 
 ---
 
-*Generated: 2026-05-29 | Updated: 2026-06-16 | Repository: `ai-agentic-chatbot` | Branch: `21-fix-round-crashes-on-double-precision-postgressql`*
+---
+
+## 25. 📝 Visualization Analysis — Feature Plan
+
+**Files affected:** `agent/state.py`, `agent/graph.py`, `server.py`, `prompts/analysis_prompt.md` (new), `tests/test_agent_graph_e2e.py`
+
+### Problem Statement
+
+Every SQL turn currently returns a visualization object (chart type + data) but no natural-language commentary on what the numbers mean. The client receives a boilerplate one-liner from `_generate_brief_content()` (e.g. `"Here's the delivery method split distribution:"`) and a heuristic template in `visualization.summary` (e.g. `"Distribution across 2 categories."`). Neither tells the user what the data actually says.
+
+---
+
+### Root Cause / Current State
+
+The data flow today ends without surfacing any insight:
+
+1. `sql_query_node` (`agent/graph.py:40`) calls `sql_subgraph.invoke()`, which returns a dict containing `explanation`, `query_result`, `generated_sql`, and other fields.
+2. `sql_query_node` calls `visualizer_node`, which uses pure heuristics to pick a chart type and produces a `visualization` dict. `visualization.summary` is always a template string (`"Distribution across 2 categories."`).
+3. `sql_query_node` calls `_generate_brief_content(visualization)`, producing a one-liner like `"Here's the delivery method split distribution:"`. This becomes the `AIMessage` content stored in state.
+4. `build_stream_response_data` in `server.py` assembles the SSE payload as `{"content": "<one-liner>", "visualization": {...}}`.
+5. The `explanation` field from the SQL subgraph (LLM-generated, e.g. `"Distribution of delivery method."`) is **never declared on `AgentState`** and **never included in the SSE payload** — it silently disappears after `sql_query_node` completes.
+6. `format_sql_response_with_visualization` and `format_sql_response` in `graph.py` are dead code — never called from the live path.
+7. `visualizer.py:48` already has a `# TODO: apply intelligent heuristics using LLMs` comment confirming this gap was always known.
+
+---
+
+### `/stream` Response Body — Before vs After
+
+#### Before (current)
+
+```json
+{
+  "content": "Here's the delivery method split distribution:",
+  "visualization": {
+    "type": "pie_chart",
+    "title": "Delivery Method Split",
+    "data": [
+      {"delivery_method": "DELIVERY", "percentage": 94.2},
+      {"delivery_method": "PICKUP",   "percentage": 5.8}
+    ],
+    "columns": ["delivery_method", "percentage"],
+    "config": { "category": "delivery_method", "value": "percentage" },
+    "summary": "Distribution across 2 categories.",
+    "row_count": 2
+  }
+}
+```
+
+`summary` is always a boilerplate template — never real insight.
+
+#### After (with analysis field)
+
+```json
+{
+  "content": "Here's the delivery method split distribution:",
+  "visualization": {
+    "type": "pie_chart",
+    "title": "Delivery Method Split",
+    "data": [
+      {"delivery_method": "DELIVERY", "percentage": 94.2},
+      {"delivery_method": "PICKUP",   "percentage": 5.8}
+    ],
+    "columns": ["delivery_method", "percentage"],
+    "config": { "category": "delivery_method", "value": "percentage" },
+    "summary": "Distribution across 2 categories.",
+    "row_count": 2
+  },
+  "analysis": "DELIVERY accounts for 94.2% of all shipments, making it the dominant fulfilment method. PICKUP represents only 5.8% of orders, suggesting most customers prefer home delivery. This split indicates a strong preference for doorstep delivery across your customer base."
+}
+```
+
+#### Non-SQL turns (greetings, refusals, clarifications)
+
+```json
+{
+  "content": "Hello! How can I help you today?",
+  "visualization": null,
+  "analysis": null
+}
+```
+
+**Frontend contract:**
+- `analysis` is always present — either a non-empty string or `null`.
+- `analysis` is non-null **only** when `visualization` is also non-null (both guarded by the same `went_through_sql_node` flag in `build_stream_response_data`).
+- `content` remains the short header line — `analysis` is the new richer companion field, not a replacement.
+
+---
+
+### P1 — Must-Do (minimum to ship)
+
+| # | File | Change |
+|---|------|--------|
+| P1-A | `agent/state.py` | Add `analysis: Optional[str]` to `AgentState`. Without this declaration the field is not checkpointed and not type-safe. |
+| P1-B | `agent/graph.py` | After `visualizer_node` runs inside `sql_query_node`, call `fast_llm` (already module-level) with a structured prompt (user query + chart type + chart title + row count + first 3-5 data rows). Return the resulting string as `"analysis"` in the `sql_query_node` return dict alongside `"visualization"`. Also add `"analysis": None` to both early-return error branches of `sql_query_node` to prevent state leakage from prior turns. |
+| P1-C | `server.py` | Add `"analysis": accumulated_state.get("analysis") if went_through_sql_node else None` to `build_stream_response_data`. Same gate as `visualization` — no extra logic needed. |
+| P1-D | `tests/test_agent_graph_e2e.py` | Extend the Turn 1 assertion to check `state1.get("analysis")` is a non-empty string. Add negative checks on Turns 2, 3, 4 that `state.get("analysis")` is `None`. The `mock_fast_llm` fixture already patches `graph.fast_llm` — set its return value for the analysis call on Turn 1. |
+
+**Minimal analysis prompt template (to embed in `graph.py` or in `analysis_prompt.md`):**
+
+```
+You are a data analyst. In 2-3 sentences, explain what the following result means in plain English for a business user. Be specific about numbers where available. Do not repeat the chart title verbatim.
+
+User question: {user_query}
+Chart type: {viz_type}
+Chart title: {viz_title}
+Row count: {row_count}
+Top data:
+{first_3_rows_as_json}
+```
+
+**LLM choice:** `fast_llm` (`ModelType.FAST`) — already instantiated at module level in `graph.py:13`. Used here for the same reason it's used for routing: low-latency, lightweight generation task.
+
+---
+
+### P2 — Should-Do
+
+| # | File | Change |
+|---|------|--------|
+| P2-A | `agent/graph.py` | Wrap the `fast_llm` analysis call in `try/except`. On failure, fall back to `subgraph_result.get("explanation", "")` (the single-sentence SQL description from `SQLGeneration`). Prevents the feature from erroring if the LLM call fails. |
+| P2-B | new `prompts/analysis_prompt.md` | Move the analysis prompt out of Python into the `prompts/` directory, matching the existing convention (`system_prompt.md`, `router_prompts.md`, `schema_to_text_prompts.md`). Load it via `get_system_prompt` / `prompt_loader.py`. Makes prompt tuning possible without touching Python code. |
+| P2-C | `agent/graph.py` | Verify that the `analysis` reset (`"analysis": None`) in the non-SQL branches prevents prior-turn values from leaking — same class of bug that issue #19 fixed for `visualization`. Covered by the P1-D negative assertions. |
+
+---
+
+### P3 — Nice-to-Have
+
+| # | What |
+|---|------|
+| P3-A | Pass first 3-5 actual data rows as compact JSON into the analysis prompt (included in P1-B above). Lets the LLM cite specific numbers (`"DELIVERY accounts for 94.2%..."`) instead of vague summaries. Cap at 5 rows; truncate long string values to avoid inflating token usage. |
+| P3-B | Update `test_server_stream_response.py` (if it exists) to assert the `analysis` key is present in the emitted SSE JSON (null or string) — machine-checked API contract. |
+| P3-C | Consider replacing the boilerplate `_generate_brief_content()` one-liner with the analysis text as `content` directly. Cleaner: one field for the human-readable response instead of two. Tradeoff: current `content` is instant (template, no LLM call); replacing it means the chat bubble is empty until the analysis round-trip completes. |
+
+---
+
+### Key File Locations
+
+| File | Relevant Lines / Notes |
+|------|----------------------|
+| `src/ai_agentic_chatbot/agent/state.py` | `AgentState` TypedDict — add `analysis: Optional[str]` |
+| `src/ai_agentic_chatbot/agent/graph.py` | `sql_query_node` (line 40); `fast_llm` module-level instance (line 13); `_generate_brief_content` (line 131) |
+| `src/ai_agentic_chatbot/agent/nodes/visualizer.py` | `# TODO: apply intelligent heuristics using LLMs` comment (line 48); `_create_payload` where `summary` is set (line 294) |
+| `src/ai_agentic_chatbot/agent/subgraphs/sql_query/state.py` | `SQLSubgraphState` — `explanation: Optional[str]` (line 19); available as fallback |
+| `src/ai_agentic_chatbot/agent/subgraphs/sql_query/nodes/generate_sql.py` | `SQLGeneration` Pydantic model — `explanation` field (line 21) |
+| `src/ai_agentic_chatbot/server.py` | `build_stream_response_data` (line 200) — only place SSE payload is assembled |
+| `src/ai_agentic_chatbot/prompts/` | All prompt files live here; no analysis prompt yet |
+| `tests/test_agent_graph_e2e.py` | `SQL_SUBGRAPH_RESULT` fixture (line 36) already has `"explanation"` field confirming it's available but untested downstream |
+
+### Status
+
+⏸️ **Planned.** Analysis and TODO list complete — not yet implemented.
+
+---
+
+*Generated: 2026-05-29 | Updated: 2026-06-25 | Repository: `ai-agentic-chatbot` | Branch: `21-fix-round-crashes-on-double-precision-postgressql`*

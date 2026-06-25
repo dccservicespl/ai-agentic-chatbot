@@ -113,7 +113,7 @@ def test_chart_then_chitchat_then_greeting_then_gibberish(graph_mocks):
     )
     assert state2["visualization"] is None
     assert state2["next_step"] == "nonsense"
-    assert "I can help you with" in state2["messages"][-1].content
+    assert "I can't help with that" in state2["messages"][-1].content
     mock_fast_llm.invoke.assert_not_called()
 
     # Turn 3 — "hi" (real greeting): gets an LLM-generated reply, no chart.
@@ -134,5 +134,5 @@ def test_chart_then_chitchat_then_greeting_then_gibberish(graph_mocks):
         {"messages": [HumanMessage(content="asdkjasdj")]}, config=config
     )
     assert state4["visualization"] is None
-    assert "I can help you with" in state4["messages"][-1].content
+    assert "I don't have the data to answer that" in state4["messages"][-1].content
     mock_fast_llm.invoke.assert_not_called()
