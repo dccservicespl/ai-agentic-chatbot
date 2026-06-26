@@ -717,3 +717,678 @@ create_user_account params: ['session', 'user_data']
 ---
 
 Once verified, Step 12 is complete. Move on to Step 13.
+
+---
+
+## Step 13: `get_auth_db()` FastAPI Dependency
+
+**This step was completed automatically.** The file was created at:
+
+```
+src/ai_agentic_chatbot/auth/dependencies.py
+```
+
+Contents:
+
+```python
+from collections.abc import Generator
+
+from sqlalchemy.orm import Session
+
+from ai_agentic_chatbot.infrastructure.datasource.factory import get_session
+
+
+def get_auth_db() -> Generator[Session, None, None]:
+    session = get_session("postgresql.primary")
+    try:
+        yield session
+    finally:
+        session.close()
+```
+
+**Why this file exists:** The existing `get_db_session()` in `infrastructure/db_depency.py` returns a dict of sessions designed for the chatbot — it cannot be used for auth routes. The auth repository functions (`get_user_by_username`, `create_user`, etc.) all take a plain `Session` as their first argument. `get_auth_db()` is a FastAPI generator dependency that:
+
+1. Opens a `Session` from the existing `DataSourceFactory` (same PostgreSQL engine — no new connection pool).
+2. Yields the session to the route function via `Depends(get_auth_db)`.
+3. Closes the session in a `finally` block after the route returns or raises — guaranteeing no session leaks.
+
+The `Generator[Session, None, None]` type hint means: yields `Session`, accepts no `.send()` values, returns `None`. FastAPI detects the `yield` and automatically splits execution: before `yield` at request start, after `yield` in the `finally` at request end.
+
+Routes in Step 15 will use it like this:
+
+```python
+@router.post("/register")
+def register(user_data: UserCreate, db: Session = Depends(get_auth_db)):
+    return create_user_account(db, user_data)
+```
+
+---
+
+**13.1 — Verify the dependency imports correctly:**
+
+```bash
+python -c "
+from ai_agentic_chatbot.auth.dependencies import get_auth_db
+import inspect
+print('get_auth_db is a generator function:', inspect.isgeneratorfunction(get_auth_db))
+print('Dependency import OK')
+"
+```
+
+Expected output:
+
+```
+get_auth_db is a generator function: True
+Dependency import OK
+```
+
+---
+
+**13.2 — Verify it opens and closes a real session:**
+
+```bash
+python -c "
+from dotenv import load_dotenv; load_dotenv()
+from ai_agentic_chatbot.infrastructure.datasource.datasource_init import initialize_datasources
+initialize_datasources()
+
+from ai_agentic_chatbot.auth.dependencies import get_auth_db
+from sqlalchemy import text
+
+gen = get_auth_db()
+session = next(gen)
+result = session.execute(text('SELECT 1')).scalar()
+print('Session query result:', result)
+
+try:
+    next(gen)
+except StopIteration:
+    pass
+print('Session closed OK')
+"
+```
+
+Expected output:
+
+```
+Session query result: 1
+Session closed OK
+```
+
+---
+
+Once verified, Step 13 is complete. Move on to Step 14.
+
+---
+
+## Step 14: `get_current_user()` FastAPI Dependency
+
+**This step was completed automatically.** `get_current_user()` was added to:
+
+```
+src/ai_agentic_chatbot/auth/dependencies.py
+```
+
+Full updated contents:
+
+```python
+from collections.abc import Generator
+
+from fastapi import Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordBearer
+from jose import JWTError
+from sqlalchemy.orm import Session
+
+from ai_agentic_chatbot.infrastructure.datasource.factory import get_session
+from ai_agentic_chatbot.auth.jwt_utils import decode_access_token
+from ai_agentic_chatbot.auth.models import User
+from ai_agentic_chatbot.auth.repository import get_user_by_username
+from ai_agentic_chatbot.auth.schemas import TokenData
+
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
+
+
+def get_auth_db() -> Generator[Session, None, None]:
+    session = get_session("postgresql.primary")
+    try:
+        yield session
+    finally:
+        session.close()
+
+
+def get_current_user(
+    token: str = Depends(oauth2_scheme),
+    db: Session = Depends(get_auth_db),
+) -> User:
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = decode_access_token(token)
+        username: str | None = payload.get("sub")
+        if username is None:
+            raise credentials_exception
+        token_data = TokenData(username=username)
+    except JWTError:
+        raise credentials_exception
+
+    user = get_user_by_username(db, token_data.username)
+    if user is None:
+        raise credentials_exception
+    if not user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Inactive user",
+        )
+    return user
+```
+
+**How it works end-to-end:**
+
+1. `OAuth2PasswordBearer(tokenUrl="/auth/login")` — tells FastAPI to look for a `Authorization: Bearer <token>` header. FastAPI also uses `tokenUrl` to wire up the Swagger UI "Authorize" button.
+2. `decode_access_token(token)` — verifies the JWT signature and expiry. Raises `JWTError` on any failure (expired, tampered, malformed).
+3. `payload.get("sub")` — extracts the username from the `sub` claim set during login. Returns `None` if missing → raises 401.
+4. `get_user_by_username(db, ...)` — loads the user from the database. If the account was deleted after the token was issued, this returns `None` → raises 401.
+5. `user.is_active` check — blocks deactivated accounts even if they have a valid token.
+6. Returns the `User` ORM object — routes declare `current_user: User = Depends(get_current_user)` and receive the full user object.
+
+**Security note:** Both "user not found" and "bad token" return the same 401 with `"Could not validate credentials"` — this prevents leaking whether a username exists.
+
+---
+
+**14.1 — Verify the dependency imports correctly:**
+
+```bash
+python -c "
+from dotenv import load_dotenv; load_dotenv()
+from ai_agentic_chatbot.auth.dependencies import get_auth_db, get_current_user, oauth2_scheme
+import inspect
+print('get_auth_db is generator:', inspect.isgeneratorfunction(get_auth_db))
+print('get_current_user is callable:', callable(get_current_user))
+print('oauth2_scheme tokenUrl:', oauth2_scheme.model.flow.tokenUrl)
+print('Step 14 imports OK')
+"
+```
+
+Expected output:
+
+```
+get_auth_db is generator: True
+get_current_user is callable: True
+oauth2_scheme tokenUrl: /auth/login
+Step 14 imports OK
+```
+
+---
+
+Once verified, Step 14 is complete. Move on to Step 15.
+
+---
+
+## Step 15: Auth Router
+
+**This step was completed automatically.** The file was created at:
+
+```
+src/ai_agentic_chatbot/auth/router.py
+```
+
+Contents:
+
+```python
+from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordRequestForm
+from sqlalchemy.orm import Session
+
+from ai_agentic_chatbot.auth.dependencies import get_auth_db, get_current_user
+from ai_agentic_chatbot.auth.jwt_utils import create_access_token
+from ai_agentic_chatbot.auth.models import User
+from ai_agentic_chatbot.auth.schemas import Token, UserCreate, UserResponse
+from ai_agentic_chatbot.auth.service import authenticate_user, create_user_account
+
+router = APIRouter(prefix="/auth", tags=["Auth"])
+
+
+@router.post(
+    "/register",
+    response_model=UserResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Register a new user account",
+)
+def register(user_data: UserCreate, db: Session = Depends(get_auth_db)):
+    try:
+        user = create_user_account(db, user_data)
+        return UserResponse.model_validate(user)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+
+
+@router.post(
+    "/login",
+    response_model=Token,
+    summary="Login and obtain a JWT access token",
+)
+def login(
+    form_data: OAuth2PasswordRequestForm = Depends(),
+    db: Session = Depends(get_auth_db),
+):
+    user = authenticate_user(db, form_data.username, form_data.password)
+    if user is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect username or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    access_token = create_access_token({"sub": user.username})
+    return Token(access_token=access_token)
+
+
+@router.get(
+    "/me",
+    response_model=UserResponse,
+    summary="Get the current authenticated user",
+)
+def me(current_user: User = Depends(get_current_user)):
+    return UserResponse.model_validate(current_user)
+```
+
+**The three endpoints:**
+
+| Method | Path | Auth required | What it does |
+|--------|------|---------------|--------------|
+| `POST` | `/auth/register` | No | Creates a user account. Body: `{ username, email, password }`. Returns `UserResponse` (201). Raises 409 on duplicate username/email. |
+| `POST` | `/auth/login` | No | Accepts `application/x-www-form-urlencoded` with `username` + `password` fields (OAuth2 standard form). Returns `{ access_token, token_type }`. Raises 401 on bad credentials. |
+| `GET`  | `/auth/me` | Yes — Bearer token | Returns the profile of the currently authenticated user. Raises 401 if token missing/invalid/expired. |
+
+**Why `/login` uses form data, not JSON:** `OAuth2PasswordRequestForm` is the OAuth2 spec standard — it expects `Content-Type: application/x-www-form-urlencoded`. This is what Swagger UI's "Authorize" button sends, and what most OAuth2 clients expect.
+
+---
+
+**15.1 — Verify the router imports correctly:**
+
+```bash
+python -c "
+from dotenv import load_dotenv; load_dotenv()
+from ai_agentic_chatbot.auth.router import router
+print('Router prefix :', router.prefix)
+print('Router tags   :', router.tags)
+routes = [(r.methods, r.path) for r in router.routes]
+print('Routes:')
+for methods, path in routes:
+    print(' ', sorted(methods), path)
+print('Router import OK')
+"
+```
+
+Expected output:
+
+```
+Router prefix : /auth
+Router tags   : ['Auth']
+Routes:
+  ['POST'] /register
+  ['POST'] /login
+  ['GET'] /me
+Router import OK
+```
+
+---
+
+Once verified, Step 15 is complete. Move on to Step 16.
+
+---
+
+## Step 16: Wire the Auth Router into `server.py`
+
+This step mounts the auth router onto the FastAPI app so the three `/auth/*` endpoints are live.
+
+**Two changes to `src/ai_agentic_chatbot/server.py`:**
+
+**16.1 — Add the import.** Find the existing import block at the top of `server.py` and add this line alongside the other local imports:
+
+```python
+from ai_agentic_chatbot.auth.router import router as auth_router
+```
+
+**16.2 — Register the router.** Add this line immediately after the `app = FastAPI(...)` block (after the closing parenthesis, before the first `@app.get`):
+
+```python
+app.include_router(auth_router)
+```
+
+After both changes the relevant section of `server.py` should look like this:
+
+```python
+from ai_agentic_chatbot.auth.router import router as auth_router  # ← added
+
+# ... other imports ...
+
+app = FastAPI(
+    title="AI Chat Application",
+    version="1.0.0",
+    description="Agent enabled AI ChatBot application",
+    lifespan=lifespan,
+)
+
+app.include_router(auth_router)  # ← added
+
+@app.get("/health", ...)
+```
+
+---
+
+**16.3 — Verify the routes are registered on the app:**
+
+```bash
+python -c "
+from dotenv import load_dotenv; load_dotenv()
+from ai_agentic_chatbot.server import app
+auth_routes = [r.path for r in app.routes if hasattr(r, 'path') and r.path.startswith('/auth')]
+print('Auth routes on app:', auth_routes)
+assert '/auth/register' in auth_routes
+assert '/auth/login' in auth_routes
+assert '/auth/me' in auth_routes
+print('Step 16 OK')
+"
+```
+
+Expected output:
+
+```
+Auth routes on app: ['/auth/register', '/auth/login', '/auth/me']
+Step 16 OK
+```
+
+---
+
+Once verified, Step 16 is complete. The auth module is fully wired. Move on to Step 17.
+
+---
+
+## Step 17: End-to-End Live Test
+
+This step starts the server and exercises the full auth flow against a running app — register → login → get profile → error cases.
+
+---
+
+**17.1 — Start the server.**
+
+Open a separate terminal and run:
+
+```bash
+python -m uvicorn ai_agentic_chatbot.server:app --host 0.0.0.0 --port 8000 --reload
+```
+
+Wait until you see:
+
+```
+INFO:     Application startup complete.
+```
+
+Leave that terminal running and open a new one for the tests below.
+
+---
+
+**17.2 — Run the full end-to-end test script.**
+
+Run this from the project root (server must be running):
+
+```bash
+python -c "
+import requests
+
+BASE = 'http://localhost:8000'
+
+# --- Register ---
+r = requests.post(f'{BASE}/auth/register', json={
+    'username': 'testuser',
+    'email': 'testuser@example.com',
+    'password': 'SecurePass123'
+})
+print('Register status :', r.status_code)          # expect 201
+print('Register body   :', r.json())
+
+# --- Duplicate register (expect 409) ---
+r = requests.post(f'{BASE}/auth/register', json={
+    'username': 'testuser',
+    'email': 'testuser@example.com',
+    'password': 'SecurePass123'
+})
+print('Duplicate status:', r.status_code)          # expect 409
+
+# --- Login ---
+r = requests.post(f'{BASE}/auth/login', data={
+    'username': 'testuser',
+    'password': 'SecurePass123'
+})
+print('Login status    :', r.status_code)          # expect 200
+token = r.json()['access_token']
+print('Token received  :', token[:30], '...')
+
+# --- /me with valid token ---
+r = requests.get(f'{BASE}/auth/me', headers={'Authorization': f'Bearer {token}'})
+print('/me status      :', r.status_code)          # expect 200
+print('/me body        :', r.json())
+
+# --- Wrong password (expect 401) ---
+r = requests.post(f'{BASE}/auth/login', data={
+    'username': 'testuser',
+    'password': 'wrongpassword'
+})
+print('Bad login status:', r.status_code)          # expect 401
+
+# --- /me with bad token (expect 401) ---
+r = requests.get(f'{BASE}/auth/me', headers={'Authorization': 'Bearer invalidtoken'})
+print('Bad token status:', r.status_code)          # expect 401
+
+print()
+print('All checks passed.')
+"
+```
+
+Expected output:
+
+```
+Register status : 201
+Register body   : {'id': 1, 'username': 'testuser', 'email': 'testuser@example.com', 'is_active': True, 'is_superuser': False, 'created_at': '...'}
+Duplicate status: 409
+Login status    : 200
+Token received  : eyJhbGciOiJIUzI1NiIsInR5cCI6...
+/me status      : 200
+/me body        : {'id': 1, 'username': 'testuser', 'email': 'testuser@example.com', 'is_active': True, 'is_superuser': False, 'created_at': '...'}
+Bad login status: 401
+Bad token status: 401
+
+All checks passed.
+```
+
+---
+
+**17.3 — Optional: Swagger UI manual test.**
+
+Open `http://localhost:8000/docs` in your browser. You will see three new endpoints under the **Auth** tag:
+
+- `POST /auth/register`
+- `POST /auth/login`
+- `GET /auth/me`
+
+To test via Swagger:
+1. Call `POST /auth/register` with a username, email, and password.
+2. Call `POST /auth/login` with the same credentials — copy the `access_token` from the response.
+3. Click the **Authorize** button (top right), paste the token, click Authorize.
+4. Call `GET /auth/me` — it should return your user profile.
+
+---
+
+Once all status codes match expectations, Step 17 is complete. The authentication module is fully implemented and live. Move on to Step 18.
+
+---
+
+## Step 18: Superuser Seed Script
+
+**This step was completed automatically.** The file was created at:
+
+```
+src/ai_agentic_chatbot/auth/seed.py
+```
+
+**Why this step exists:** All four main endpoints (`/stream`, `/schemaJson`, `/schemaText`, `/ingest`) now require a valid JWT. To obtain a token you must log in. To log in you must have an account. The seed script creates the first superuser account from env vars — a safe, one-time operation that avoids hard-coding credentials anywhere in the codebase.
+
+The `SEED_USERNAME`, `SEED_EMAIL`, and `SEED_PASSWORD` vars were reserved in `.env` back in Step 2 for exactly this purpose.
+
+---
+
+**18.1 — Fill in the seed vars in `.env`.**
+
+Open `.env` and set the three seed values:
+
+```
+SEED_USERNAME=admin
+SEED_EMAIL=admin@example.com
+SEED_PASSWORD=<choose a strong password>
+```
+
+---
+
+**18.2 — Run the seed script:**
+
+```bash
+python -m ai_agentic_chatbot.auth.seed
+```
+
+Expected output:
+
+```
+Superuser created: id=1  username=admin  email=admin@example.com
+Remove SEED_USERNAME / SEED_EMAIL / SEED_PASSWORD from .env now.
+```
+
+If the user already exists (e.g., you re-run it), the script exits safely:
+
+```
+User 'admin' already exists — nothing to do.
+```
+
+---
+
+**18.3 — Remove the seed vars from `.env`.**
+
+After a successful run, blank out or delete the three lines in `.env`:
+
+```
+SEED_USERNAME=
+SEED_EMAIL=
+SEED_PASSWORD=
+```
+
+This prevents the credentials from sitting in the file unnecessarily.
+
+---
+
+**18.4 — Verify the superuser can log in and hit a protected endpoint:**
+
+```bash
+python -c "
+import requests
+
+BASE = 'http://localhost:8000'
+
+r = requests.post(f'{BASE}/auth/login', data={
+    'username': 'admin',
+    'password': '<your seed password>'
+})
+print('Login status:', r.status_code)   # expect 200
+token = r.json()['access_token']
+
+r = requests.get(f'{BASE}/auth/me', headers={'Authorization': f'Bearer {token}'})
+print('/me body    :', r.json())
+print('is_superuser:', r.json()['is_superuser'])   # expect True
+"
+```
+
+Expected output:
+
+```
+Login status: 200
+/me body    : {'id': ..., 'username': 'admin', 'email': 'admin@example.com', 'is_active': True, 'is_superuser': True, 'created_at': '...'}
+is_superuser: True
+```
+
+---
+
+Once verified, Step 18 is complete. The auth module implementation is finished. Move on to Step 19.
+
+---
+
+## Step 19: Commit the Auth Module
+
+This step stages and commits all remaining auth module files.
+
+> **Warning — do NOT stage `config.yaml` as-is.** It currently contains live Azure OpenAI API keys in plaintext. Blank them out before committing (step 19.1 below).
+
+---
+
+**19.1 — Remove the API keys from `config.yaml`.**
+
+Open `config.yaml` and replace every `api_key:` value that has a real key with an empty string. The committed file should look like:
+
+```yaml
+    fast:
+      api_key: ""
+    smart:
+      api_key: ""
+    embedding:
+      api_key: ""
+```
+
+Also blank out any `host`, `username`, `password` fields under `datasources` if they contain real values. The file is safe to commit once all secrets are empty strings.
+
+---
+
+**19.2 — Stage the files:**
+
+```bash
+git add docs/auth-module-implementation.md
+git add src/ai_agentic_chatbot/auth/dependencies.py
+git add src/ai_agentic_chatbot/auth/router.py
+git add src/ai_agentic_chatbot/auth/seed.py
+git add src/ai_agentic_chatbot/server.py
+git add config.yaml
+git add certs/
+```
+
+---
+
+**19.3 — Commit:**
+
+```bash
+git commit -m "feat: complete user authentication module with JWT-secured APIs
+
+- Add FastAPI dependencies: get_auth_db (session lifecycle) and
+  get_current_user (JWT Bearer validation with 401 on failure)
+- Add auth router with POST /auth/register, POST /auth/login,
+  GET /auth/me; login uses OAuth2PasswordRequestForm (form data)
+- Protect POST /stream, GET /schemaJson, GET /schemaText,
+  GET /ingest with get_current_user dependency
+- Add seed script (auth/seed.py) to create the first superuser
+  from SEED_* env vars; idempotent and exits safely if user exists
+- Complete implementation guide (steps 13–18) in docs/
+- Add config.yaml with model and datasource configuration (secrets blanked)"
+```
+
+---
+
+**19.4 — Verify the commit:**
+
+```bash
+git log --oneline -3
+git show --stat HEAD
+```
+
+You should see the new commit at the top listing all the staged files.
+
+---
+
+Once verified, Step 19 is complete. Move on to Step 20 (create the pull request).

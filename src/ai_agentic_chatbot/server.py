@@ -35,6 +35,9 @@ from ai_agentic_chatbot.application.transform_schema_to_text import (
     generate_schema_summary,
 )
 from ai_agentic_chatbot.utils.utils import get_db_connection_string
+from ai_agentic_chatbot.auth.router import router as auth_router
+from ai_agentic_chatbot.auth.dependencies import get_current_user
+from ai_agentic_chatbot.auth.models import User
 
 load_dotenv()
 
@@ -74,6 +77,8 @@ app = FastAPI(
     description="Agent enabled AI ChatBot application",
     lifespan=lifespan,
 )
+
+app.include_router(auth_router)
 
 
 @app.get(
@@ -125,7 +130,7 @@ graph = build_graph()
         503: {"description": "Extraction failed — database unreachable or introspection error"},
     },
 )
-def schema_json():
+def schema_json(current_user: User = Depends(get_current_user)):
     try:
         db_engine = get_engine("postgresql.primary")
         config = SchemaExtractionConfig(
@@ -156,7 +161,7 @@ def schema_json():
         503: {"description": "Conversion failed — missing schema JSON or LLM error"},
     },
 )
-def schema_text():
+def schema_text(current_user: User = Depends(get_current_user)):
     try:
         transform_schema_to_text()
         generate_schema_summary()
@@ -182,7 +187,7 @@ def schema_text():
         500: {"description": "Ingestion failed — embedding or database error"},
     },
 )
-def ingest_schema_endpoint(force_reset: bool = False):
+def ingest_schema_endpoint(force_reset: bool = False, current_user: User = Depends(get_current_user)):
     try:
         if force_reset:
             get_vector_store().reset_collection()
@@ -236,7 +241,7 @@ def build_stream_response_data(content: str, accumulated_state: dict) -> dict:
         500: {"description": "Internal server error during agent execution"},
     },
 )
-async def stream_endpoint(stream_request: StreamRequest):
+async def stream_endpoint(stream_request: StreamRequest, current_user: User = Depends(get_current_user)):
     """Streams agent responses using Server-Sent Events."""
     try:
         thread_id = stream_request.thread_id
