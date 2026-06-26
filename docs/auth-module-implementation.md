@@ -1391,4 +1391,681 @@ You should see the new commit at the top listing all the staged files.
 
 ---
 
-Once verified, Step 19 is complete. Move on to Step 20 (create the pull request).
+Once verified, Step 19 is complete. Move on to Step 20.
+
+---
+
+## Step 20: Add `RefreshToken` ORM Model
+
+**This step was completed automatically.** `auth/models.py` was updated with two changes:
+
+**New imports added:**
+```python
+import uuid
+from sqlalchemy import ForeignKey          # added
+from sqlalchemy.dialects.postgresql import UUID  # added
+```
+
+**New class added after `User`:**
+
+```python
+class RefreshToken(Base):
+    __tablename__ = "refresh_tokens"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    family_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False, index=True)
+    used: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    revoked: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+```
+
+**Column-by-column rationale:**
+
+| Column | Type | Purpose |
+|---|---|---|
+| `id` | UUID PK | Random UUID4 — avoids sequential ID enumeration attacks |
+| `user_id` | BigInt FK → users.id | `CASCADE DELETE` so tokens are cleaned up when a user is deleted; indexed for family revocation queries |
+| `token_hash` | String(64), unique | SHA-256 hex digest of the raw token (always 64 chars); unique index enables O(log n) lookup |
+| `family_id` | UUID, indexed | Groups all tokens from one login session; one `UPDATE WHERE family_id = ?` revokes the whole family on replay detection |
+| `used` | Boolean | `True` once this token has been rotated away — distinguishes normal rotation from security revocation |
+| `revoked` | Boolean | `True` when force-revoked (logout, replay detected, admin action) — checked independently of `used` |
+| `expires_at` | DateTime(tz) | Hard expiry; enables periodic cleanup `DELETE FROM refresh_tokens WHERE expires_at < NOW()` |
+| `created_at` | DateTime(tz) | Audit trail; server-default so the application never needs to set it |
+
+---
+
+**20.1 — Verify the model imports correctly:**
+
+```bash
+python -c "
+from ai_agentic_chatbot.auth.models import User, RefreshToken
+import inspect
+print('User table        :', User.__tablename__)
+print('RefreshToken table:', RefreshToken.__tablename__)
+print('RefreshToken cols :', [c.name for c in RefreshToken.__table__.columns])
+print('Step 20 OK')
+"
+```
+
+Expected output:
+
+```
+User table        : users
+RefreshToken table: refresh_tokens
+RefreshToken cols : ['id', 'user_id', 'token_hash', 'family_id', 'used', 'revoked', 'expires_at', 'created_at']
+Step 20 OK
+```
+
+---
+
+Once verified, Step 20 is complete. Move on to Step 21.
+
+---
+
+## Step 21: Generate and Apply the `refresh_tokens` Migration
+
+**No change to `alembic/env.py` is needed.** Line 20 already imports `ai_agentic_chatbot.auth.models`, which contains both `User` and `RefreshToken`. The `include_object` filter in `env.py` automatically picks up any model registered with `Base` — `RefreshToken` is included the moment it was added to `models.py`.
+
+---
+
+**21.1 — Generate the migration:**
+
+```bash
+alembic revision --autogenerate -m "create refresh_tokens table"
+```
+
+This creates a new file in `alembic/versions/`.
+
+---
+
+**21.2 — Inspect the generated file before applying.**
+
+Open the new file in `alembic/versions/` and confirm:
+
+- `upgrade()` contains only `op.create_table('refresh_tokens', ...)` with all 8 columns plus index creation
+- `downgrade()` contains only `op.drop_index(...)` and `op.drop_table('refresh_tokens')`
+- There are **no** `op.drop_table` calls for `users`, `orders`, `sales`, `customer`, or any other existing table
+
+If you see unexpected drops, stop and do not proceed.
+
+---
+
+**21.3 — Apply the migration:**
+
+```bash
+alembic upgrade head
+```
+
+Expected output:
+
+```
+INFO  [alembic.runtime.migration] Running upgrade <prev_rev> -> <new_rev>, create refresh_tokens table
+```
+
+---
+
+**21.4 — Verify the table was created in the database:**
+
+```bash
+python -c "
+from dotenv import load_dotenv; load_dotenv()
+from ai_agentic_chatbot.infrastructure.datasource.datasource_init import initialize_datasources
+from ai_agentic_chatbot.infrastructure.datasource.factory import get_engine
+from sqlalchemy import text
+initialize_datasources()
+engine = get_engine('postgresql.primary')
+with engine.connect() as conn:
+    result = conn.execute(text(\"SELECT column_name, data_type FROM information_schema.columns WHERE table_name='refresh_tokens' ORDER BY ordinal_position\"))
+    for row in result:
+        print(f'  {row[0]:15s} {row[1]}')
+print('Step 21 OK')
+"
+```
+
+Expected output:
+
+```
+  id              uuid
+  user_id         bigint
+  token_hash      character varying
+  family_id       uuid
+  used            boolean
+  revoked         boolean
+  expires_at      timestamp with time zone
+  created_at      timestamp with time zone
+Step 21 OK
+```
+
+---
+
+Once all 8 columns appear, Step 21 is complete. Move on to Step 22.
+
+---
+
+## Step 22: Add `generate_refresh_token()` and `hash_token()` to `jwt_utils.py`
+
+**This step was completed automatically.** Two additions were made to `src/ai_agentic_chatbot/auth/jwt_utils.py`:
+
+**New imports at the top:**
+```python
+import hashlib
+import secrets
+```
+
+**Two new functions added after `decode_access_token`:**
+
+```python
+def generate_refresh_token() -> str:
+    return secrets.token_urlsafe(64)
+
+
+def hash_token(raw: str) -> str:
+    return hashlib.sha256(raw.encode()).hexdigest()
+```
+
+**Why these two functions:**
+
+- `generate_refresh_token()` — `secrets.token_urlsafe(64)` produces 64 bytes (512 bits) of cryptographically secure random data, URL-safe base64-encoded. This is the raw token sent to the client. Never stored in the DB.
+- `hash_token()` — SHA-256 of the raw token, returned as a 64-character hex digest. This is what gets stored in `refresh_tokens.token_hash`. If the DB is exfiltrated, attackers get hashes, not usable tokens. SHA-256 (without salt) is safe here because the input has 512 bits of entropy — rainbow tables are infeasible.
+
+**Why not JWT for refresh tokens:** The refresh token is always validated against the DB, so embedding claims in a JWT adds nothing. An opaque random string is simpler, smaller, and cannot be decoded by the client.
+
+---
+
+**22.1 — Verify both functions work correctly:**
+
+```bash
+python -c "
+from ai_agentic_chatbot.auth.jwt_utils import generate_refresh_token, hash_token
+
+raw = generate_refresh_token()
+print('Raw token length  :', len(raw))
+print('Raw token sample  :', raw[:30], '...')
+
+hashed = hash_token(raw)
+print('Hash length       :', len(hashed))
+print('Hash sample       :', hashed[:30], '...')
+
+# Same input always produces the same hash
+assert hash_token(raw) == hashed, 'Hash is not deterministic'
+
+# Different tokens produce different hashes
+raw2 = generate_refresh_token()
+assert hash_token(raw2) != hashed, 'Collision detected'
+
+print('Step 22 OK')
+"
+```
+
+Expected output:
+
+```
+Raw token length  : 86
+Raw token sample  : <random base64 string> ...
+Hash length       : 64
+Hash sample       : <hex string> ...
+Step 22 OK
+```
+
+> Note: raw token length is 86 characters (64 bytes → base64 encoding adds ~33% overhead).
+
+---
+
+Once verified, Step 22 is complete. Move on to Step 23.
+
+---
+
+## Step 23: Update Pydantic Schemas
+
+**This step was completed automatically.** Three changes were made to `src/ai_agentic_chatbot/auth/schemas.py`:
+
+**1 — `Token` schema updated** — `refresh_token` field added:
+
+```python
+class Token(BaseModel):
+    access_token: str
+    refresh_token: str | None = None   # ← added
+    token_type: str = "bearer"
+```
+
+`refresh_token` is `None` by default so the existing `/auth/me` response (which returns a `Token`-derived object) is unaffected. It will be populated by the modified `login` endpoint (Step 26) and the new `refresh` endpoint.
+
+**2 — `RefreshRequest` schema added:**
+
+```python
+class RefreshRequest(BaseModel):
+    refresh_token: str
+```
+
+Request body for `POST /auth/refresh`. The raw opaque token string sent by the client.
+
+**3 — `LogoutRequest` schema added:**
+
+```python
+class LogoutRequest(BaseModel):
+    refresh_token: str
+```
+
+Request body for `POST /auth/logout`. Identical structure to `RefreshRequest` — kept as a separate class so each endpoint's intent is explicit and they can diverge independently in future.
+
+---
+
+**23.1 — Verify all schemas load correctly:**
+
+```bash
+python -c "
+from ai_agentic_chatbot.auth.schemas import Token, RefreshRequest, LogoutRequest, TokenData
+
+print('Token fields       :', list(Token.model_fields.keys()))
+print('RefreshRequest     :', list(RefreshRequest.model_fields.keys()))
+print('LogoutRequest      :', list(LogoutRequest.model_fields.keys()))
+
+# Token.refresh_token should be optional (default None)
+t = Token(access_token='abc')
+assert t.refresh_token is None, 'refresh_token should default to None'
+assert t.token_type == 'bearer'
+
+# Token with refresh_token
+t2 = Token(access_token='abc', refresh_token='xyz')
+assert t2.refresh_token == 'xyz'
+
+print('Step 23 OK')
+"
+```
+
+Expected output:
+
+```
+Token fields       : ['access_token', 'refresh_token', 'token_type']
+RefreshRequest     : ['refresh_token']
+LogoutRequest      : ['refresh_token']
+Step 23 OK
+```
+
+---
+
+Once verified, Step 23 is complete. Move on to Step 24.
+
+---
+
+## Step 24: Add Refresh Token CRUD to `repository.py`
+
+**This step was completed automatically.** Five new functions were added to `src/ai_agentic_chatbot/auth/repository.py`, along with updated imports:
+
+**New imports:**
+```python
+import uuid
+from datetime import datetime
+from sqlalchemy import select, update      # update added
+from ai_agentic_chatbot.auth.models import User, RefreshToken  # RefreshToken added
+```
+
+**New functions:**
+
+```python
+def create_refresh_token(
+    session: Session,
+    *,
+    user_id: int,
+    family_id: uuid.UUID,
+    token_hash: str,
+    expires_at: datetime,
+) -> RefreshToken:
+    rt = RefreshToken(user_id=user_id, family_id=family_id, token_hash=token_hash, expires_at=expires_at)
+    session.add(rt)
+    session.commit()
+    session.refresh(rt)
+    return rt
+
+
+def get_refresh_token_by_hash(session: Session, token_hash: str) -> RefreshToken | None:
+    return session.execute(
+        select(RefreshToken).where(RefreshToken.token_hash == token_hash)
+    ).scalar_one_or_none()
+
+
+def mark_token_used(session: Session, token_id: uuid.UUID) -> None:
+    session.execute(update(RefreshToken).where(RefreshToken.id == token_id).values(used=True))
+    session.commit()
+
+
+def revoke_family(session: Session, family_id: uuid.UUID) -> None:
+    session.execute(update(RefreshToken).where(RefreshToken.family_id == family_id).values(revoked=True))
+    session.commit()
+
+
+def revoke_token(session: Session, token_id: uuid.UUID) -> None:
+    session.execute(update(RefreshToken).where(RefreshToken.id == token_id).values(revoked=True))
+    session.commit()
+```
+
+**What each function does:**
+
+| Function | Called by | Purpose |
+|---|---|---|
+| `create_refresh_token` | `login` endpoint | Stores a new hashed token row with its family and expiry |
+| `get_refresh_token_by_hash` | `refresh` + `logout` endpoints | Single indexed lookup — finds a token by its SHA-256 hash |
+| `mark_token_used` | `refresh` endpoint | Marks the incoming token as used before issuing the new one |
+| `revoke_family` | `refresh` endpoint (replay detected) | Revokes every token in a family — forces full re-login |
+| `revoke_token` | `logout` endpoint | Revokes a single token cleanly on user-initiated logout |
+
+---
+
+**24.1 — Verify all functions import correctly:**
+
+```bash
+python -c "
+from ai_agentic_chatbot.auth.repository import (
+    create_refresh_token, get_refresh_token_by_hash,
+    mark_token_used, revoke_family, revoke_token
+)
+import inspect
+fns = [create_refresh_token, get_refresh_token_by_hash, mark_token_used, revoke_family, revoke_token]
+for fn in fns:
+    print(f'{fn.__name__:30s} params: {list(inspect.signature(fn).parameters.keys())}')
+print('Step 24 OK')
+"
+```
+
+Expected output:
+
+```
+create_refresh_token           params: ['session', 'user_id', 'family_id', 'token_hash', 'expires_at']
+get_refresh_token_by_hash      params: ['session', 'token_hash']
+mark_token_used                params: ['session', 'token_id']
+revoke_family                  params: ['session', 'family_id']
+revoke_token                   params: ['session', 'token_id']
+Step 24 OK
+```
+
+---
+
+Once verified, Step 24 is complete. Move on to Step 25.
+
+---
+
+## Step 25: Add `JWT_REFRESH_TOKEN_EXPIRE_DAYS` to `.env`
+
+This step adds the refresh token expiry configuration to your environment files.
+
+---
+
+**25.1 — Open `.env`** and add this line in the `# JWT Authentication` block:
+
+```
+JWT_REFRESH_TOKEN_EXPIRE_DAYS=7
+```
+
+The block should look like this after the change:
+
+```
+# JWT Authentication
+JWT_SECRET_KEY=<your key>
+JWT_ALGORITHM=HS256
+JWT_ACCESS_TOKEN_EXPIRE_MINUTES=60
+JWT_REFRESH_TOKEN_EXPIRE_DAYS=7
+```
+
+---
+
+**25.2 — Open `.env.example`** and add the same line (no value needed in the template):
+
+```
+JWT_REFRESH_TOKEN_EXPIRE_DAYS=7
+```
+
+---
+
+**25.3 — Verify the var loads correctly:**
+
+```bash
+python -c "
+from dotenv import load_dotenv; load_dotenv()
+import os
+val = os.environ.get('JWT_REFRESH_TOKEN_EXPIRE_DAYS', 'MISSING')
+print('JWT_REFRESH_TOKEN_EXPIRE_DAYS:', val)
+assert val != 'MISSING', 'Variable not found in .env'
+assert int(val) == 7, f'Expected 7, got {val}'
+print('Step 25 OK')
+"
+```
+
+Expected output:
+
+```
+JWT_REFRESH_TOKEN_EXPIRE_DAYS: 7
+Step 25 OK
+```
+
+---
+
+Once verified, Step 25 is complete. Move on to Step 26.
+
+---
+
+## Step 26: Update Auth Router — Login, Refresh, Logout
+
+**This step was completed automatically.** `src/ai_agentic_chatbot/auth/router.py` was fully rewritten with the following changes:
+
+**New imports added:**
+```python
+import os, uuid
+from datetime import datetime, timedelta, timezone
+from fastapi import Response
+from ai_agentic_chatbot.auth.jwt_utils import generate_refresh_token, hash_token
+from ai_agentic_chatbot.auth.repository import (
+    create_refresh_token, get_refresh_token_by_hash,
+    get_user_by_id, mark_token_used, revoke_family, revoke_token,
+)
+from ai_agentic_chatbot.auth.schemas import LogoutRequest, RefreshRequest
+```
+
+**Module-level constant:**
+```python
+_REFRESH_EXPIRE_DAYS = int(os.environ.get("JWT_REFRESH_TOKEN_EXPIRE_DAYS", "7"))
+```
+
+---
+
+**`POST /auth/login` — modified:**
+
+After authenticating, now also generates a refresh token row and returns it alongside the access token:
+
+```python
+raw_rt = generate_refresh_token()
+create_refresh_token(
+    db,
+    user_id=user.id,
+    family_id=uuid.uuid4(),          # new family per login
+    token_hash=hash_token(raw_rt),
+    expires_at=datetime.now(timezone.utc) + timedelta(days=_REFRESH_EXPIRE_DAYS),
+)
+return Token(access_token=access_token, refresh_token=raw_rt)
+```
+
+---
+
+**`POST /auth/refresh` — new endpoint:**
+
+Full validation + rotation logic:
+
+1. Hash the incoming token → look up by `token_hash`
+2. Not found → 401
+3. `revoked == True` → 401 "Token has been revoked"
+4. `used == True` → `revoke_family()` → 401 "Token reuse detected" *(replay attack)*
+5. `expires_at < now()` → 401 "Refresh token expired"
+6. `mark_token_used()` on the old token
+7. Look up user via `get_user_by_id()` — 401 if deleted or inactive
+8. `create_refresh_token()` with the **same `family_id`** (maintains the session chain)
+9. Return new `{ access_token, refresh_token }`
+
+---
+
+**`POST /auth/logout` — new endpoint:**
+
+```python
+rt = get_refresh_token_by_hash(db, hash_token(body.refresh_token))
+if rt is not None and not rt.revoked:
+    revoke_token(db, rt.id)
+return Response(status_code=status.HTTP_204_NO_CONTENT)
+```
+
+Always returns **HTTP 204** — never reveals whether the token existed (prevents an attacker from probing for valid tokens).
+
+---
+
+**`get_user_by_id` also added to `repository.py`** (needed by `/refresh` to load the user from the token's `user_id`):
+
+```python
+def get_user_by_id(session: Session, user_id: int) -> User | None:
+    return session.execute(select(User).where(User.id == user_id)).scalar_one_or_none()
+```
+
+---
+
+**26.1 — Verify the router imports and all 5 routes are registered:**
+
+```bash
+python -c "
+from dotenv import load_dotenv; load_dotenv()
+from ai_agentic_chatbot.auth.router import router
+print('Router prefix:', router.prefix)
+routes = [(sorted(r.methods), r.path) for r in router.routes]
+print('Routes:')
+for methods, path in routes:
+    print(' ', methods, path)
+print('Step 26 OK')
+"
+```
+
+Expected output:
+
+```
+Router prefix: /auth
+Routes:
+  ['POST'] /register
+  ['POST'] /login
+  ['POST'] /refresh
+  ['POST'] /logout
+  ['GET'] /me
+Step 26 OK
+```
+
+---
+
+Once verified, Step 26 is complete. Move on to Step 27.
+
+---
+
+## Step 27: End-to-End Live Test — Refresh Token Flow
+
+This step starts the server and exercises the full refresh token lifecycle: login → refresh → logout → replay detection.
+
+---
+
+**27.1 — Start the server** (separate terminal):
+
+```bash
+poetry run uvicorn ai_agentic_chatbot.server:app --host 0.0.0.0 --port 8000 --reload
+```
+
+Wait for `Application startup complete.`
+
+---
+
+**27.2 — Run the full end-to-end test script** (server must be running):
+
+```bash
+python -c "
+import requests
+
+BASE = 'http://localhost:8000'
+USERNAME = 'admin'
+PASSWORD = '<your admin password>'
+
+# --- Login ---
+r = requests.post(f'{BASE}/auth/login', data={'username': USERNAME, 'password': PASSWORD})
+print('Login status          :', r.status_code)          # expect 200
+assert r.status_code == 200
+body = r.json()
+access_token  = body['access_token']
+refresh_token = body['refresh_token']
+print('Access token received :', access_token[:30], '...')
+print('Refresh token received:', refresh_token[:30], '...')
+
+# --- /me with access token ---
+r = requests.get(f'{BASE}/auth/me', headers={'Authorization': f'Bearer {access_token}'})
+print('/me status            :', r.status_code)          # expect 200
+assert r.status_code == 200
+
+# --- Refresh: get new token pair ---
+r = requests.post(f'{BASE}/auth/refresh', json={'refresh_token': refresh_token})
+print('Refresh status        :', r.status_code)          # expect 200
+assert r.status_code == 200
+body2 = r.json()
+new_access_token  = body2['access_token']
+new_refresh_token = body2['refresh_token']
+print('New access token      :', new_access_token[:30], '...')
+print('New refresh token     :', new_refresh_token[:30], '...')
+
+# --- /me with new access token ---
+r = requests.get(f'{BASE}/auth/me', headers={'Authorization': f'Bearer {new_access_token}'})
+print('/me with new token    :', r.status_code)          # expect 200
+assert r.status_code == 200
+
+# --- Replay: reuse the OLD refresh token (expect 401 + family revoked) ---
+r = requests.post(f'{BASE}/auth/refresh', json={'refresh_token': refresh_token})
+print('Replay attack status  :', r.status_code)          # expect 401
+print('Replay detail         :', r.json().get('detail'))
+assert r.status_code == 401
+
+# --- Login again to get a fresh token for logout test ---
+r = requests.post(f'{BASE}/auth/login', data={'username': USERNAME, 'password': PASSWORD})
+fresh_rt = r.json()['refresh_token']
+
+# --- Logout ---
+r = requests.post(f'{BASE}/auth/logout', json={'refresh_token': fresh_rt})
+print('Logout status         :', r.status_code)          # expect 204
+assert r.status_code == 204
+
+# --- Refresh after logout (expect 401) ---
+r = requests.post(f'{BASE}/auth/refresh', json={'refresh_token': fresh_rt})
+print('Post-logout refresh   :', r.status_code)          # expect 401
+print('Post-logout detail    :', r.json().get('detail'))
+assert r.status_code == 401
+
+print()
+print('All checks passed.')
+"
+```
+
+Expected output:
+
+```
+Login status          : 200
+Access token received : eyJhbGciOiJIUzI1NiIsInR5cCI6...
+Refresh token received: <random string> ...
+/me status            : 200
+Refresh status        : 200
+New access token      : eyJhbGciOiJIUzI1NiIsInR5cCI6...
+New refresh token     : <random string> ...
+/me with new token    : 200
+Replay attack status  : 401
+Replay detail         : Token reuse detected — all sessions revoked
+Logout status         : 204
+Post-logout refresh   : 401
+Post-logout detail    : Token has been revoked
+
+All checks passed.
+```
+
+---
+
+Once all assertions pass, Step 27 is complete. The refresh token system is fully implemented and live.

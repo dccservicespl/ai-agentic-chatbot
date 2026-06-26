@@ -31,6 +31,8 @@
 23. [ROUND() on `double precision` Crashes Revenue-Share Pie Chart Queries](#23-round-on-double-precision-crashes-revenue-share-pie-chart-queries)
 24. [`/stream` Doesn't Surface Intermediate Progress — Analysis & Plan](#24-stream-doesnt-surface-intermediate-progress--analysis--plan)
 25. [Visualization Analysis — Feature Plan](#25-visualization-analysis--feature-plan)
+26. [User Authentication Module — Implementation Plan](#26-user-authentication-module--implementation-plan)
+27. [JWT Refresh Token System — Design & Implementation Plan](#27-jwt-refresh-token-system--design--implementation-plan)
 
 ---
 
@@ -4507,7 +4509,200 @@ SEED_PASSWORD=
 
 ### Status
 
-⏸️ **Planned.** Design and TODO list complete — not yet implemented.
+✅ **Completed.** All 19 implementation steps done and verified end-to-end (2026-06-26).
+
+---
+
+---
+
+## 27. 🔑 JWT Refresh Token System — Design & Implementation Plan
+
+### Problem Statement
+
+The current access token has a 60-minute TTL. When it expires, the user must re-enter their credentials. For a chatbot that runs across a workday session, this creates unacceptable UX friction. A refresh token system allows the client to silently obtain a new access token without prompting the user — extending the effective session lifetime to days while keeping the access token short-lived.
+
+---
+
+### Two-Token Architecture
+
+```
+POST /auth/login
+    └─► { access_token (15–60 min), refresh_token (7–14 days) }
+
+Every protected API call:
+    Authorization: Bearer <access_token>
+
+Access token expires:
+    POST /auth/refresh  { refresh_token: "<token>" }
+    └─► { access_token (new), refresh_token (new) }
+
+User logs out:
+    POST /auth/logout  { refresh_token: "<token>" }
+    └─► HTTP 204 (token revoked in DB)
+```
+
+The access token remains a short-lived JWT verified statlessly. The refresh token is an opaque random string always validated against the database — never a JWT.
+
+---
+
+### Core Design Decisions
+
+| Decision | Choice | Rationale |
+|---|---|---|
+| Refresh token format | Opaque random string (`secrets.token_urlsafe(64)`) | DB-validated anyway; embedding claims in a JWT adds nothing |
+| Storage | PostgreSQL table (`refresh_tokens`) | No Redis needed; single indexed lookup is fast enough at this scale |
+| What is stored | SHA-256 hash of the raw token | Raw token goes to client only; if DB is exfiltrated, attacker gets hashes not usable tokens |
+| Token transport | Response body (JSON) | No browser frontend yet; HttpOnly cookies add CSRF complexity with no XSS benefit for API/mobile clients |
+| Rotation | Mandatory on every refresh | Each `/auth/refresh` invalidates the old token and issues a new pair |
+| Replay detection | Token family model | Detecting a used token → revoke entire family → force re-login |
+
+---
+
+### Token Family Model (Replay Attack Detection)
+
+Every login creates a new `family_id` (UUID). All refresh tokens issued from that login share the same `family_id`.
+
+```
+Login ──► access_token_1 + refresh_token_A  (family_id = X)
+              │
+              ▼ /auth/refresh with refresh_token_A
+         mark A used=True
+         ──► access_token_2 + refresh_token_B  (family_id = X)
+              │
+              ▼ attacker replays refresh_token_A (already used=True)
+         REPLAY DETECTED
+         ──► revoke all tokens where family_id = X
+         ──► 401 to both legitimate user and attacker
+         ──► user must log in again
+```
+
+This design is **self-reporting theft detection**: using a stolen token alerts the system.
+
+---
+
+### Database Schema — `refresh_tokens` Table
+
+```python
+class RefreshToken(Base):
+    __tablename__ = "refresh_tokens"
+
+    id:         UUID (PK, random)        # UUID4 — avoids sequential enumeration
+    user_id:    BigInt FK → users.id     # CASCADE DELETE; indexed for family revocation
+    token_hash: String(64), unique       # SHA-256 hex of raw token (always 64 chars)
+    family_id:  UUID, indexed            # Groups all tokens from one login session
+    used:       Boolean (default False)  # True = this token was already rotated away
+    revoked:    Boolean (default False)  # True = force-revoked (logout / replay detected)
+    expires_at: DateTime(tz)             # Hard expiry; used for DB cleanup
+    created_at: DateTime(tz)             # Audit trail
+```
+
+**`used` vs `revoked`:**
+- `used = True` + `revoked = False` → normal rotation (legitimate previous use)
+- `used = True` + `revoked = True` → replay detected (security event)
+- `used = False` + `revoked = True` → explicit logout or admin revocation
+
+---
+
+### New Endpoints
+
+#### `POST /auth/login` (modified)
+Currently returns `{ access_token, token_type }`. Must also generate a refresh token row and return `refresh_token` in the response.
+
+**New response:**
+```json
+{ "access_token": "<jwt>", "refresh_token": "<opaque>", "token_type": "bearer" }
+```
+
+---
+
+#### `POST /auth/refresh`
+
+**Request body (JSON):**
+```json
+{ "refresh_token": "<opaque_token_string>" }
+```
+
+**Logic:**
+1. Hash the incoming token: `SHA-256(raw_token).hexdigest()`
+2. Look up row by `token_hash`
+3. Not found → 401 "Invalid refresh token"
+4. `revoked == True` → 401 "Token has been revoked"
+5. `used == True` → revoke entire `family_id` → 401 "Token reuse detected" *(replay attack)*
+6. `expires_at < now()` → 401 "Refresh token expired"
+7. Mark current row `used = True`
+8. Generate new raw token, store its hash with same `family_id`, `expires_at = now() + 7 days`
+9. Issue new `create_access_token({"sub": user.username})`
+
+**Response (200):**
+```json
+{ "access_token": "<new_jwt>", "refresh_token": "<new_opaque>", "token_type": "bearer" }
+```
+
+---
+
+#### `POST /auth/logout`
+
+**Request body (JSON):**
+```json
+{ "refresh_token": "<opaque_token_string>" }
+```
+
+**Logic:**
+1. Hash incoming token
+2. Look up row by `token_hash`
+3. If found and not revoked → set `revoked = True`, commit
+4. Always return **HTTP 204** regardless (do not leak whether token existed)
+
+---
+
+### Files Changed
+
+| File | Change |
+|---|---|
+| `auth/models.py` | Add `RefreshToken` ORM class |
+| `auth/schemas.py` | Add `refresh_token: str \| None = None` to `Token`; add `RefreshRequest` schema |
+| `auth/repository.py` | Add `create_refresh_token`, `get_refresh_token_by_hash`, `mark_token_used`, `revoke_family`, `revoke_token` |
+| `auth/jwt_utils.py` | Add `generate_refresh_token()` and `hash_token()` helpers |
+| `auth/router.py` | Modify `login`; add `POST /auth/refresh` and `POST /auth/logout` |
+| `alembic/env.py` | Import `RefreshToken` so autogenerate detects the new table |
+
+---
+
+### Migration Steps
+
+1. Add `RefreshToken` to `auth/models.py`
+2. Import it in `alembic/env.py`
+3. Run `alembic revision --autogenerate -m "create refresh_tokens table"`
+4. Inspect generated file — confirm only `create_table('refresh_tokens', ...)` with no drops
+5. Run `alembic upgrade head`
+
+---
+
+### Security Notes
+
+- **Never store the raw token** — only `hashlib.sha256(raw.encode()).hexdigest()`
+- **SHA-256 without salt** is safe here because `secrets.token_urlsafe(64)` produces 512 bits of entropy — rainbow tables are infeasible
+- **Expired token cleanup** — run `DELETE FROM refresh_tokens WHERE expires_at < NOW()` periodically (at login time or via a cron job) to prevent table bloat
+- **Revisit HttpOnly cookie** if a browser SPA is added as a client — the response body approach is correct only while clients are API/mobile/server-to-server
+
+---
+
+### TODO List
+
+| Step | File | Action |
+|---|---|---|
+| 20 | `auth/models.py` | Add `RefreshToken` ORM model |
+| 21 | `alembic/env.py` | Import `RefreshToken` for autogenerate |
+| 22 | `alembic/versions/` | Generate + apply `create_refresh_tokens_table` migration |
+| 23 | `auth/jwt_utils.py` | Add `generate_refresh_token()` and `hash_token()` |
+| 24 | `auth/schemas.py` | Update `Token` schema; add `RefreshRequest` schema |
+| 25 | `auth/repository.py` | Add refresh token CRUD functions |
+| 26 | `auth/router.py` | Modify `login`; add `/auth/refresh` and `/auth/logout` |
+| 27 | `.env` / `.env.example` | Add `JWT_REFRESH_TOKEN_EXPIRE_DAYS=7` |
+
+### Status
+
+✅ **Completed.** All 8 implementation steps (Steps 20–27) done and verified end-to-end (2026-06-27).
 
 ---
 
