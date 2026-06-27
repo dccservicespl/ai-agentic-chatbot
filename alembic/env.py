@@ -18,6 +18,7 @@ if config.config_file_name is not None:
 # Import Base and register all ORM models so autogenerate can detect them
 from ai_agentic_chatbot.infrastructure.database import Base
 import ai_agentic_chatbot.auth.models  # noqa: F401 — registers User with Base.metadata
+from pgvector.sqlalchemy import Vector  # noqa: F401 — registers vector type so Alembic does not warn on pgvector columns
 
 target_metadata = Base.metadata
 

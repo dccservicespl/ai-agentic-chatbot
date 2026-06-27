@@ -17,6 +17,7 @@ class UserResponse(BaseModel):
     email: str
     is_active: bool
     is_superuser: bool
+    daily_prompt_limit: int = 0
     created_at: datetime
 
 
@@ -45,3 +46,7 @@ class PasswordUpdateRequest(BaseModel):
 
 class PasswordUpdateResponse(BaseModel):
     message: str
+
+
+class PromptLimitUpdateRequest(BaseModel):
+    daily_prompt_limit: int = Field(..., ge=0)

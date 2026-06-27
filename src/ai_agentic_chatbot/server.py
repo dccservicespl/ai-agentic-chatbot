@@ -38,7 +38,7 @@ from ai_agentic_chatbot.utils.utils import get_db_connection_string
 from ai_agentic_chatbot.auth.router import router as auth_router
 from ai_agentic_chatbot.auth.dependencies import get_auth_db, get_current_user
 from ai_agentic_chatbot.auth.models import User
-from ai_agentic_chatbot.auth.repository import create_prompt_log
+from ai_agentic_chatbot.auth.repository import count_prompts_today, create_prompt_log
 
 load_dotenv()
 
@@ -254,6 +254,11 @@ async def stream_endpoint(
 
         if not messages:
             raise HTTPException(status_code=400, detail="messages cannot be empty")
+
+        if current_user.daily_prompt_limit > 0:
+            used_today = count_prompts_today(db, current_user.id)
+            if used_today >= current_user.daily_prompt_limit:
+                raise HTTPException(status_code=429, detail="Daily prompt limit reached")
 
         create_prompt_log(
             db,

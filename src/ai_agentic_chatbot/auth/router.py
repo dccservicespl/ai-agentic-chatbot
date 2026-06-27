@@ -13,11 +13,13 @@ from ai_agentic_chatbot.auth.repository import (
     create_refresh_token,
     get_refresh_token_by_hash,
     get_user_by_id,
+    get_user_by_username,
     mark_token_used,
     revoke_family,
     revoke_token,
+    update_user_prompt_limit,
 )
-from ai_agentic_chatbot.auth.schemas import LogoutRequest, PasswordUpdateRequest, PasswordUpdateResponse, RefreshRequest, Token, UserCreate, UserResponse
+from ai_agentic_chatbot.auth.schemas import LogoutRequest, PasswordUpdateRequest, PasswordUpdateResponse, PromptLimitUpdateRequest, RefreshRequest, Token, UserCreate, UserResponse
 from ai_agentic_chatbot.auth.service import authenticate_user, change_password, create_user_account
 
 router = APIRouter(prefix="/auth", tags=["Auth"])
@@ -170,3 +172,19 @@ def update_password(
 ):
     change_password(db, current_user, payload.current_password, payload.new_password)
     return PasswordUpdateResponse(message="Password updated successfully")
+
+
+@router.patch("/users/{username}/limit", response_model=UserResponse)
+def set_prompt_limit(
+    username: str,
+    payload: PromptLimitUpdateRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_auth_db),
+):
+    if not current_user.is_superuser:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Superuser access required")
+    target_user = get_user_by_username(db, username)
+    if target_user is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+    updated = update_user_prompt_limit(db, target_user, payload.daily_prompt_limit)
+    return UserResponse.model_validate(updated)

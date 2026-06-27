@@ -1,7 +1,7 @@
 import uuid
-from datetime import datetime
+from datetime import date, datetime, time, timezone
 
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
 from ai_agentic_chatbot.auth.models import User, RefreshToken, PromptLog
@@ -107,3 +107,21 @@ def create_prompt_log(
     db.commit()
     db.refresh(log)
     return log
+
+
+def count_prompts_today(db: Session, user_id: int) -> int:
+    today_start = datetime.combine(date.today(), time.min).replace(tzinfo=timezone.utc)
+    result = db.execute(
+        select(func.count()).select_from(PromptLog).where(
+            PromptLog.user_id == user_id,
+            PromptLog.created_at >= today_start,
+        )
+    ).scalar_one()
+    return result
+
+
+def update_user_prompt_limit(db: Session, user: User, limit: int) -> User:
+    user.daily_prompt_limit = limit
+    db.commit()
+    db.refresh(user)
+    return user
