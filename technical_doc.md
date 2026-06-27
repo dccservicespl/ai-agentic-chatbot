@@ -33,6 +33,8 @@
 25. [Visualization Analysis — Feature Plan](#25-visualization-analysis--feature-plan)
 26. [User Authentication Module — Implementation Plan](#26-user-authentication-module--implementation-plan)
 27. [JWT Refresh Token System — Design & Implementation Plan](#27-jwt-refresh-token-system--design--implementation-plan)
+28. [Alembic vs Docker — Migration System Clash Analysis](#28-alembic-vs-docker--migration-system-clash-analysis)
+29. [User Prompt Management — Implementation Plan](#29-user-prompt-management--implementation-plan)
 
 ---
 
@@ -4706,4 +4708,269 @@ Currently returns `{ access_token, token_type }`. Must also generate a refresh t
 
 ---
 
-*Generated: 2026-05-29 | Updated: 2026-06-26 | Repository: `ai-agentic-chatbot` | Branch: `21-fix-round-crashes-on-double-precision-postgressql`*
+---
+
+## 28. Alembic vs Docker — Migration System Clash Analysis
+
+> ⚠️ **Priority: HIGH** — Must be resolved before any production deployment involving schema changes. App will crash on a fresh DB or after new migrations if left unaddressed.
+
+### Background
+
+Database migrations are managed by **Alembic** (`alembic/`, `alembic.ini`). The application is containerised via **Docker** (`Dockerfile`, `entrypoint.sh`, `docker-compose.yml`, `docker-compose.prod.yml`). These two systems currently do not talk to each other, creating three critical gaps.
+
+---
+
+### Issue 1 — CRITICAL: `alembic/` is not copied into the Docker image
+
+**What the Dockerfile copies:**
+
+```
+COPY src/           → app source code
+COPY certs/         → TLS certificates
+COPY config.example.yaml
+COPY entrypoint.sh
+```
+
+`alembic/` and `alembic.ini` are **not `COPY`-ed**. The `alembic` CLI cannot be invoked from inside any running container — the files simply do not exist there.
+
+**Impact:** Migrations must be run manually from the developer's machine before every deploy. This is invisible to the Docker workflow and trivially easy to forget, especially in CI/CD pipelines.
+
+---
+
+### Issue 2 — CRITICAL: No migration step runs before the application starts
+
+`entrypoint.sh` flow:
+
+```
+1. Validate required env vars
+2. Wait for PostgreSQL (TCP probe — up to 60s)
+3. exec uvicorn   ← app starts immediately, no alembic upgrade head
+```
+
+There is no `alembic upgrade head` between steps 2 and 3. On a fresh database — or after any new migration is added (e.g., `users` table, `refresh_tokens` table) — the container starts, uvicorn boots, and the first authenticated request hits a `relation "users" does not exist` error.
+
+**Affected migrations already in the repo:**
+
+| Migration | Table |
+|---|---|
+| `afab544e8c58` | `users` |
+| `65c0b5446016` | `refresh_tokens` |
+
+---
+
+### Issue 3 — MODERATE: `prepend_sys_path` is wrong for local Alembic runs
+
+`alembic.ini` line 21:
+
+```ini
+prepend_sys_path = .
+```
+
+This adds the project root (`.`) to `sys.path`. But the `ai_agentic_chatbot` package lives under `src/`, so the import in `alembic/env.py`:
+
+```python
+from ai_agentic_chatbot.infrastructure.database import Base
+import ai_agentic_chatbot.auth.models
+```
+
+...will raise `ModuleNotFoundError` unless `PYTHONPATH=src` is set in the shell before invoking `alembic`. The Dockerfile sets `ENV PYTHONPATH=/app/src`, but since `alembic/` is not in the image, that env var never helps.
+
+**Result:** Developers must remember to run `$env:PYTHONPATH="src"; alembic upgrade head` (PowerShell) or `PYTHONPATH=src alembic upgrade head` (bash) — an undocumented requirement.
+
+---
+
+### Fix Plan
+
+#### Fix 1 — Copy alembic files into the Docker image (`Dockerfile`)
+
+```dockerfile
+# After the COPY src/ line:
+COPY alembic/ ./alembic/
+COPY alembic.ini ./
+```
+
+#### Fix 2 — Run migrations in entrypoint (`entrypoint.sh`)
+
+Add one line between the DB-wait block and `exec "$@"`:
+
+```sh
+echo "Running database migrations..."
+alembic upgrade head
+```
+
+Full corrected entrypoint flow:
+```
+1. Validate env vars
+2. Wait for PostgreSQL
+3. alembic upgrade head   ← NEW
+4. exec uvicorn
+```
+
+This makes every container start idempotent — Alembic detects if the schema is already current and exits instantly (no-op), so the overhead on restarts is negligible.
+
+#### Fix 3 — Fix `prepend_sys_path` in `alembic.ini`
+
+```ini
+# Before:
+prepend_sys_path = .
+
+# After:
+prepend_sys_path = src
+```
+
+This allows `alembic` commands to work from the project root without any manual `PYTHONPATH` export.
+
+---
+
+### Summary Table
+
+| # | Issue | Severity | Fix Location |
+|---|---|---|---|
+| 1 | `alembic/` and `alembic.ini` not in Docker image | **Critical** | `Dockerfile` — add two `COPY` lines |
+| 2 | No `alembic upgrade head` before uvicorn starts | **Critical** | `entrypoint.sh` — add one line after DB wait |
+| 3 | `prepend_sys_path = .` breaks local `alembic` CLI | **Moderate** | `alembic.ini` — change `.` to `src` |
+
+---
+
+### TODO List
+
+| Step | File | Action |
+|---|---|---|
+| 1 | `Dockerfile` | Add `COPY alembic/ ./alembic/` and `COPY alembic.ini ./` after the `COPY src/` line |
+| 2 | `entrypoint.sh` | Add `alembic upgrade head` after the PostgreSQL wait block, before `exec "$@"` |
+| 3 | `alembic.ini` | Change `prepend_sys_path = .` to `prepend_sys_path = src` |
+| 4 | Manual test | Build image, start container against a fresh DB, confirm tables are created before uvicorn accepts traffic |
+
+### Status
+
+Pending — analysis recorded 2026-06-27. No code changes made yet.
+
+---
+
+---
+
+## 29. User Prompt Management — Implementation Plan
+
+Three related features: password self-service, prompt audit logging, and per-user daily limits. Features 1 and 2 are independent; Feature 3 depends on Feature 2.
+
+```
+Feature 1 (password update)  — no DB schema change, ship independently
+     ↓
+Feature 2 (save prompts)     — new prompt_logs table (migration required)
+     ↓
+Feature 3 (daily limit)      — new column on users + reads prompt_logs
+```
+
+---
+
+### Codebase Baseline (as of 2026-06-27)
+
+**User ORM columns (`auth/models.py`):** `id`, `username`, `email`, `hashed_password`, `is_active`, `is_superuser`, `created_at`, `updated_at` — no usage-tracking fields.
+
+**`/stream` handler (`server.py:244`):** Already has `current_user: User = Depends(get_current_user)` and `stream_request: StreamRequest` in scope. `current_user` is currently unused beyond being an auth gate.
+
+**Existing migrations:** `afab544e8c58` (users table) → `65c0b5446016` (refresh_tokens table).
+
+**No password update path exists** anywhere in `repository.py`, `service.py`, or `router.py`.
+
+---
+
+### Feature 1 — `PATCH /auth/password` (Self-Service Password Update)
+
+Username is taken from the authenticated JWT — not the request body. The caller must supply their current password to prove identity before setting a new one.
+
+| Step | File | Action |
+|---|---|---|
+| 1.1 | `auth/schemas.py` | Add `PasswordUpdateRequest(BaseModel)` — fields: `current_password: str`, `new_password: str` (enforce min length 8). Add `PasswordUpdateResponse(BaseModel)` — field: `message: str`. |
+| 1.2 | `auth/repository.py` | Add `update_user_password(db, user: User, new_hashed: str) -> User` — sets `user.hashed_password = new_hashed`, calls `db.commit()`, `db.refresh(user)`, returns user. `updated_at` auto-fires via ORM `onupdate`. |
+| 1.3 | `auth/service.py` | Add `change_password(db, current_user, current_password, new_password)` — calls `verify_password(current_password, current_user.hashed_password)`, raises `HTTP 400` if wrong, calls `hash_password(new_password)`, calls `update_user_password`. |
+| 1.4 | `auth/router.py` | Add `PATCH /auth/password` route — protected by `get_current_user`. Body: `PasswordUpdateRequest`. Calls `service.change_password(...)`. Returns `PasswordUpdateResponse`. |
+
+---
+
+### Feature 2 — Save Prompts to DB on Every `/stream` Call
+
+New `prompt_logs` table stores each prompt with a FK to the submitting user and the conversation thread.
+
+#### 2a. New ORM Model (`auth/models.py`)
+
+Add `PromptLog` class to the existing models file:
+
+| Column | Type | Constraints |
+|---|---|---|
+| `id` | `BigInteger` | PK, autoincrement |
+| `user_id` | `BigInteger` | FK → `users.id` ON DELETE CASCADE, indexed |
+| `thread_id` | `String(255)` | not null |
+| `prompt_text` | `Text` | not null |
+| `created_at` | `DateTime(timezone=True)` | not null, server_default `now()` |
+
+#### 2b. Migration
+
+| Step | File | Action |
+|---|---|---|
+| 2.1 | `auth/models.py` | Add `PromptLog` ORM class (columns above). |
+| 2.2 | `alembic/versions/` | Run `alembic revision --autogenerate -m "create prompt_logs table"`. Inspect output — confirm only `create_table('prompt_logs', ...)` with no drops. Run `alembic upgrade head`. |
+
+#### 2c. Repository + Handler
+
+| Step | File | Action |
+|---|---|---|
+| 2.3 | `auth/repository.py` | Add `create_prompt_log(db, user_id: int, thread_id: str, prompt_text: str) -> PromptLog` — creates and commits a `PromptLog` row. |
+| 2.4 | `server.py` | Inject `db: Session = Depends(get_auth_db)` into the `/stream` handler (alongside the existing `current_user` dependency). Before invoking the LangGraph agent, call `create_prompt_log(db, current_user.id, stream_request.thread_id, stream_request.messages[-1].content)`. |
+
+---
+
+### Feature 3 — Configurable Daily Prompt Limit per User
+
+`daily_prompt_limit = 0` means unlimited. The limit check happens in `/stream` before the graph is invoked, so no LLM tokens are burned on rejected requests.
+
+**Requires Feature 2** (`prompt_logs` table must exist before this feature can query it).
+
+#### 3a. Schema Change
+
+| Step | File | Action |
+|---|---|---|
+| 3.1 | `auth/models.py` | Add `daily_prompt_limit` column to `User` — `Column(Integer, nullable=False, server_default="0")`. |
+| 3.2 | `alembic/versions/` | Run `alembic revision --autogenerate -m "add daily_prompt_limit to users"`. Inspect — confirm only `add_column('users', Column('daily_prompt_limit', Integer, ...))`. Run `alembic upgrade head`. |
+| 3.3 | `auth/schemas.py` | Add `daily_prompt_limit: int = 0` to `UserResponse` so `GET /auth/me` exposes the field. |
+
+#### 3b. Limit Check Logic
+
+| Step | File | Action |
+|---|---|---|
+| 3.4 | `auth/repository.py` | Add `count_prompts_today(db, user_id: int) -> int` — queries `PromptLog` where `user_id = user_id` AND `created_at >= today 00:00 UTC`. Returns integer count. |
+| 3.5 | `server.py` | In `/stream`, after saving the prompt log (Feature 2 step 2.4), add: if `current_user.daily_prompt_limit > 0` and `count_prompts_today(db, current_user.id) > current_user.daily_prompt_limit`, raise `HTTP 429` with detail `"Daily prompt limit reached"`. |
+
+#### 3c. Admin Endpoint to Set Limits
+
+| Step | File | Action |
+|---|---|---|
+| 3.6 | `auth/schemas.py` | Add `PromptLimitUpdateRequest(BaseModel)` — field: `daily_prompt_limit: int` (must be >= 0). |
+| 3.7 | `auth/repository.py` | Add `update_user_prompt_limit(db, user: User, limit: int) -> User` — sets `user.daily_prompt_limit = limit`, commits. |
+| 3.8 | `auth/router.py` | Add `PATCH /auth/users/{username}/limit` route — superuser-only (guard: `if not current_user.is_superuser: raise HTTP 403`). Looks up target user by username, calls `update_user_prompt_limit`. Returns updated `UserResponse`. |
+
+---
+
+### Full Execution Order
+
+```
+Step 1.1 → 1.2 → 1.3 → 1.4   (Feature 1 — password update, no migration)
+     ↓
+Step 2.1 → 2.2 (migration)    (Feature 2a — create prompt_logs table)
+     ↓
+Step 2.3 → 2.4                (Feature 2b — repository + hook into /stream)
+     ↓
+Step 3.1 → 3.2 (migration)    (Feature 3a — add daily_prompt_limit to users)
+     ↓
+Step 3.3 → 3.4 → 3.5          (Feature 3b — limit check in /stream)
+     ↓
+Step 3.6 → 3.7 → 3.8          (Feature 3c — admin limit-setting endpoint)
+```
+
+### Status
+
+Pending — plan recorded 2026-06-27. No code changes made yet.
+
+---
+
+*Generated: 2026-05-29 | Updated: 2026-06-27 | Repository: `ai-agentic-chatbot` | Branch: `21-fix-round-crashes-on-double-precision-postgressql`*

@@ -28,3 +28,18 @@ def create_user_account(session: Session, user_data: UserCreate) -> User:
         email=user_data.email,
         hashed_password=hash_password(user_data.password),
     )
+
+
+def change_password(
+    db: Session,
+    current_user: User,
+    current_password: str,
+    new_password: str,
+) -> User:
+    from .password import verify_password, hash_password
+    from .repository import update_user_password
+    from fastapi import HTTPException
+    if not verify_password(current_password, current_user.hashed_password):
+        raise HTTPException(status_code=400, detail="Current password is incorrect")
+    new_hashed = hash_password(new_password)
+    return update_user_password(db, current_user, new_hashed)

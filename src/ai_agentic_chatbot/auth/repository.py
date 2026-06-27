@@ -4,7 +4,7 @@ from datetime import datetime
 from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
-from ai_agentic_chatbot.auth.models import User, RefreshToken
+from ai_agentic_chatbot.auth.models import User, RefreshToken, PromptLog
 
 
 def get_user_by_username(session: Session, username: str) -> User | None:
@@ -86,3 +86,24 @@ def revoke_token(session: Session, token_id: uuid.UUID) -> None:
         update(RefreshToken).where(RefreshToken.id == token_id).values(revoked=True)
     )
     session.commit()
+
+
+def update_user_password(db: Session, user: User, new_hashed: str) -> User:
+    user.hashed_password = new_hashed
+    db.commit()
+    db.refresh(user)
+    return user
+
+
+def create_prompt_log(
+    db: Session,
+    *,
+    user_id: int,
+    thread_id: str,
+    prompt_text: str,
+) -> PromptLog:
+    log = PromptLog(user_id=user_id, thread_id=thread_id, prompt_text=prompt_text)
+    db.add(log)
+    db.commit()
+    db.refresh(log)
+    return log

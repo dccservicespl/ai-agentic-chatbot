@@ -17,8 +17,8 @@ from ai_agentic_chatbot.auth.repository import (
     revoke_family,
     revoke_token,
 )
-from ai_agentic_chatbot.auth.schemas import LogoutRequest, RefreshRequest, Token, UserCreate, UserResponse
-from ai_agentic_chatbot.auth.service import authenticate_user, create_user_account
+from ai_agentic_chatbot.auth.schemas import LogoutRequest, PasswordUpdateRequest, PasswordUpdateResponse, RefreshRequest, Token, UserCreate, UserResponse
+from ai_agentic_chatbot.auth.service import authenticate_user, change_password, create_user_account
 
 router = APIRouter(prefix="/auth", tags=["Auth"])
 
@@ -160,3 +160,13 @@ def logout(body: LogoutRequest, db: Session = Depends(get_auth_db)):
 )
 def me(current_user: User = Depends(get_current_user)):
     return UserResponse.model_validate(current_user)
+
+
+@router.patch("/password", response_model=PasswordUpdateResponse)
+def update_password(
+    payload: PasswordUpdateRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_auth_db),
+):
+    change_password(db, current_user, payload.current_password, payload.new_password)
+    return PasswordUpdateResponse(message="Password updated successfully")

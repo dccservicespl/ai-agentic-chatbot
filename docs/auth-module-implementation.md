@@ -2069,3 +2069,233 @@ All checks passed.
 ---
 
 Once all assertions pass, Step 27 is complete. The refresh token system is fully implemented and live.
+
+---
+
+## Feature 1 — Self-Service Password Update (`PATCH /auth/password`)
+
+This feature lets an authenticated user change their own password by supplying their current password alongside the desired new one. The endpoint validates the current password with bcrypt, rejects passwords shorter than 8 characters, and persists the new bcrypt hash — all without requiring superuser privileges.
+
+---
+
+### Step 1: Edit `auth/schemas.py`
+
+**1.1 — Open** `src/ai_agentic_chatbot/auth/schemas.py`.
+
+**1.2 — Find** the existing import line at the top of the file:
+
+```python
+from pydantic import BaseModel, ConfigDict
+```
+
+**Replace it with** (add `Field`):
+
+```python
+from pydantic import BaseModel, ConfigDict, Field
+```
+
+**1.3 — Find** the last class in the file:
+
+```python
+class LogoutRequest(BaseModel):
+    refresh_token: str
+```
+
+**Append** the two new models immediately after it:
+
+```python
+class PasswordUpdateRequest(BaseModel):
+    current_password: str
+    new_password: str = Field(..., min_length=8)
+
+
+class PasswordUpdateResponse(BaseModel):
+    message: str
+```
+
+---
+
+### Step 2: Edit `auth/repository.py`
+
+**2.1 — Open** `src/ai_agentic_chatbot/auth/repository.py`.
+
+**2.2 — Scroll to the very end of the file** (after `revoke_token`).
+
+**2.3 — Append** the following function:
+
+```python
+def update_user_password(db: Session, user: User, new_hashed: str) -> User:
+    user.hashed_password = new_hashed
+    db.commit()
+    db.refresh(user)
+    return user
+```
+
+> No new imports are needed — `Session` and `User` are already imported at the top of the file.
+
+---
+
+### Step 3: Edit `auth/service.py`
+
+**3.1 — Open** `src/ai_agentic_chatbot/auth/service.py`.
+
+**3.2 — Scroll to the very end of the file** (after `create_user_account`).
+
+**3.3 — Append** the following function:
+
+```python
+def change_password(
+    db: Session,
+    current_user: User,
+    current_password: str,
+    new_password: str,
+) -> User:
+    from .password import verify_password, hash_password
+    from .repository import update_user_password
+    from fastapi import HTTPException
+    if not verify_password(current_password, current_user.hashed_password):
+        raise HTTPException(status_code=400, detail="Current password is incorrect")
+    new_hashed = hash_password(new_password)
+    return update_user_password(db, current_user, new_hashed)
+```
+
+> The three `from` imports are intentionally local to this function — they avoid circular imports and keep the module-level import list unchanged.
+
+---
+
+### Step 4: Edit `auth/router.py`
+
+**4.1 — Open** `src/ai_agentic_chatbot/auth/router.py`.
+
+**4.2 — Find** the schemas import line:
+
+```python
+from ai_agentic_chatbot.auth.schemas import LogoutRequest, RefreshRequest, Token, UserCreate, UserResponse
+```
+
+**Replace it with** (add `PasswordUpdateRequest` and `PasswordUpdateResponse`):
+
+```python
+from ai_agentic_chatbot.auth.schemas import LogoutRequest, PasswordUpdateRequest, PasswordUpdateResponse, RefreshRequest, Token, UserCreate, UserResponse
+```
+
+**4.3 — Find** the service import line:
+
+```python
+from ai_agentic_chatbot.auth.service import authenticate_user, create_user_account
+```
+
+**Replace it with** (add `change_password`):
+
+```python
+from ai_agentic_chatbot.auth.service import authenticate_user, change_password, create_user_account
+```
+
+**4.4 — Find** the end of the `GET /me` route handler:
+
+```python
+def me(current_user: User = Depends(get_current_user)):
+    return UserResponse.model_validate(current_user)
+```
+
+**Append** the new route immediately after it:
+
+```python
+@router.patch("/password", response_model=PasswordUpdateResponse)
+def update_password(
+    payload: PasswordUpdateRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_auth_db),
+):
+    change_password(db, current_user, payload.current_password, payload.new_password)
+    return PasswordUpdateResponse(message="Password updated successfully")
+```
+
+---
+
+### Manual Test
+
+Ensure the server is running (`uvicorn` or however you start it locally), then run:
+
+```bash
+python -c "
+import requests
+
+BASE = 'http://localhost:8000'
+USERNAME = 'admin'
+OLD_PASSWORD = '<your current password>'
+NEW_PASSWORD = 'newpassword99'
+
+# --- Step 1: Login with current credentials ---
+r = requests.post(f'{BASE}/auth/login', data={'username': USERNAME, 'password': OLD_PASSWORD})
+print('Login status         :', r.status_code)           # expect 200
+assert r.status_code == 200
+access_token = r.json()['access_token']
+print('Access token         :', access_token[:30], '...')
+
+headers = {'Authorization': f'Bearer {access_token}'}
+
+# --- Step 2: Change password ---
+r = requests.patch(
+    f'{BASE}/auth/password',
+    json={'current_password': OLD_PASSWORD, 'new_password': NEW_PASSWORD},
+    headers=headers,
+)
+print('PATCH /password      :', r.status_code)           # expect 200
+print('Response body        :', r.json())
+assert r.status_code == 200
+assert r.json()['message'] == 'Password updated successfully'
+
+# --- Step 3: Login with the new password ---
+r = requests.post(f'{BASE}/auth/login', data={'username': USERNAME, 'password': NEW_PASSWORD})
+print('Login (new password) :', r.status_code)           # expect 200
+assert r.status_code == 200
+
+# --- Step 4: Confirm old password is rejected ---
+r = requests.post(f'{BASE}/auth/login', data={'username': USERNAME, 'password': OLD_PASSWORD})
+print('Login (old password) :', r.status_code)           # expect 401
+assert r.status_code == 401
+
+# --- Step 5: Confirm wrong current_password is rejected ---
+r2 = requests.post(f'{BASE}/auth/login', data={'username': USERNAME, 'password': NEW_PASSWORD})
+token2 = r2.json()['access_token']
+r = requests.patch(
+    f'{BASE}/auth/password',
+    json={'current_password': 'wrongpassword', 'new_password': 'doesnotmatter'},
+    headers={'Authorization': f'Bearer {token2}'},
+)
+print('Wrong current pwd    :', r.status_code)           # expect 400
+assert r.status_code == 400
+
+# --- Step 6: Confirm short new_password is rejected ---
+r = requests.patch(
+    f'{BASE}/auth/password',
+    json={'current_password': NEW_PASSWORD, 'new_password': 'short'},
+    headers={'Authorization': f'Bearer {token2}'},
+)
+print('Short new password   :', r.status_code)           # expect 422
+assert r.status_code == 422
+
+print()
+print('All checks passed.')
+"
+```
+
+Expected output:
+
+```
+Login status         : 200
+Access token         : eyJhbGciOiJIUzI1NiIsInR5cCI6...
+PATCH /password      : 200
+Response body        : {'message': 'Password updated successfully'}
+Login (new password) : 200
+Login (old password) : 401
+Wrong current pwd    : 400
+Short new password   : 422
+
+All checks passed.
+```
+
+---
+
+Once all assertions pass, Feature 1 is complete. Authenticated users can now change their own password via `PATCH /auth/password`.

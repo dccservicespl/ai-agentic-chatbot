@@ -36,8 +36,9 @@ from ai_agentic_chatbot.application.transform_schema_to_text import (
 )
 from ai_agentic_chatbot.utils.utils import get_db_connection_string
 from ai_agentic_chatbot.auth.router import router as auth_router
-from ai_agentic_chatbot.auth.dependencies import get_current_user
+from ai_agentic_chatbot.auth.dependencies import get_auth_db, get_current_user
 from ai_agentic_chatbot.auth.models import User
+from ai_agentic_chatbot.auth.repository import create_prompt_log
 
 load_dotenv()
 
@@ -241,7 +242,11 @@ def build_stream_response_data(content: str, accumulated_state: dict) -> dict:
         500: {"description": "Internal server error during agent execution"},
     },
 )
-async def stream_endpoint(stream_request: StreamRequest, current_user: User = Depends(get_current_user)):
+async def stream_endpoint(
+    stream_request: StreamRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_auth_db),
+):
     """Streams agent responses using Server-Sent Events."""
     try:
         thread_id = stream_request.thread_id
@@ -249,6 +254,13 @@ async def stream_endpoint(stream_request: StreamRequest, current_user: User = De
 
         if not messages:
             raise HTTPException(status_code=400, detail="messages cannot be empty")
+
+        create_prompt_log(
+            db,
+            user_id=current_user.id,
+            thread_id=thread_id,
+            prompt_text=messages[-1].content,
+        )
 
         config = {"configurable": {"thread_id": thread_id}}
         inputs = {"messages": [HumanMessage(content=messages[-1].content)]}
