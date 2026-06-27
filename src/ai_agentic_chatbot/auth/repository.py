@@ -125,3 +125,7 @@ def update_user_prompt_limit(db: Session, user: User, limit: int) -> User:
     db.commit()
     db.refresh(user)
     return user
+
+
+def get_all_users(db: Session) -> list[User]:
+    return list(db.execute(select(User).order_by(User.id)).scalars().all())

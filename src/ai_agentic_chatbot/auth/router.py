@@ -1,4 +1,5 @@
 import os
+from typing import Optional, Union
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -11,6 +12,7 @@ from ai_agentic_chatbot.auth.jwt_utils import create_access_token, generate_refr
 from ai_agentic_chatbot.auth.models import User
 from ai_agentic_chatbot.auth.repository import (
     create_refresh_token,
+    get_all_users,
     get_refresh_token_by_hash,
     get_user_by_id,
     get_user_by_username,
@@ -188,3 +190,27 @@ def set_prompt_limit(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
     updated = update_user_prompt_limit(db, target_user, payload.daily_prompt_limit)
     return UserResponse.model_validate(updated)
+
+
+@router.get(
+    "/users",
+    summary="List users or fetch a single user by username",
+    description=(
+        "Superuser-only. With no query parameter returns all users ordered by ID. "
+        "Pass `?username=foo` to fetch a specific user's details (HTTP 404 if not found). "
+        "Returns HTTP 403 for non-superusers."
+    ),
+)
+def list_users(
+    username: Optional[str] = None,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_auth_db),
+) -> Union[UserResponse, list[UserResponse]]:
+    if not current_user.is_superuser:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Superuser access required")
+    if username:
+        user = get_user_by_username(db, username)
+        if user is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+        return UserResponse.model_validate(user)
+    return [UserResponse.model_validate(u) for u in get_all_users(db)]

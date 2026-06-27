@@ -313,6 +313,8 @@ async def stream_endpoint(
 
         return StreamingResponse(event_generator(), media_type="text/event-stream")
 
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"[API ERROR] {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
