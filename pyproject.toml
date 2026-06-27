@@ -3,7 +3,7 @@ name = "ai-agentic-chatbot"
 version = "0.1.0"
 description = ""
 authors = [
-    {name = "arijitdcc",email = "asarkar@dccil.com"}
+    { name = "arijitdcc", email = "asarkar@dccil.com" }
 ]
 readme = "README.md"
 requires-python = ">=3.13,<4.0.0"
@@ -26,11 +26,15 @@ dependencies = [
     "langchain-postgres (>=0.0.16,<0.0.17)",
     "pandas (>=2.0.0,<3.0.0)",
     "sqlparse (>=0.4.0,<1.0.0)",
-    "pandas-stubs (>=2.3.3,<2.4.0)"
+    "pandas-stubs (>=2.3.3,<2.4.0)",
+    "python-jose[cryptography] (>=3.3.0,<4.0.0)",
+    "passlib[bcrypt] (>=1.7.4,<2.0.0)",
+    "python-multipart (>=0.0.9,<1.0.0)",
+    "alembic (>=1.13.0,<2.0.0)"
 ]
 
 [tool.poetry]
-packages = [{include = "ai_agentic_chatbot", from = "src"}]
+packages = [{ include = "ai_agentic_chatbot", from = "src" }]
 
 
 [tool.poetry.group.dev.dependencies]
