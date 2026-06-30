@@ -34,7 +34,9 @@
 26. [User Authentication Module — Implementation Plan](#26-user-authentication-module--implementation-plan)
 27. [JWT Refresh Token System — Design & Implementation Plan](#27-jwt-refresh-token-system--design--implementation-plan)
 28. [Alembic vs Docker — Migration System Clash Analysis](#28-alembic-vs-docker--migration-system-clash-analysis)
-29. [User Prompt Management — Implementation Plan](#29-user-prompt-management--implementation-plan)
+29. [User Prompt Management — Implementation Plan ✅ COMPLETED](#29-user-prompt-management--implementation-plan-completed)
+30. [Multi-Database Context Support — Architecture & TODO List](#30-multi-database-context-support--architecture--todo-list)
+31. [Database Structure for Multi-Context — Decision & Schema Design](#31-database-structure-for-multi-context--decision--schema-design)
 
 ---
 
@@ -4849,7 +4851,7 @@ Pending — analysis recorded 2026-06-27. No code changes made yet.
 
 ---
 
-## 29. User Prompt Management — Implementation Plan
+## 29. User Prompt Management — Implementation Plan ✅ COMPLETED
 
 Three related features: password self-service, prompt audit logging, and per-user daily limits. Features 1 and 2 are independent; Feature 3 depends on Feature 2.
 
@@ -4973,4 +4975,624 @@ Pending — plan recorded 2026-06-27. No code changes made yet.
 
 ---
 
-*Generated: 2026-05-29 | Updated: 2026-06-27 | Repository: `ai-agentic-chatbot` | Branch: `21-fix-round-crashes-on-double-precision-postgressql`*
+---
+
+## 30. Multi-Database Context Support — Architecture & TODO List
+
+> **Goal:** Allow the chatbot to serve multiple isolated database "contexts" — each with its own set of tables, schema files, vector collection, and system prompt — while keeping the underlying process flow (query → LLM → SQL → DB → response) fully intact. Some table names may be identical across contexts.
+
+> **Decision:** Use **one PostgreSQL database with multiple PostgreSQL schemas** (one schema per context) within the **existing codebase**. See [Section 31](#31-database-structure-for-multi-context--decision--schema-design) for the full rationale, including why a separate codebase was rejected.
+
+> **Implementation note (validated 2026-06-30):** Auth tables (`users`, `refresh_tokens`, `prompt_logs`) stay in the `public` schema — zero changes to `auth/models.py` or existing migrations. Only new tables (`db_contexts`, `user_contexts`) are created in the `app` schema. All work happens in a dedicated feature branch. See feature branch guidance below.
+
+---
+
+### Known Issues & Fixes (discovered during plan review, 2026-06-30)
+
+| Priority | Issue | Location | Fix |
+|---|---|---|---|
+| P0 | `SET LOCAL search_path` fails silently with `autocommit=True` — queries run against wrong schema | `execute_query.py:37–38` / TODO 15 | Use explicit transaction (`conn.begin()`), include `public` in path — see TODO 15 |
+| P1 | `ctx.schema_name` interpolated into SQL string with no validation — SQL injection risk | TODO 15 | Validate schema name against `^[a-z_][a-z0-9_]*$` before use |
+| P1 | `ingest_vector_schema.py:21` hardcodes `"db_schema_vectors"` — not covered by TODO 7 | `application/ingest_vector_schema.py` | Add to TODO 7 touch-point list |
+| P1 | Dual source of truth: config.yaml vs. DB for contexts — no reconciliation | TODOs 1, 3, 5 | config.yaml is the source of truth; DB is seeded from it at startup — see TODO 5 |
+| P1 | `alembic/env.py` `include_object` will not detect `app`-schema ORM models for autogenerate | `alembic/env.py:26–35` | Fix before any `--autogenerate` run; write first migration by hand |
+| P2 | `GRANT ALL PRIVILEGES ON ALL TABLES` does not cover future tables | Section 31 Bootstrap SQL | Add `ALTER DEFAULT PRIVILEGES` — see Section 31 |
+| P2 | `user_contexts.is_default` has no DB-level uniqueness constraint | TODO 3 | Add partial unique index `WHERE is_default = TRUE` |
+| P2 | No error when user has zero assigned contexts — unhandled 500 | TODO 18 | Return `HTTP 422` with clear message |
+| P2 | Full schema docs injected on every request including greetings — high token cost | TODO 20 | Use `schema_summary.json` instead of full table docs for prompt injection |
+| P3 | Context CRUD placed in `auth/repository.py` — wrong module | TODO 4 | Move to new `context/repository.py` |
+| P3 | Context switching within same `thread_id` is undefined | TODO 10 | Document behavior — require new `thread_id` per context switch |
+| P3 | `"No code changes needed for a new context"` claim is misleading | Section 31 | Corrected — lists all 9 required infrastructure steps |
+
+---
+
+### Feature Branch & Pre-flight
+
+#### Create a dedicated feature branch
+
+All work in Phases 1–8 must be done in a new branch, never directly on `develop`. The existing auth system is working and any regression there is a user-facing security failure.
+
+```bash
+git checkout develop
+git pull origin develop
+git checkout -b 30-feat-multi-context-schema-routing
+```
+
+#### `auth/models.py` — no changes needed ✅
+
+The existing ORM models (`User`, `RefreshToken`, `PromptLog`) have no `schema=` argument and FK strings are bare (`"users.id"`). **Leave them exactly as they are.** The auth tables stay in the `public` schema permanently. The `get_auth_db()` session used by all auth endpoints never goes through `execute_query.py`, so the `SET LOCAL search_path` the SQL agent uses does not affect the auth system at all.
+
+#### Existing migration files — do not edit ✅
+
+The 4 existing migrations (`afab544e8c58`, `65c0b5446016`, `9927490b88de`, `1ab190c811b5`) are already applied. Do not edit them. Do not run `ALTER TABLE ... SET SCHEMA`. The first new migration is purely additive — see Section 31 for the correct migration template.
+
+#### `alembic/env.py` — one fix required before autogenerate
+
+The `include_object` function (lines 26–35) uses `name in Base.metadata.tables` to detect tables. For schema-qualified ORM models (e.g., `app.db_contexts`), the metadata key is `"app.db_contexts"` but `name` is just `"db_contexts"` — so autogenerate silently ignores new `app`-schema tables. **Write the first multi-context migration by hand** (not `--autogenerate`). Fix `include_object` on this branch before any future `--autogenerate` runs.
+
+---
+
+### Phase 1 — Context Registry (Config & DB Layer)
+
+#### TODO 1 — Define a `DbContext` config schema in `config.yaml`
+
+Add a `contexts:` block. Each entry contains: `context_id` (unique slug), `schema_name` (PostgreSQL schema, e.g. `context_sales`), `include_tables` (list), `system_prompt_path`, `router_prompt_path`, and `schema_dir` (e.g. `temp/context_sales/`). The `vector_collection_name` field maps to the `collection_name` used in `langchain_pg_collection`.
+
+```yaml
+contexts:
+  sales:
+    schema_name: context_sales
+    include_tables: [orders, customer, product, inventory, v_sales_summary]
+    system_prompt_path: src/ai_agentic_chatbot/prompts/context_sales/system_prompt.md
+    router_prompt_path: src/ai_agentic_chatbot/prompts/context_sales/router_prompt.md
+    schema_dir: temp/context_sales/
+    vector_collection_name: context_sales_vectors
+  hr:
+    schema_name: context_hr
+    include_tables: [orders, employee, department]
+    system_prompt_path: src/ai_agentic_chatbot/prompts/context_hr/system_prompt.md
+    router_prompt_path: src/ai_agentic_chatbot/prompts/context_hr/router_prompt.md
+    schema_dir: temp/context_hr/
+    vector_collection_name: context_hr_vectors
+```
+
+#### TODO 2 — Create a `DbContextRegistry` settings class
+
+Create `infrastructure/context/context_settings.py`. Reads and validates the `contexts:` block from `config.yaml`. Exposes `get_context(context_id: str) -> DbContextConfig` (raises `KeyError` on unknown IDs). Follow the same singleton pattern as `DataSourceSettings`.
+
+#### TODO 3 — Add `db_contexts` and `user_contexts` tables via Alembic
+
+**`db_contexts` table** (schema `app`):
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | BigInteger PK | autoincrement |
+| `context_id` | String(100) | unique slug, e.g. `sales` |
+| `display_name` | String(255) | human-readable label |
+| `schema_name` | String(100) | PostgreSQL schema name, e.g. `context_sales` |
+| `system_prompt_path` | Text | file path for this context's system prompt |
+| `router_prompt_path` | Text | file path for router prompt |
+| `schema_dir` | Text | local directory for temp schema files |
+| `vector_collection_name` | String(255) | pgvector collection name |
+| `include_tables` | JSONB | list of table names to introspect |
+| `is_active` | Boolean | default True |
+| `created_at` | DateTime | server_default now() |
+
+**`user_contexts` table** (schema `app`, many-to-many: users ↔ contexts):
+
+| Column | Type | Notes |
+|---|---|---|
+| `user_id` | BigInteger | FK → `public.users.id` ON DELETE CASCADE — auth tables stay in `public` |
+| `context_id` | BigInteger | FK → `app.db_contexts.id` ON DELETE CASCADE |
+| `is_default` | Boolean | one default context per user |
+
+**Required partial unique index** — prevents two default contexts per user at the database level:
+
+```sql
+CREATE UNIQUE INDEX uq_user_default_context
+ON app.user_contexts (user_id)
+WHERE is_default = TRUE;
+```
+
+Add this index to the Alembic migration using `op.create_index()` with `postgresql_where=text("is_default = TRUE")`. Do not rely solely on application logic to enforce this constraint.
+
+Run `alembic revision --autogenerate -m "add db_contexts and user_contexts"` after Phase 0 completes.
+
+#### TODO 4 — Add context CRUD to a new `context/repository.py`
+
+**Do NOT add to `auth/repository.py`** — that module already owns JWT tokens, user management, refresh token lifecycle, and prompt logging. Context management is a separate domain.
+
+Create `src/ai_agentic_chatbot/context/repository.py`:
+
+| Function | Purpose |
+|---|---|
+| `get_contexts_for_user(db, user_id)` | Returns all contexts the user is assigned to |
+| `get_default_context(db, user_id)` | Returns the user's default context row, or `None` |
+| `get_context_by_slug(db, context_id)` | Looks up a `db_contexts` row by its string slug |
+| `assign_context_to_user(db, user_id, context_db_id, is_default)` | Inserts a `user_contexts` row; if `is_default=True`, clears the existing default first |
+| `seed_contexts_from_config(db, registry)` | Called at startup — upserts config.yaml entries into `db_contexts` so the DB is always in sync with config |
+
+#### TODO 5 — Add admin API endpoints for context management; resolve the source-of-truth conflict
+
+**Source-of-truth decision (was missing from original plan):**
+
+config.yaml is the **source of truth** for context definitions. The `db_contexts` table is a **DB mirror** populated by `seed_contexts_from_config()` at startup and used for user assignments. `POST /admin/contexts` must NOT be used to create new contexts — it only manages user assignments. To add a new context: add it to config.yaml first, then restart the service (which seeds it into the DB), then assign it to users.
+
+File: `auth/router.py`
+
+| Endpoint | Method | Notes |
+|---|---|---|
+| `/admin/contexts` | GET | List all active contexts from DB (superuser only) |
+| `/admin/contexts/{context_slug}/users/{username}` | PUT | Assign context to user (superuser only) |
+| `/admin/contexts/{context_slug}/users/{username}` | DELETE | Remove user's context access (superuser only) |
+| `/contexts` | GET | Return calling user's allowed contexts (for UI switcher) |
+
+> Removing `POST /admin/contexts` from the original plan — context creation is controlled by config.yaml, not the API.
+
+---
+
+### Phase 2 — Schema Pipeline Namespacing
+
+#### TODO 6 — Namespace all temp/schema files under `temp/{context_id}/`
+
+| File | Change |
+|---|---|
+| `schema_extractor/SaveSchemaJson.py:13` | Accept `schema_dir: Path` parameter; write to `schema_dir / "db_schema.json"` instead of hardcoded `Path.cwd() / "temp" / "db_schema.json"` |
+| `application/transform_schema_to_text.py:19–21, 80–102` | Replace hardcoded `temp/` paths with `schema_dir` argument passed through from the caller |
+| `application/ingest_vector_schema.py:9` | Accept and pass `schema_dir` to `VectorSchemaBuilder` and `SaveSchemaJson` |
+
+#### TODO 7 — Namespace the pgvector collection per context
+
+**Three files, not two** — the original plan missed `ingest_vector_schema.py`:
+
+| File | Change |
+|---|---|
+| `infrastructure/vector_store/pgvector_store.py:26` | Replace hardcoded `"db_schema_vectors"` with a `collection_name` constructor argument; remove the module-level `_vector_store` singleton (lines 106–114) and `get_vector_store()` function entirely |
+| `application/ingest_vector_schema.py:21` | Replace hardcoded `"db_schema_vectors"` — pass `collection_name=ctx.vector_collection_name` when constructing `PgVectorSchemaStore` |
+| `schema_extractor/vector_schema_builder.py:76` | Change UUID seed from `uuid5(NAMESPACE_DNS, table_name)` to `uuid5(NAMESPACE_DNS, f"{context_id}:{table_name}")` to prevent cross-context ID collisions |
+| `infrastructure/vector_store/pgvector_store.py:30–34` | Pass `schema="vector_store"` to `PGVector(...)` constructor so all pgvector tables land in the `vector_store` PostgreSQL schema |
+
+Also check `server.py` for any remaining direct calls to the old `get_vector_store()` singleton (e.g., `reset_collection()` in the `/ingest` endpoint) and update them to use the context-parameterized constructor.
+
+#### TODO 8 — Remove the module-level `SchemaLoader` singleton
+
+File: `schema_extractor/schema_loader.py:298–307`
+
+- Eliminate the `_schema_loader` global (the self-identified TODO comment at line 298 flags this exact issue).
+- Replace `get_schema_loader()` with a factory function `get_schema_loader(context_id: str) -> SchemaLoader` that accepts a `schema_dir` and `context_id`, and caches instances in a `Dict[str, SchemaLoader]` keyed by `context_id`.
+- **Cache invalidation note:** `SchemaLoader` reads YAML files from disk on each method call — it has no internal in-memory cache of file contents. The per-context dict cache therefore serves only as a way to avoid re-constructing the object. If `SchemaLoader` ever gains internal file caching, this dict must add an invalidation path (e.g., evict and re-create the entry after `/schemaText` completes for that context). Document this dependency with a comment in `get_schema_loader()`.
+
+#### TODO 9 — Update admin setup routes to accept `context_id`
+
+File: `server.py` — routes `/schemaJson`, `/schemaText`, `/ingest`
+
+- Add `context_id: str` as a query parameter on each route.
+- Load the matching `DbContextConfig` from `DbContextRegistry`.
+- Pass `include_tables`, `schema_dir`, `vector_collection_name`, `context_id`, and `schema_name` (PostgreSQL schema) to each pipeline step.
+- Remove the hardcoded `include_tables` list at line 138.
+- Pass `SchemaExtractionConfig(include_schemas=[ctx.schema_name], include_tables=ctx.include_tables)` to `SchemaExtractor` — the `include_schemas` field already exists in `SchemaExtractionConfig` but has never been populated.
+
+---
+
+### Phase 3 — Agent State & Prompt Propagation
+
+#### TODO 10 — Add `db_context_id: str` to both state models
+
+| File | Change |
+|---|---|
+| `agent/state.py` | Add `db_context_id: str` field to `AgentState` |
+| `agent/subgraphs/sql_query/state.py` | Add `db_context_id: str` field to `SQLSubgraphState` |
+| `agent/graph.py` | When initializing `SQLSubgraphState`, copy `db_context_id` from `AgentState` |
+
+**Context switching within the same `thread_id`:** LangGraph's MemorySaver checkpoint stores `db_context_id` per `thread_id`. If a client sends two requests with different `context_id` values on the same `thread_id`, the second request's value will override the checkpoint. This is undefined and potentially dangerous behavior. **Document this constraint at the API level:** a client must use a new `thread_id` when switching contexts. Return `HTTP 400` if the incoming `context_id` differs from the context stored in the active checkpoint for that `thread_id`.
+
+#### TODO 11 — Make `get_system_prompt()` context-aware
+
+File: `utils/prompt_loader.py:35–42`
+
+- Add optional `system_prompt_path: str = None` parameter.
+- When provided, read from that path directly. When `None`, fall back to the `SYSTEM_PROMPT_PATH` env var (preserving backward compatibility for the single-context case during transition).
+- Same change for `get_router_prompt()`.
+
+#### TODO 12 — Update the router node to use context-specific prompt and schema
+
+File: `agent/router.py:73–87`
+
+- Read `db_context_id` from state.
+- Call `DbContextRegistry.get_context(db_context_id)` to get the config.
+- Call context-aware `get_system_prompt(ctx.router_prompt_path)` and `get_schema_loader(db_context_id).load_schema_summary()`.
+- Note: line 75 currently instantiates `SchemaLoader()` directly instead of using a registry call. Replace with `get_schema_loader(db_context_id)`.
+
+---
+
+### Phase 4 — SQL Subgraph Nodes
+
+#### TODO 13 — Make `retrieve_schemas` context-aware
+
+File: `agent/subgraphs/sql_query/nodes/retrieve_schemas.py:15–55`
+
+- Read `db_context_id` from state.
+- Call `get_schema_loader(db_context_id)` for the DDL map.
+- Instantiate `PgVectorSchemaStore(collection_name=ctx.vector_collection_name)` instead of the removed singleton.
+
+#### TODO 14 — Make `generate_sql` context-aware
+
+File: `agent/subgraphs/sql_query/nodes/generate_sql.py:55`
+
+- Engine stays `get_engine("postgresql.primary")` (same database).
+- Pass context-specific system prompt to the LLM call via context-aware `get_system_prompt(ctx.system_prompt_path)`.
+- For glossary/column hints: pass `schema_name=ctx.schema_name` to the hint-fetching functions (see TODO 16).
+
+#### TODO 15 — Make `execute_query` context-aware — `SET LOCAL search_path` ⚠️ CRITICAL FIX
+
+File: `agent/subgraphs/sql_query/nodes/execute_query.py:37–38`
+
+The original plan's code is **wrong and will silently query the wrong schema:**
+
+```python
+# WRONG — do not use this
+with engine.connect() as conn:
+    conn.execute(text(f"SET LOCAL search_path = {ctx.schema_name}, app"))
+    result = conn.execute(text(sql_query).execution_options(autocommit=True))
+```
+
+**Why it fails:** `SET LOCAL` is transaction-scoped. With `autocommit=True` on the second execute, SQLAlchemy commits the implicit transaction before running the SQL query. The commit ends the transaction, clearing `SET LOCAL`. The SQL query then runs in a new transaction against the default `search_path` (typically `public`) — not `context_hr`. No error is raised; data from the wrong schema is silently returned.
+
+**Correct implementation:**
+
+```python
+# CORRECT — explicit transaction via conn.begin()
+import re
+
+ctx = DbContextRegistry.get_context(state["db_context_id"])
+
+# Validate schema_name before string interpolation (SET cannot use bound params)
+if not re.match(r'^[a-z_][a-z0-9_]*$', ctx.schema_name):
+    raise ValueError(f"Invalid schema name: {ctx.schema_name!r}")
+
+with engine.connect() as conn:
+    with conn.begin():                                # explicit transaction block
+        conn.execute(
+            text(f"SET LOCAL search_path TO {ctx.schema_name}, app, public")
+        )
+        # "public" fallback covers auth tables (users, refresh_tokens, prompt_logs)
+        # which stay in the public schema permanently
+        result = conn.execute(text(sql_query))        # same transaction — SET LOCAL is active
+        rows = result.fetchmany(MAX_QUERY_RESULTS)
+# transaction commits on conn.begin() exit; SET LOCAL resets automatically — no pool leak
+```
+
+The `with conn.begin()` block opens an explicit transaction. Both statements execute within it. `SET LOCAL` is strictly scoped to that transaction and resets automatically when it commits — the connection returned to the pool is clean with no lingering `search_path` side-effects.
+
+**Also remove `autocommit=True`** from the existing `execute_query.py` — it is incompatible with `SET LOCAL` and is deprecated in SQLAlchemy 2.x for this pattern anyway.
+
+#### TODO 16 — Make glossary/column hint lookups context-aware
+
+File: `agent/subgraphs/sql_query/nodes/glossary_lookup.py`
+
+- If `business_glossary` and `schema_metadata` tables live in each context's PostgreSQL schema: rely on the `SET LOCAL search_path` set in TODO 15 — no additional changes needed.
+- If these tables live in a central `app` schema: add a `context_id` filter column to each table and pass `context_id` to the query.
+
+---
+
+### Phase 5 — API Layer
+
+#### TODO 17 — Add `context_id` to `StreamRequest`
+
+File: `agent/schema.py`
+
+```python
+class StreamRequest(BaseModel):
+    thread_id:  str
+    messages:   list[Message]
+    context_id: Optional[str] = None   # if None, use user's default context
+```
+
+#### TODO 18 — Update the `/stream` route to resolve and inject context
+
+File: `server.py:245`
+
+After authenticating the user (JWT), resolve `context_id` in this order:
+
+1. If `stream_request.context_id` is provided:
+   - Verify the user is in `user_contexts` for that context → raise `HTTP 403` if not.
+   - Verify the `context_id` matches the checkpoint for this `thread_id` (if an existing checkpoint exists) → raise `HTTP 400` with message `"Context switch requires a new thread_id"` if they differ.
+2. If `None`, call `get_default_context(db, current_user.id)`.
+   - If that also returns `None` (user has no assigned contexts): raise `HTTP 422` with message `"No context assigned to this user. Contact an administrator."` — do NOT allow this to propagate to a 500 error.
+3. Inject `db_context_id` into the initial `AgentState` before calling `graph.astream_events()`.
+
+#### TODO 19 — Add `GET /contexts` endpoint for the frontend
+
+File: `auth/router.py` or `server.py`
+
+Returns the list of contexts the current user is allowed to access — used by the frontend to render a context-switcher UI element. Response includes `context_id`, `display_name`, and `is_default` flag.
+
+---
+
+### Phase 6 — System Prompt Refactor
+
+#### TODO 20 — Decouple table knowledge from `system_prompt.md`
+
+The current `system_prompt.md` has 5 table names, column listings, and ~50 hardcoded SQL examples baked in statically. This makes it unusable for a second context.
+
+**Token cost warning:** The original plan proposed injecting `SchemaLoader.get_table_docs_for_search()` as `{schema_context}` into the system prompt on every request. That method returns full LLM-enriched documentation for every table — potentially several thousand tokens per request, including greetings, routing turns, and clarification turns. Use `SchemaLoader.load_schema_summary()` instead — it loads `schema_summary.json`, which is a compact table-name and purpose summary suitable for routing context. Reserve full schema docs for the SQL generation node only (which already receives DDLs via `retrieved_tables`).
+
+**Changes:**
+
+- Remove the static table/column knowledge from `system_prompt.md` and replace it with a `{schema_summary}` placeholder (not `{schema_context}` — use the summary, not the full docs).
+- Inject `ctx_loader.load_schema_summary()` at the `{schema_summary}` placeholder in `prompt_loader.py`.
+- Create a separate `system_prompt.md` per context under `prompts/context_{id}/system_prompt.md`, keeping only context-independent instructions in a shared base template.
+
+---
+
+### Phase 7 — Pre-launch Dead Code Cleanup (Optional but Recommended)
+
+Do this before starting Phase 1 to reduce noise during review:
+
+| Location | Dead Code | Action |
+|---|---|---|
+| `agent/graph.py:~150–430` | `format_sql_response`, `format_sql_response_with_visualization`, `format_as_markdown_table`, `_analyze_for_visualizations`, `_format_data_values`, `_generate_data_summary` — never called | Delete |
+| `agent/subgraphs/sql_query/nodes/retrieve_schemas.py:58–186` | Commented-out `_semantic_search` function | Delete |
+| `schema_extractor/schema_loader.py:231–261` | Unused `_generate_ddl_from_doc` method | Delete |
+
+---
+
+### Phase 8 — Testing & Hardening
+
+#### TODO 21 — Write integration tests for context isolation
+
+- Verify a query from context A never touches context B's tables or vector collection.
+- Verify a user not assigned to any context gets `HTTP 422`, not `HTTP 500`.
+- Verify a user not assigned to a specific context gets `HTTP 403` when requesting that context.
+- Verify `SET LOCAL search_path` resets correctly between requests (pool connection reuse test) — connect to the same pooled connection twice and confirm the second query does not inherit the first request's search_path.
+- Verify context switching on the same `thread_id` returns `HTTP 400`.
+
+#### TODO 22 — Seed a second context end-to-end
+
+1. Add the new context to `config.yaml` under `contexts:`.
+2. Create the PostgreSQL schema: `CREATE SCHEMA context_hr;`
+3. Grant permissions (see Section 31 Bootstrap SQL).
+4. Restart the service so `seed_contexts_from_config()` registers the new context in `db_contexts`.
+5. Call `GET /schemaJson?context_id=hr` → `GET /schemaText?context_id=hr` → `GET /ingest?context_id=hr`.
+6. Assign the context to a test user via `PUT /admin/contexts/hr/users/{username}`.
+7. Run a query through `POST /stream` with `context_id=hr` and verify the SQL targets `context_hr.` tables.
+8. Confirm a user without the `hr` assignment gets `HTTP 403` when requesting `context_id=hr`.
+
+---
+
+### Full Touch-Point Summary
+
+| Layer | Files to Change | Nature of Change |
+|---|---|---|
+| **Pre-flight** | `alembic/env.py` | Fix `include_object` for `app`-schema autogenerate (before first `--autogenerate` run) |
+| Config | `config.yaml` | Add `contexts:` block |
+| DB models + migrations | New Alembic migration | `db_contexts`, `user_contexts` tables + partial unique index |
+| Context registry | New `infrastructure/context/context_settings.py` | `DbContextRegistry` singleton |
+| Context CRUD | New `context/repository.py` | Context-user assignment functions (not in auth/repository.py) |
+| Schema pipeline | `SaveSchemaJson.py`, `transform_schema_to_text.py`, `ingest_vector_schema.py` | Accept `schema_dir`, `context_id` params |
+| Vector store | `pgvector_store.py`, `ingest_vector_schema.py`, `vector_schema_builder.py` | Remove singleton; parameterize collection name; namespace UUIDs; add `schema="vector_store"` |
+| Schema loader | `schema_loader.py` | Remove global singleton; add per-context cache with invalidation note |
+| Agent state | `agent/state.py`, `sql_query/state.py` | Add `db_context_id` field |
+| Prompt loader | `prompt_loader.py`, `system_prompt.md` | Context-aware path resolution; add `{schema_summary}` placeholder (not full docs) |
+| Router node | `agent/router.py` | Use context-specific prompt + per-context `get_schema_loader()` call |
+| SQL nodes | `retrieve_schemas.py`, `generate_sql.py`, `execute_query.py`, `glossary_lookup.py` | Context-aware schema loader, vector store, `SET LOCAL` with `engine.begin()` |
+| API | `agent/schema.py`, `server.py` | Add `context_id` to `StreamRequest`; resolve + inject at `/stream`; handle zero-context user with 422 |
+| Admin routes | `auth/router.py` | Context-user assignment endpoints (no POST /admin/contexts) |
+| System prompts | `prompts/context_{id}/system_prompt.md` | One prompt file per context |
+
+> **Key insight:** The `DataSourceFactory` infrastructure already supports multiple named datasources. Since all contexts share one PostgreSQL database, `get_engine("postgresql.primary")` remains unchanged in all nodes — only the `SET LOCAL search_path` injection in `execute_query.py` (using `engine.begin()`) changes how the engine resolves table names at runtime.
+
+---
+
+## 31. Database Structure for Multi-Context — Decision & Schema Design
+
+> **Question:** Should contexts be isolated using (A) multiple PostgreSQL schemas within one database, or (B) separate databases per context? And should this be done in the **existing codebase** or a **new separate codebase**?
+
+### Why a Separate Codebase Was Rejected
+
+Before comparing schema options, a separate codebase was evaluated and rejected for one decisive reason: **the auth system is not separable without unacceptable cost.**
+
+Every user account, JWT session, refresh token, daily prompt limit, and audit log lives in tables managed by this codebase. A separate codebase for a new context would either:
+
+- **Duplicate the entire auth system** → two disconnected user databases, two logins, doubled security surface area, and two refresh token revocation trees to maintain independently.
+- **Depend on this codebase's database externally** → both services would share the same JWT secret and `users` table anyway, making the separation meaningless — just a worse version of the same architecture with an added network hop and two deployments to keep in sync.
+
+For 2–5 internal contexts in one organization, the refactor described in Section 30 is the correct path.
+
+---
+
+### Constraints that drove the schema decision
+
+| Constraint | Value |
+|---|---|
+| Expected number of contexts | 2–5 (small, fixed set) |
+| Ownership | All internal domains within the same organization |
+| Cross-context queries needed | Yes — some admin/reporting queries join data across contexts |
+
+### Option Comparison
+
+| Concern | Option A — Multiple PostgreSQL Schemas | Option B — Separate Databases |
+|---|---|---|
+| Table name collisions | Handled natively — `context_a.orders` and `context_b.orders` coexist | Handled — each database has its own `public.orders` |
+| Connection pool usage | 15 connections total regardless of context count | 15 connections × N databases (15 × 5 = 75 max) |
+| Cross-context queries | Native cross-schema JOIN: `SELECT * FROM context_sales.orders JOIN context_hr.employee` | Requires PostgreSQL foreign data wrappers (FDW) or ETL — complex and slow |
+| Operational overhead | One database to manage, back up, monitor | N databases — N connection strings, N Alembic runs, N backup jobs |
+| Security isolation | Schema-level (PostgreSQL role grants per schema). Note: `chatbot_user` has grants on all schemas — a `SET LOCAL` bug would cause silent cross-schema access (see TODO 15 fix) | Database-level (true hard isolation) |
+| LLM SQL generation impact | Zero — `SET LOCAL search_path TO context_X, app, public` means LLM writes plain `SELECT * FROM orders`, PostgreSQL resolves to the right schema | Zero — engine points to the right database |
+| Existing code changes | `execute_query.py:37–38`: add `conn.begin()` + `SET LOCAL`; `auth/models.py` unchanged; engine unchanged | 4 files need dynamic engine resolution; N connection strings to manage |
+| Alembic migrations | New migration per context using `op.create_table(..., schema="context_<slug>")` | Re-run Alembic with different `POSTGRESQL_DB` env var per database |
+| pgvector (`langchain_postgres`) | Pass `schema="vector_store"` to `PGVector(...)` constructor | Separate `langchain_pg_collection` table in each database |
+
+**Security caveat on Option A:** Schema-level isolation is not equivalent to database-level isolation. The `chatbot_user` application role has `USAGE` grants on all schemas. If the LLM ever generates a schema-qualified query (e.g., `SELECT * FROM context_hr.employee`) during a `context_sales` session — through a misconfiguration or schema doc contamination in the vector store — the query will succeed. The `SET LOCAL search_path` mechanism is a convention enforced by application code, not a hard database boundary. For the stated use case (2–5 internal domains, same organization), this risk is acceptable. For multi-tenant or multi-organization deployments, Option B (separate databases) would be required.
+
+### Decision: Option A — One Database, Multiple PostgreSQL Schemas
+
+**Reasons:**
+1. Cross-context admin queries work natively with schema-qualified JOINs.
+2. Single connection pool (15 connections) — no resource explosion.
+3. Single database to manage, back up, and monitor.
+4. `SET LOCAL search_path TO context_X, app, public` (via `conn.begin()`) is the only change to the SQL execution path — the LLM writes unqualified table names, PostgreSQL resolves them against the context schema first.
+5. `SchemaExtractor` already accepts `schema=` in `inspector.get_table_names(schema=schema_name)` calls — the extraction layer is already schema-aware.
+
+### Recommended Schema Layout
+
+```
+your_database (ai_chatbot_db)
+│
+├── public                     ← auth tables stay here permanently — zero migration needed
+│   ├── users                  ← auth/models.py unchanged; no __table_args__ added
+│   ├── refresh_tokens
+│   ├── prompt_logs
+│   └── alembic_version
+│
+├── app                        ← new metadata tables only (created by new migration)
+│   ├── db_contexts
+│   └── user_contexts          ← FK user_id → public.users.id (cross-schema FK, fully supported)
+│
+├── context_sales              ← first business context
+│   ├── orders
+│   ├── customer
+│   ├── product
+│   ├── inventory
+│   └── v_sales_summary
+│
+├── context_hr                 ← second business context
+│   ├── orders                 ← same name as context_sales.orders — no collision
+│   ├── employee
+│   └── department
+│
+└── vector_store               ← all langchain pgvector tables, one per context
+    ├── langchain_pg_collection   (collection_name = "context_sales_vectors", etc.)
+    └── langchain_pg_embedding
+```
+
+### How `SET LOCAL search_path` Works at Runtime (Corrected)
+
+```
+User sends POST /stream with context_id = "hr"
+         │
+         ▼
+/stream resolves DbContextConfig → schema_name = "context_hr"
+         │
+         ▼
+agent state: db_context_id = "hr"
+         │
+         ▼
+execute_query node:
+    # Validate schema_name (SQL injection guard — SET cannot use bound params)
+    if not re.match(r'^[a-z_][a-z0-9_]*$', ctx.schema_name):
+        raise ValueError(...)
+
+    with engine.connect() as conn:
+        with conn.begin():                          # ← explicit transaction block
+            conn.execute(text("SET LOCAL search_path TO context_hr, app, public"))
+            #  search_path priority: context_hr → app → public
+            #  "public" covers auth tables (users etc.) that stay in public schema
+            result = conn.execute(text("SELECT * FROM orders WHERE ..."))
+            #                                          ^^^^^^
+            #  LLM wrote this — no schema prefix needed
+            #  PostgreSQL resolves: context_hr.orders
+        # conn.begin() exits → transaction commits → SET LOCAL resets
+         │
+         ▼
+Connection returns to pool — search_path is back to database default (clean)
+(SET LOCAL is strictly transaction-scoped — zero pool leak risk)
+```
+
+> **Why NOT `autocommit=True`:** `SET LOCAL` is transaction-scoped. With `autocommit=True`, each statement runs in its own implicit transaction that immediately commits. The `SET LOCAL` commits and its scope ends before the SQL query even starts, so the query runs against the database-default `search_path` (typically `public` only). No error is raised — wrong schema data is silently returned. The explicit `conn.begin()` block keeps both statements in one transaction.
+
+### Auth ORM Models — No Changes Required ✅
+
+`auth/models.py` does not need any changes. All three ORM classes (`User`, `RefreshToken`, `PromptLog`) stay exactly as they are — no `__table_args__`, no `schema=` argument, no FK string changes. The auth tables remain in `public` permanently.
+
+The auth session (`get_auth_db()`) is completely isolated from the SQL agent's `execute_query.py` connection. The `SET LOCAL search_path` the agent applies never affects auth queries.
+
+### Required Alembic Changes — Purely Additive New Migration
+
+**DO NOT edit the 4 existing migration files.** They have already been applied; editing them does nothing, and retroactively altering them can corrupt downgrade paths.
+
+**The new migration is purely additive — only CREATE statements, no ALTER or DROP on existing tables:**
+
+```python
+# alembic/versions/XXXX_add_app_schema_and_context_tables.py
+# Write this manually — do NOT use --autogenerate (env.py include_object bug)
+
+def upgrade() -> None:
+    op.execute("CREATE SCHEMA IF NOT EXISTS app")
+    op.execute("CREATE SCHEMA IF NOT EXISTS vector_store")
+    op.create_table(
+        "db_contexts",
+        # ... columns (see TODO 3 in Section 30)
+        schema="app",
+    )
+    op.create_table(
+        "user_contexts",
+        # user_id FK references public.users — cross-schema FK is fully supported in PostgreSQL
+        # ForeignKeyConstraint(['user_id'], ['public.users.id'], ondelete='CASCADE')
+        schema="app",
+    )
+    op.create_index(
+        "uq_user_default_context",
+        "user_contexts",
+        ["user_id"],
+        schema="app",
+        unique=True,
+        postgresql_where=text("is_default = TRUE"),
+    )
+
+def downgrade() -> None:
+    op.drop_index("uq_user_default_context", table_name="user_contexts", schema="app")
+    op.drop_table("user_contexts", schema="app")
+    op.drop_table("db_contexts", schema="app")
+    op.execute("DROP SCHEMA IF EXISTS vector_store")
+    op.execute("DROP SCHEMA IF EXISTS app")
+```
+
+**Safe downgrade check:** `alembic downgrade -1` drops only the tables and schemas this migration created. It does not touch `public.users`, `public.refresh_tokens`, or `public.prompt_logs`. The auth system remains fully functional after a downgrade.
+
+New context migrations (one per context) use `schema="context_<slug>"` in each `op.create_table()` — same purely additive pattern.
+
+### PostgreSQL Bootstrap (run once per environment)
+
+Auth tables (`users`, `refresh_tokens`, `prompt_logs`) stay in `public` — no grants needed for them, they already have the right permissions. Only grant new schemas:
+
+```sql
+-- Create new schemas (public already exists — do not recreate it)
+CREATE SCHEMA IF NOT EXISTS app;
+CREATE SCHEMA IF NOT EXISTS context_sales;
+CREATE SCHEMA IF NOT EXISTS context_hr;
+CREATE SCHEMA IF NOT EXISTS vector_store;
+
+-- Grant usage on new schemas
+GRANT USAGE ON SCHEMA app TO chatbot_user;
+GRANT USAGE ON SCHEMA context_sales TO chatbot_user;
+GRANT USAGE ON SCHEMA context_hr TO chatbot_user;
+GRANT USAGE ON SCHEMA vector_store TO chatbot_user;
+
+-- Cover tables created by FUTURE Alembic migrations in the new schemas
+-- (GRANT ALL ON ALL TABLES only covers tables that exist at this moment;
+--  ALTER DEFAULT PRIVILEGES covers tables created later by migrations)
+ALTER DEFAULT PRIVILEGES IN SCHEMA app GRANT ALL ON TABLES TO chatbot_user;
+ALTER DEFAULT PRIVILEGES IN SCHEMA app GRANT ALL ON SEQUENCES TO chatbot_user;
+ALTER DEFAULT PRIVILEGES IN SCHEMA context_sales GRANT ALL ON TABLES TO chatbot_user;
+ALTER DEFAULT PRIVILEGES IN SCHEMA context_hr GRANT ALL ON TABLES TO chatbot_user;
+ALTER DEFAULT PRIVILEGES IN SCHEMA vector_store GRANT ALL ON TABLES TO chatbot_user;
+```
+
+### Adding a Third Context — Complete Steps
+
+The following steps are all required. "No code changes" is accurate for Python application code only — there are 6+ infrastructure and file-system steps:
+
+1. `CREATE SCHEMA context_finance;` in PostgreSQL.
+2. Add `ALTER DEFAULT PRIVILEGES IN SCHEMA context_finance GRANT ALL ON TABLES TO chatbot_user;`.
+3. Add the context entry to `config.yaml` under `contexts:`.
+4. Create `prompts/context_finance/system_prompt.md` and `router_prompt.md`.
+5. Create `temp/context_finance/` directory.
+6. Restart the service — `seed_contexts_from_config()` registers the new entry in `db_contexts`.
+7. Populate the business data tables in `context_finance` schema (out of scope for this app).
+8. Call `GET /schemaJson?context_id=finance` → `GET /schemaText?context_id=finance` → `GET /ingest?context_id=finance`.
+9. Assign the context to users via `PUT /admin/contexts/finance/users/{username}`.
+
+---
+
+*Generated: 2026-05-29 | Updated: 2026-06-30 | Repository: `ai-agentic-chatbot` | Branch: `develop`*
