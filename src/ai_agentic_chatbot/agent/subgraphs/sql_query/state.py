@@ -11,6 +11,7 @@ class SQLSubgraphState(TypedDict):
     # Input (from parent graph)
     user_query: str
     router_table_hints: Optional[List[str]]
+    db_context_id: str  # copied from AgentState.db_context_id by sql_query_node
     
     # Schema Retrieval
     retrieved_tables: Optional[List[Tuple[str, str, float]]]  # (name, ddl, score)

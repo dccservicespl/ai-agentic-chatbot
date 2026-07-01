@@ -3,7 +3,7 @@ from pathlib import Path
 
 import uvicorn
 from dotenv import load_dotenv
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, Depends, HTTPException, Query
 from langchain_core.messages import AIMessage
 from langchain_core.messages import HumanMessage
 from sqlalchemy import text
@@ -22,6 +22,10 @@ from ai_agentic_chatbot.infrastructure.datasource.factory import (
     get_engine,
 )
 from ai_agentic_chatbot.infrastructure.db_depency import get_db_session
+from ai_agentic_chatbot.infrastructure.context.context_settings import (
+    DbContextConfig,
+    get_context_registry,
+)
 from ai_agentic_chatbot.logging_config import setup_logging, get_logger
 from ai_agentic_chatbot.schema_extractor.SaveSchemaJson import save_schema_temp_file
 from ai_agentic_chatbot.schema_extractor.SchemaExtractionConfig import (
@@ -44,10 +48,14 @@ load_dotenv()
 setup_logging()
 logger = get_logger(__name__)
 
-# TODO 9 (not yet done): resolve these per-context via DbContextRegistry
-# (schema_dir, vector_collection_name) instead of single project-wide defaults.
-DEFAULT_SCHEMA_DIR = Path(__file__).resolve().parent.parent.parent / "temp"
-DEFAULT_VECTOR_COLLECTION = "db_schema_vectors"
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+
+
+def _resolve_context(context_id: str) -> DbContextConfig:
+    try:
+        return get_context_registry().get_context(context_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
 
 
 @asynccontextmanager
@@ -125,26 +133,32 @@ graph = build_graph()
     summary="Extract database schema to JSON",
     description=(
             "Introspects the PostgreSQL database using SQLAlchemy and extracts the structural schema "
-            "(tables, columns, primary keys, foreign keys) for the configured table whitelist: "
-            "`orders`, `customer`, `sales`, `product`, `inventory`. "
-            "The result is serialised to `temp/db_schema.json` and the file path is returned. "
+            "(tables, columns, primary keys, foreign keys) for the given context's PostgreSQL schema "
+            "and table whitelist (both defined in config.yaml under `contexts.<context_id>`). "
+            "The result is serialised to `<context.schema_dir>/db_schema.json` and the file path is returned. "
             "\n\n**Run this as Step 1 of the schema setup pipeline** before calling `/schemaText` or `/ingest`."
     ),
     responses={
         200: {"description": "Schema extracted successfully — returns path to the JSON file"},
+        404: {"description": "Unknown context_id"},
         503: {"description": "Extraction failed — database unreachable or introspection error"},
     },
 )
-def schema_json(current_user: User = Depends(get_current_user)):
+def schema_json(
+    context_id: str = Query(..., description="Context slug from config.yaml's contexts: block"),
+    current_user: User = Depends(get_current_user),
+):
+    ctx = _resolve_context(context_id)
     try:
         db_engine = get_engine("postgresql.primary")
         config = SchemaExtractionConfig(
-            include_tables=["orders", "customer", "sales", "product", "inventory", "v_sales_summary"]
+            include_schemas=[ctx.schema_name],
+            include_tables=ctx.include_tables,
         )
 
         extractor = SchemaExtractor(db_engine, config)
         schema = extractor.extract_database_schema()
-        schema_file_path = save_schema_temp_file(schema, DEFAULT_SCHEMA_DIR)
+        schema_file_path = save_schema_temp_file(schema, PROJECT_ROOT / ctx.schema_dir)
 
         return {"SchemaPath": schema_file_path}
     except Exception as exc:
@@ -156,20 +170,26 @@ def schema_json(current_user: User = Depends(get_current_user)):
     tags=["SchemaExtractor"],
     summary="Convert schema JSON to LLM-enriched documentation",
     description=(
-            "Reads the schema JSON produced by `/schemaJson` and sends each table to the LLM, "
+            "Reads the schema JSON produced by `/schemaJson` for this context and sends each table to the LLM, "
             "which generates a human-readable `TableSchemaDocumentation` (business purpose, key fields, "
-            "relationships, example questions). The output is saved as `schema_documentation.yaml`. "
+            "relationships, example questions). The output is saved as `<context.schema_dir>/schema_documentation.yaml`. "
             "\n\n**Run this as Step 2 of the schema setup pipeline** after `/schemaJson` and before `/ingest`."
     ),
     responses={
         200: {"description": "Schema converted to text documentation successfully"},
+        404: {"description": "Unknown context_id"},
         503: {"description": "Conversion failed — missing schema JSON or LLM error"},
     },
 )
-def schema_text(current_user: User = Depends(get_current_user)):
+def schema_text(
+    context_id: str = Query(..., description="Context slug from config.yaml's contexts: block"),
+    current_user: User = Depends(get_current_user),
+):
+    ctx = _resolve_context(context_id)
     try:
-        transform_schema_to_text(DEFAULT_SCHEMA_DIR)
-        generate_schema_summary(DEFAULT_SCHEMA_DIR)
+        schema_dir = PROJECT_ROOT / ctx.schema_dir
+        transform_schema_to_text(schema_dir)
+        generate_schema_summary(schema_dir)
 
         return {"Schema to text conversion completed"}
     except Exception as exc:
@@ -181,31 +201,37 @@ def schema_text(current_user: User = Depends(get_current_user)):
     tags=["SchemaExtractor"],
     summary="Ingest schema into vector store",
     description=(
-            "Reads the LLM-generated schema documentation (`schema_documentation.yaml`), chunks it per table, "
-            "embeds each chunk using Azure OpenAI embeddings, and upserts the vectors into the pgvector store in PostgreSQL. "
+            "Reads this context's LLM-generated schema documentation (`schema_documentation.yaml`), chunks it "
+            "per table, embeds each chunk using Azure OpenAI embeddings, and upserts the vectors into this "
+            "context's pgvector collection (`context.vector_collection_name`) in PostgreSQL. "
             "After this step the SQL agent can perform semantic table discovery at query time. "
             "\n\n**Run this as Step 3 of the schema setup pipeline** after `/schemaText`. "
             "Re-run whenever the database schema changes."
     ),
     responses={
         200: {"description": "Schema ingested into pgvector successfully"},
+        404: {"description": "Unknown context_id"},
         500: {"description": "Ingestion failed — embedding or database error"},
     },
 )
-def ingest_schema_endpoint(force_reset: bool = False, current_user: User = Depends(get_current_user)):
+def ingest_schema_endpoint(
+    context_id: str = Query(..., description="Context slug from config.yaml's contexts: block"),
+    force_reset: bool = False,
+    current_user: User = Depends(get_current_user),
+):
+    ctx = _resolve_context(context_id)
     try:
-        # TODO 9: resolve context_id/collection_name from a context_id query param
-        # via DbContextRegistry instead of these single-context literals.
         if force_reset:
-            PgVectorSchemaStore(collection_name=DEFAULT_VECTOR_COLLECTION).reset_collection()
-            logger.info("force_reset=True: pgvector collection cleared before ingest")
+            PgVectorSchemaStore(collection_name=ctx.vector_collection_name).reset_collection()
+            logger.info(f"force_reset=True: pgvector collection '{ctx.vector_collection_name}' cleared before ingest")
 
+        schema_dir = PROJECT_ROOT / ctx.schema_dir
         ingest_schema(
-            schema_path=DEFAULT_SCHEMA_DIR / "schema_documentation.yaml",
-            context_id="default",
-            collection_name=DEFAULT_VECTOR_COLLECTION,
+            schema_path=schema_dir / "schema_documentation.yaml",
+            context_id=ctx.context_id,
+            collection_name=ctx.vector_collection_name,
         )
-        return {"status": "ingested", "force_reset": force_reset}
+        return {"status": "ingested", "force_reset": force_reset, "context_id": ctx.context_id}
     except Exception as exc:
         raise exc
 

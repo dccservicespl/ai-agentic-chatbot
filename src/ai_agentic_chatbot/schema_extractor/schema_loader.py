@@ -3,7 +3,7 @@
 import json
 import yaml
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List
 from ai_agentic_chatbot.logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -12,9 +12,8 @@ logger = get_logger(__name__)
 class SchemaLoader:
     """Utility class to load pre-processed schema data."""
 
-    def __init__(self):
-        self.base_dir = Path(__file__).resolve().parent.parent.parent.parent
-        self.temp_dir = self.base_dir / "temp"
+    def __init__(self, schema_dir: Path):
+        self.temp_dir = Path(schema_dir)
 
     def load_schema_json(self) -> Dict:
         """Load the raw schema JSON data."""
@@ -295,13 +294,20 @@ class SchemaLoader:
         return "\n".join(lines)
 
 
-# TODO: This global instance relating to the process... multi tenancy should not be having hat
-_schema_loader: Optional[SchemaLoader] = None
+_schema_loaders: Dict[str, SchemaLoader] = {}
 
 
-def get_schema_loader() -> SchemaLoader:
-    """Get the global schema loader instance."""
-    global _schema_loader
-    if _schema_loader is None:
-        _schema_loader = SchemaLoader()
-    return _schema_loader
+def get_schema_loader(context_id: str, schema_dir: Path) -> SchemaLoader:
+    """Return the cached SchemaLoader for this context, constructing it on first use.
+
+    SchemaLoader re-reads its JSON/YAML files from disk on every method call —
+    it holds no in-memory cache of file contents itself. This per-context dict
+    therefore only avoids reconstructing the object on every call; it is not a
+    staleness cache. If SchemaLoader ever gains internal file-content caching,
+    this dict must add an invalidation path (e.g. evict and re-create the entry
+    after /schemaText completes for that context), or callers will silently
+    see stale schema documentation.
+    """
+    if context_id not in _schema_loaders:
+        _schema_loaders[context_id] = SchemaLoader(schema_dir)
+    return _schema_loaders[context_id]

@@ -1,5 +1,7 @@
 """Schema retrieval node for semantic table search."""
 
+from pathlib import Path
+
 from typing import List, Tuple, Dict, Any
 from ai_agentic_chatbot.infrastructure.embedding.embedding_connection import (
     get_azure_openai_embedding,
@@ -8,8 +10,16 @@ from langchain_core.runnables import RunnableConfig
 from ai_agentic_chatbot.schema_extractor.schema_loader import get_schema_loader
 from ai_agentic_chatbot.logging_config import get_logger
 from ai_agentic_chatbot.infrastructure.vector_store.pgvector_store import PgVectorSchemaStore
+from ai_agentic_chatbot.infrastructure.context.context_settings import get_context_registry
 
 logger = get_logger(__name__)
+
+PROJECT_ROOT = Path(__file__).resolve().parents[6]
+
+# TODO 18 (not yet done): /stream will inject the real db_context_id. Until
+# then, every request resolves against this one real, configured context —
+# "default" is not a registered context_id in config.yaml.
+_FALLBACK_CONTEXT_ID = "sales"
 
 
 def retrieve_schemas_node(state: dict, config: RunnableConfig) -> dict:
@@ -20,12 +30,14 @@ def retrieve_schemas_node(state: dict, config: RunnableConfig) -> dict:
 
     user_query = state["user_query"]
     router_hints = state.get("router_table_hints", [])
+    db_context_id = state.get("db_context_id") or _FALLBACK_CONTEXT_ID
 
     try:
-        schema_loader = get_schema_loader()
+        ctx = get_context_registry().get_context(db_context_id)
+        schema_loader = get_schema_loader(context_id=db_context_id, schema_dir=PROJECT_ROOT / ctx.schema_dir)
         table_docs = schema_loader.get_table_docs_for_search()
 
-        retrieved = _semantic_searchV2(user_query, table_docs, router_hints)
+        retrieved = _semantic_searchV2(user_query, table_docs, router_hints, ctx.vector_collection_name)
 
         if not retrieved:
             logger.warning("No tables retrieved from semantic search")
@@ -207,6 +219,7 @@ def _semantic_searchV2(
     query: str,
     table_docs: List[Dict[str, Any]],
     router_hints: List[str],
+    collection_name: str,
     k: int = 5,
     score_threshold: float = 0.3,
 ) -> List[Tuple[str, str, float]]:
@@ -228,10 +241,7 @@ def _semantic_searchV2(
         # against all stored schema vectors using cosine similarity in SQL.
         # Returns (table_name, relevance_score) sorted descending, already filtered
         # by score_threshold. Scores are 0-1 (higher = more similar).
-        # TODO 13: resolve collection_name from db_context_id via DbContextRegistry
-        # instead of this single-context literal, once the SQL subgraph state
-        # carries db_context_id (Phase 3/4).
-        vector_store = PgVectorSchemaStore(collection_name="db_schema_vectors")
+        vector_store = PgVectorSchemaStore(collection_name=collection_name)
         pgvector_results = vector_store.search(query, k=k, score_threshold=score_threshold)
 
         if not pgvector_results:

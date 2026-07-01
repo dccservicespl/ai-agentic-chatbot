@@ -59,6 +59,10 @@ def sql_query_node(state: AgentState) -> dict:
     subgraph_input = {
         "user_query": state["messages"][-1].content,
         "router_table_hints": state.get("relevant_tables", []),
+        # TODO 18: /stream will inject db_context_id into AgentState for every
+        # request; until then this falls back to "sales" — the one real
+        # registered context_id in config.yaml ("default" is not registered).
+        "db_context_id": state.get("db_context_id", "sales"),
         "generation_attempts": 0,
         "max_retries": 2,
         "is_safe": False,

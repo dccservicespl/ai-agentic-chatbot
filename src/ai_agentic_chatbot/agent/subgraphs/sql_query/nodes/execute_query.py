@@ -1,7 +1,10 @@
 """Query execution node for database operations."""
 
-from sqlalchemy import create_engine, text
+import re
+
+from sqlalchemy import text
 from ai_agentic_chatbot.infrastructure.datasource.factory import get_engine
+from ai_agentic_chatbot.infrastructure.context.context_settings import get_context_registry
 from ai_agentic_chatbot.logging_config import get_logger
 import time
 
@@ -10,6 +13,16 @@ logger = get_logger(__name__)
 # Configuration constants
 QUERY_TIMEOUT = 30  # seconds
 MAX_QUERY_RESULTS = 1000
+
+# SET cannot use bound params, so schema_name is interpolated directly into
+# the SQL string — it must be validated first even though it traces back to
+# a trusted config.yaml value, not raw user input.
+_VALID_SCHEMA_NAME = re.compile(r"^[a-z_][a-z0-9_]*$")
+
+# TODO 18 (not yet done): /stream will inject the real db_context_id. Until
+# then, every request resolves against this one real, configured context —
+# "default" is not a registered context_id in config.yaml.
+_FALLBACK_CONTEXT_ID = "sales"
 
 
 def execute_query_node(state: dict) -> dict:
@@ -30,35 +43,53 @@ def execute_query_node(state: dict) -> dict:
         return {"execution_error": "No SQL query to execute"}
 
     try:
+        db_context_id = state.get("db_context_id") or _FALLBACK_CONTEXT_ID
+        ctx = get_context_registry().get_context(db_context_id)
+
+        if not _VALID_SCHEMA_NAME.match(ctx.schema_name):
+            raise ValueError(f"Invalid schema name: {ctx.schema_name!r}")
+
         engine = get_engine("postgresql.primary")
 
         start_time = time.time()
 
+        # Explicit transaction (conn.begin()), NOT autocommit — SET LOCAL is
+        # transaction-scoped. With autocommit, SQLAlchemy would commit the
+        # implicit transaction from the SET statement before running the SQL
+        # query, silently clearing search_path and querying "public" instead
+        # of this context's schema with no error raised.
         with engine.connect() as conn:
-            result = conn.execute(text(sql_query).execution_options(autocommit=True))
+            with conn.begin():
+                # "public" fallback covers auth tables (users, refresh_tokens,
+                # prompt_logs), which stay in the public schema permanently.
+                conn.execute(
+                    text(f"SET LOCAL search_path TO {ctx.schema_name}, app, public")
+                )
+                result = conn.execute(text(sql_query))
 
-            rows = result.fetchmany(MAX_QUERY_RESULTS)
+                rows = result.fetchmany(MAX_QUERY_RESULTS)
 
-            has_more = len(rows) == MAX_QUERY_RESULTS
-            if has_more:
-                extra_row = result.fetchone()
-                if extra_row:
-                    logger.warning(
-                        f"Query returned more than {MAX_QUERY_RESULTS} rows - truncated"
-                    )
+                has_more = len(rows) == MAX_QUERY_RESULTS
+                if has_more:
+                    extra_row = result.fetchone()
+                    if extra_row:
+                        logger.warning(
+                            f"Query returned more than {MAX_QUERY_RESULTS} rows - truncated"
+                        )
 
-            execution_time = time.time() - start_time
+                execution_time = time.time() - start_time
 
-            if rows and result.keys():
-                data = [
-                    {
-                        key: _serialize_value(value)
-                        for key, value in zip(result.keys(), row)
-                    }
-                    for row in rows
-                ]
-            else:
-                data = []
+                if rows and result.keys():
+                    data = [
+                        {
+                            key: _serialize_value(value)
+                            for key, value in zip(result.keys(), row)
+                        }
+                        for row in rows
+                    ]
+                else:
+                    data = []
+            # transaction commits here; SET LOCAL resets automatically — no pool leak
 
             logger.info(
                 f"✅ Query executed successfully: {len(data)} rows in {execution_time:.2f}s"

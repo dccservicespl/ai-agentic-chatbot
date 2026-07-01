@@ -5278,12 +5278,13 @@ The `with conn.begin()` block opens an explicit transaction. Both statements exe
 
 **Also remove `autocommit=True`** from the existing `execute_query.py` — it is incompatible with `SET LOCAL` and is deprecated in SQLAlchemy 2.x for this pattern anyway.
 
-#### TODO 16 — Make glossary/column hint lookups context-aware
+#### TODO 16 — Make glossary/column hint lookups context-aware ✅ COMPLETED (during TODO 14)
 
-File: `agent/subgraphs/sql_query/nodes/glossary_lookup.py`
+**The doc's original plan here was wrong.** `business_glossary` and `schema_metadata` do live in each context's PostgreSQL schema (confirmed: `demo_01.business_glossary`, `demo_01.schema_metadata`), so the assumption was "rely on the `SET LOCAL search_path` set in TODO 15 — no additional changes needed." But `fetch_glossary_hints`/`fetch_column_hints` open their **own separate `engine.connect()`** calls in `glossary_lookup.py` — a different connection than the one `execute_query.py` sets `SET LOCAL search_path` on in TODO 15. `SET LOCAL` is transaction/connection-scoped, so it has zero effect here; relying on it would have left these lookups silently broken (always querying `public`, finding nothing) for any non-`public`-schema context.
 
-- If `business_glossary` and `schema_metadata` tables live in each context's PostgreSQL schema: rely on the `SET LOCAL search_path` set in TODO 15 — no additional changes needed.
-- If these tables live in a central `app` schema: add a `context_id` filter column to each table and pass `context_id` to the query.
+**Actual fix (done as part of TODO 14, since the two changes couldn't be separated without breaking the app):** both functions in `glossary_lookup.py` now take a required `schema_name: str` parameter and schema-qualify their queries directly (`FROM {schema_name}.business_glossary`, `FROM {schema_name}.schema_metadata`), validated against `^[a-z_][a-z0-9_]*$` before interpolation — same identifier-validation pattern as TODO 15, since `SET`/table names can't use bound params. `generate_sql.py` resolves `ctx.schema_name` via the context registry and passes it through at both call sites.
+
+Verified live: confirmed both tables exist in `demo_01` (not `public`), inserted a throwaway glossary row, confirmed `fetch_glossary_hints` correctly found it via the schema-qualified query, then cleaned it up. Also confirmed the schema-name validator blocks an injection attempt (`"demo_01; DROP TABLE users; --"`).
 
 ---
 

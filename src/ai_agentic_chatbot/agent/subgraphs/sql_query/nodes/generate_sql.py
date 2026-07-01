@@ -13,9 +13,15 @@ from ai_agentic_chatbot.agent.subgraphs.sql_query.nodes.glossary_lookup import (
     fetch_glossary_hints,
     fetch_column_hints,
 )
+from ai_agentic_chatbot.infrastructure.context.context_settings import get_context_registry
 from ai_agentic_chatbot.logging_config import get_logger
 
 logger = get_logger(__name__)
+
+# TODO 18 (not yet done): /stream will inject the real db_context_id. Until
+# then, every request resolves against this one real, configured context —
+# "default" is not a registered context_id in config.yaml.
+_FALLBACK_CONTEXT_ID = "sales"
 
 
 class SQLGeneration(BaseModel):
@@ -50,8 +56,10 @@ def generate_sql_node(state: dict) -> dict:
 
     previous_error = state.get("execution_error")
     generation_attempts = state.get("generation_attempts", 0)
+    db_context_id = state.get("db_context_id") or _FALLBACK_CONTEXT_ID
 
     try:
+        ctx = get_context_registry().get_context(db_context_id)
         engine = get_engine("postgresql.primary")
         table_names = [name for name, _ddl, _score in retrieved_tables]
 
@@ -63,8 +71,9 @@ def generate_sql_node(state: dict) -> dict:
             user_query=user_query,
             previous_error=previous_error,
             generation_attempts=generation_attempts,
-            glossary_hints=fetch_glossary_hints(user_query, engine),
-            column_hints=fetch_column_hints(table_names, engine),
+            glossary_hints=fetch_glossary_hints(user_query, engine, ctx.schema_name),
+            column_hints=fetch_column_hints(table_names, engine, ctx.schema_name),
+            system_prompt_path=ctx.system_prompt_path,
         )
 
         prompt = SystemMessage(content=prompt_content)
@@ -110,10 +119,11 @@ def _create_generation_prompt(
         generation_attempts: int = 0,
         glossary_hints: str = "",
         column_hints: str = "",
+        system_prompt_path: Optional[str] = None,
 ) -> str:
     """Create the SQL generation prompt."""
 
-    system_context = get_system_prompt()
+    system_context = get_system_prompt(system_prompt_path)
 
     hints_block = "\n\n".join(filter(None, [glossary_hints, column_hints]))
     hints_section = f"\n\n{hints_block}" if hints_block else ""
