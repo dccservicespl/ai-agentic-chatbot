@@ -1,4 +1,5 @@
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 import uvicorn
 from dotenv import load_dotenv
@@ -11,11 +12,8 @@ from starlette.responses import StreamingResponse
 
 from ai_agentic_chatbot.agent.graph import build_graph
 from ai_agentic_chatbot.agent.schema import StreamRequest
-from ai_agentic_chatbot.application.ingest_vector_schema import (
-    ingest_schema,
-    SCHEMA_TO_TEXT_PATH,
-)
-from ai_agentic_chatbot.infrastructure.vector_store.pgvector_store import get_vector_store
+from ai_agentic_chatbot.application.ingest_vector_schema import ingest_schema
+from ai_agentic_chatbot.infrastructure.vector_store.pgvector_store import PgVectorSchemaStore
 from ai_agentic_chatbot.infrastructure.datasource.datasource_init import (
     initialize_datasources,
 )
@@ -34,17 +32,22 @@ from ai_agentic_chatbot.application.transform_schema_to_text import (
     transform_schema_to_text,
     generate_schema_summary,
 )
-from ai_agentic_chatbot.utils.utils import get_db_connection_string
 from ai_agentic_chatbot.auth.router import router as auth_router
 from ai_agentic_chatbot.auth.dependencies import get_auth_db, get_current_user
 from ai_agentic_chatbot.auth.models import User
 from ai_agentic_chatbot.auth.repository import count_prompts_today, create_prompt_log
+from ai_agentic_chatbot.context.router import router as context_router
 
 load_dotenv()
 
 # Setup logging
 setup_logging()
 logger = get_logger(__name__)
+
+# TODO 9 (not yet done): resolve these per-context via DbContextRegistry
+# (schema_dir, vector_collection_name) instead of single project-wide defaults.
+DEFAULT_SCHEMA_DIR = Path(__file__).resolve().parent.parent.parent / "temp"
+DEFAULT_VECTOR_COLLECTION = "db_schema_vectors"
 
 
 @asynccontextmanager
@@ -80,6 +83,7 @@ app = FastAPI(
 )
 
 app.include_router(auth_router)
+app.include_router(context_router)
 
 
 @app.get(
@@ -140,7 +144,7 @@ def schema_json(current_user: User = Depends(get_current_user)):
 
         extractor = SchemaExtractor(db_engine, config)
         schema = extractor.extract_database_schema()
-        schema_file_path = save_schema_temp_file(schema)
+        schema_file_path = save_schema_temp_file(schema, DEFAULT_SCHEMA_DIR)
 
         return {"SchemaPath": schema_file_path}
     except Exception as exc:
@@ -164,8 +168,8 @@ def schema_json(current_user: User = Depends(get_current_user)):
 )
 def schema_text(current_user: User = Depends(get_current_user)):
     try:
-        transform_schema_to_text()
-        generate_schema_summary()
+        transform_schema_to_text(DEFAULT_SCHEMA_DIR)
+        generate_schema_summary(DEFAULT_SCHEMA_DIR)
 
         return {"Schema to text conversion completed"}
     except Exception as exc:
@@ -190,13 +194,16 @@ def schema_text(current_user: User = Depends(get_current_user)):
 )
 def ingest_schema_endpoint(force_reset: bool = False, current_user: User = Depends(get_current_user)):
     try:
+        # TODO 9: resolve context_id/collection_name from a context_id query param
+        # via DbContextRegistry instead of these single-context literals.
         if force_reset:
-            get_vector_store().reset_collection()
+            PgVectorSchemaStore(collection_name=DEFAULT_VECTOR_COLLECTION).reset_collection()
             logger.info("force_reset=True: pgvector collection cleared before ingest")
 
         ingest_schema(
-            schema_path=SCHEMA_TO_TEXT_PATH,
-            pg_conn_str=get_db_connection_string(),
+            schema_path=DEFAULT_SCHEMA_DIR / "schema_documentation.yaml",
+            context_id="default",
+            collection_name=DEFAULT_VECTOR_COLLECTION,
         )
         return {"status": "ingested", "force_reset": force_reset}
     except Exception as exc:

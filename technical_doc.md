@@ -5112,22 +5112,34 @@ Create `src/ai_agentic_chatbot/context/repository.py`:
 | `assign_context_to_user(db, user_id, context_db_id, is_default)` | Inserts a `user_contexts` row; if `is_default=True`, clears the existing default first |
 | `seed_contexts_from_config(db, registry)` | Called at startup — upserts config.yaml entries into `db_contexts` so the DB is always in sync with config |
 
-#### TODO 5 — Add admin API endpoints for context management; resolve the source-of-truth conflict
+#### TODO 5 — Add admin API endpoints for context management; resolve the source-of-truth conflict ✅ COMPLETED
 
 **Source-of-truth decision (was missing from original plan):**
 
-config.yaml is the **source of truth** for context definitions. The `db_contexts` table is a **DB mirror** populated by `seed_contexts_from_config()` at startup and used for user assignments. `POST /admin/contexts` must NOT be used to create new contexts — it only manages user assignments. To add a new context: add it to config.yaml first, then restart the service (which seeds it into the DB), then assign it to users.
+config.yaml is the **source of truth** for context definitions. The `db_contexts` table is a **DB mirror** populated by `seed_contexts_from_config()` at startup and used for user assignments. `POST /context/admin` must NOT be used to create new contexts — it only manages user assignments. To add a new context: add it to config.yaml first, then restart the service (which seeds it into the DB), then assign it to users.
 
-File: `auth/router.py`
+**Amendment during implementation — router placement (2026-07-01):** the original plan said `File: auth/router.py`, reusing the existing superuser-gated router (`/auth/users`, etc.). That was implemented first, then reverted after review: it made `auth/router.py` import from `context.repository`/`context.schemas`, i.e. **auth depending on context** — the reverse of the dependency direction TODO 4 already established for the repository layer (context must depend on auth, never the other way). It also produced `/auth/admin/contexts` and `/auth/contexts` instead of the clean paths below.
+
+**Final implementation:** a dedicated `context/router.py`, mounted in `server.py` via `app.include_router(context_router)` (the same one-line pattern already used for `auth_router` — unavoidable, since FastAPI has no router auto-discovery). It imports `get_current_user` / `get_auth_db` from `auth.dependencies` and `get_user_by_username` from `auth.repository` — a one-way dependency on `auth`. `auth/router.py` has zero knowledge of `context`.
+
+File: `context/router.py` (prefix `/context`)
 
 | Endpoint | Method | Notes |
 |---|---|---|
-| `/admin/contexts` | GET | List all active contexts from DB (superuser only) |
-| `/admin/contexts/{context_slug}/users/{username}` | PUT | Assign context to user (superuser only) |
-| `/admin/contexts/{context_slug}/users/{username}` | DELETE | Remove user's context access (superuser only) |
-| `/contexts` | GET | Return calling user's allowed contexts (for UI switcher) |
+| `/context/admin` | GET | List all active contexts from DB (superuser only) |
+| `/context/admin/{context_slug}/users/{username}` | PUT | Assign context to user (superuser only); `is_default` query param clears any prior default first |
+| `/context/admin/{context_slug}/users/{username}` | DELETE | Remove user's context access (superuser only); HTTP 404 if not assigned |
+| `/context` | GET | Return calling user's allowed contexts with an `is_default` flag (for UI switcher) — this also satisfies TODO 19, which specified the same endpoint; no separate work was needed there |
 
-> Removing `POST /admin/contexts` from the original plan — context creation is controlled by config.yaml, not the API.
+> Removing `POST /context/admin` from the original plan — context creation is controlled by config.yaml, not the API.
+
+**Repository additions beyond TODO 4's original list:** `context/repository.py` needed two more functions to back these endpoints — `list_active_contexts(db)` (all active `db_contexts` rows, for the admin list) and `remove_context_assignment(db, user_id, context_db_id) -> bool` (for the DELETE endpoint, returns `False` if no assignment existed so the route can 404).
+
+**Schema gap fixed along the way:** `db_contexts.display_name` is `NOT NULL` (TODO 3), but neither `DbContextConfig` (TODO 2) nor `config.yaml`'s `contexts:` block defined one. Added `display_name: Optional[str] = None` to `DbContextConfig` (defaults to the context slug if omitted) so `seed_contexts_from_config` has a value to write.
+
+**Verified against the live `ai_chatbot_db_v2` database** using real `admin`/`dcc` accounts via `TestClient` (with lifespan startup so `DataSourceFactory` is initialized): superuser list, non-superuser 403, assign with `is_default=true`, self-service list reflecting the assignment, unassign (204), repeat unassign (404), and confirmation the list reverts to empty. No test data left behind.
+
+**Unrelated bug found and fixed during verification:** `users_id_seq` was desynced from `public.users` (`last_value=2` while `id=3` already existed for user `dcc`), which would have broken the next `/auth/register` call with a `UniqueViolation`. Fixed via `SELECT setval('users_id_seq', (SELECT MAX(id) FROM users))`.
 
 ---
 
@@ -5301,11 +5313,9 @@ After authenticating the user (JWT), resolve `context_id` in this order:
    - If that also returns `None` (user has no assigned contexts): raise `HTTP 422` with message `"No context assigned to this user. Contact an administrator."` — do NOT allow this to propagate to a 500 error.
 3. Inject `db_context_id` into the initial `AgentState` before calling `graph.astream_events()`.
 
-#### TODO 19 — Add `GET /contexts` endpoint for the frontend
+#### TODO 19 — Add `GET /contexts` endpoint for the frontend ✅ COMPLETED (as part of TODO 5)
 
-File: `auth/router.py` or `server.py`
-
-Returns the list of contexts the current user is allowed to access — used by the frontend to render a context-switcher UI element. Response includes `context_id`, `display_name`, and `is_default` flag.
+Implemented as `GET /context` in `context/router.py` — see TODO 5 for the full router placement decision. Returns the list of contexts the current user is allowed to access, with `context_id`, `display_name`, and `is_default` flag, used by the frontend to render a context-switcher UI element. No separate implementation was needed once TODO 5 was done.
 
 ---
 
@@ -5377,7 +5387,7 @@ Do this before starting Phase 1 to reduce noise during review:
 | Router node | `agent/router.py` | Use context-specific prompt + per-context `get_schema_loader()` call |
 | SQL nodes | `retrieve_schemas.py`, `generate_sql.py`, `execute_query.py`, `glossary_lookup.py` | Context-aware schema loader, vector store, `SET LOCAL` with `engine.begin()` |
 | API | `agent/schema.py`, `server.py` | Add `context_id` to `StreamRequest`; resolve + inject at `/stream`; handle zero-context user with 422 |
-| Admin routes | `auth/router.py` | Context-user assignment endpoints (no POST /admin/contexts) |
+| Admin routes | `context/router.py` (new, prefix `/context`) | Context-user assignment endpoints (no POST /context/admin); depends one-way on `auth.dependencies`/`auth.repository`, never the reverse |
 | System prompts | `prompts/context_{id}/system_prompt.md` | One prompt file per context |
 
 > **Key insight:** The `DataSourceFactory` infrastructure already supports multiple named datasources. Since all contexts share one PostgreSQL database, `get_engine("postgresql.primary")` remains unchanged in all nodes — only the `SET LOCAL search_path` injection in `execute_query.py` (using `engine.begin()`) changes how the engine resolves table names at runtime.

@@ -18,6 +18,7 @@ if config.config_file_name is not None:
 # Import Base and register all ORM models so autogenerate can detect them
 from ai_agentic_chatbot.infrastructure.database import Base
 import ai_agentic_chatbot.auth.models  # noqa: F401 — registers User with Base.metadata
+import ai_agentic_chatbot.context.models  # noqa: F401 — registers DbContext/UserContext with Base.metadata
 from pgvector.sqlalchemy import Vector  # noqa: F401 — registers vector type so Alembic does not warn on pgvector columns
 
 target_metadata = Base.metadata
@@ -29,9 +30,15 @@ def include_object(object, name, type_, reflected, compare_to):
     This prevents Alembic from detecting or dropping pre-existing business
     tables (orders, sales, customer, etc.) that have no ORM model.
     Any new model added to Base will automatically be picked up.
+
+    For schema-qualified ORM models (e.g. schema="app"), Base.metadata.tables
+    stores the key as "app.db_contexts" while `name` is just "db_contexts".
+    Check both forms so autogenerate correctly detects app-schema tables.
     """
     if type_ == "table":
-        return name in Base.metadata.tables
+        schema = getattr(object, "schema", None)
+        qualified_name = f"{schema}.{name}" if schema else name
+        return qualified_name in Base.metadata.tables or name in Base.metadata.tables
     return True
 
 

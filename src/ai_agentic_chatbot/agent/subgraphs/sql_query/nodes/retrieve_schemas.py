@@ -7,7 +7,7 @@ from ai_agentic_chatbot.infrastructure.embedding.embedding_connection import (
 from langchain_core.runnables import RunnableConfig
 from ai_agentic_chatbot.schema_extractor.schema_loader import get_schema_loader
 from ai_agentic_chatbot.logging_config import get_logger
-from ai_agentic_chatbot.infrastructure.vector_store.pgvector_store import get_vector_store
+from ai_agentic_chatbot.infrastructure.vector_store.pgvector_store import PgVectorSchemaStore
 
 logger = get_logger(__name__)
 
@@ -228,7 +228,10 @@ def _semantic_searchV2(
         # against all stored schema vectors using cosine similarity in SQL.
         # Returns (table_name, relevance_score) sorted descending, already filtered
         # by score_threshold. Scores are 0-1 (higher = more similar).
-        vector_store = get_vector_store()
+        # TODO 13: resolve collection_name from db_context_id via DbContextRegistry
+        # instead of this single-context literal, once the SQL subgraph state
+        # carries db_context_id (Phase 3/4).
+        vector_store = PgVectorSchemaStore(collection_name="db_schema_vectors")
         pgvector_results = vector_store.search(query, k=k, score_threshold=score_threshold)
 
         if not pgvector_results:

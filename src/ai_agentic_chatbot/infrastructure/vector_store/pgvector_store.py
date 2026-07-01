@@ -1,4 +1,4 @@
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple
 
 from langchain_core.documents import Document
 from langchain_postgres import PGVector
@@ -16,12 +16,18 @@ class PgVectorSchemaStore:
     - Embedding schema text
     - Storing vectors in PostgreSQL (pgvector)
     - Searching stored vectors by semantic similarity
+
+    collection_name must be unique per context (see DbContextConfig.vector_collection_name)
+    — different contexts share the same underlying langchain_pg_collection /
+    langchain_pg_embedding tables (in the public schema) and are isolated only by
+    collection name. langchain_postgres has no schema= constructor option to
+    physically separate them into their own PostgreSQL schema (checked 0.0.16
+    and 0.0.17 — neither supports it).
     """
 
     def __init__(
             self,
-            connection_string: str,
-            collection_name: str = "db_schema_vectors",
+            collection_name: str,
             embedding_model: str = "text-embedding-3-small",
     ):
         self._engine = get_engine("postgresql.primary")
@@ -101,14 +107,3 @@ class PgVectorSchemaStore:
         matched = sorted(best.items(), key=lambda x: x[1], reverse=True)
         logger.debug(f"pgvector search returned {len(matched)} tables above threshold {score_threshold}")
         return matched
-
-
-_vector_store: Optional[PgVectorSchemaStore] = None
-
-
-def get_vector_store() -> PgVectorSchemaStore:
-    """Return the singleton PgVectorSchemaStore instance."""
-    global _vector_store
-    if _vector_store is None:
-        _vector_store = PgVectorSchemaStore(connection_string="")
-    return _vector_store
