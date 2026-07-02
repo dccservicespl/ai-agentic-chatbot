@@ -1,8 +1,10 @@
+import os
 from contextlib import asynccontextmanager
 
 import uvicorn
 from dotenv import load_dotenv
 from fastapi import FastAPI, Depends, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from langchain_core.messages import AIMessage
 from langchain_core.messages import HumanMessage
 from sqlalchemy import text
@@ -80,6 +82,14 @@ app = FastAPI(
 )
 
 app.include_router(auth_router)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=os.getenv("CORS_ORIGINS", "*").split(","),
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization"],
+    allow_credentials=True,
+)
 
 
 @app.get(
