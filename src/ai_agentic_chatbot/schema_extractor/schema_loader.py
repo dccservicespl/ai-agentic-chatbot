@@ -227,39 +227,6 @@ class SchemaLoader:
 
         return "VARCHAR(255)"
 
-    def _generate_ddl_from_doc(self, table: Dict) -> str:
-        """Generate DDL from processed documentation (legacy method)."""
-        table_name = table.get("table_name", "")
-        schema_name = table.get("schema_name", "public")
-
-        lines = [f"CREATE TABLE {schema_name}.{table_name} ("]
-
-        col_lines = []
-        for col in table.get("columns", []):
-            col_line = f"  {col.get('name', '')} {col.get('data_type', '')}"
-            if not col.get("nullable", True):
-                col_line += " NOT NULL"
-            if col.get("default"):
-                col_line += f" DEFAULT {col.get('default')}"
-            col_lines.append(col_line)
-
-        primary_keys = table.get("primary_keys", [])
-        if primary_keys:
-            pk_cols = ", ".join(primary_keys)
-            col_lines.append(f"  PRIMARY KEY ({pk_cols})")
-
-        for fk in table.get("foreign_keys", []):
-            fk_line = (
-                f"  FOREIGN KEY ({fk.get('column', '')}) "
-                f"REFERENCES {fk.get('referred_table', '')}({fk.get('referred_column', '')})"
-            )
-            col_lines.append(fk_line)
-
-        lines.append(",\n".join(col_lines))
-        lines.append(");")
-
-        return "\n".join(lines)
-
     def _generate_ddl_from_raw(self, table: Dict) -> str:
         """Generate DDL from raw schema JSON."""
         table_name = table.get("table_name", "")

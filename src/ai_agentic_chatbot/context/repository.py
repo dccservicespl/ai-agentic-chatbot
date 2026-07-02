@@ -38,6 +38,10 @@ def get_context_by_slug(db: Session, context_id: str) -> Optional[DbContext]:
     ).scalar_one_or_none()
 
 
+def is_user_assigned_to_context(db: Session, user_id: int, context_db_id: int) -> bool:
+    return db.get(UserContext, (user_id, context_db_id)) is not None
+
+
 def list_active_contexts(db: Session) -> list[DbContext]:
     return list(
         db.execute(

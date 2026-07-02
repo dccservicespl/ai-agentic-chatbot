@@ -37,6 +37,7 @@
 29. [User Prompt Management — Implementation Plan ✅ COMPLETED](#29-user-prompt-management--implementation-plan-completed)
 30. [Multi-Database Context Support — Architecture & TODO List](#30-multi-database-context-support--architecture--todo-list)
 31. [Database Structure for Multi-Context — Decision & Schema Design](#31-database-structure-for-multi-context--decision--schema-design)
+32. [`config.yaml` vs `.env` — Ownership, Dead Variables & Cleanup Status](#32-configyaml-vs-env--ownership-dead-variables--cleanup-status)
 
 ---
 
@@ -281,6 +282,8 @@ logging:
 | `ROUTER_PROMPT_PATH` | Path to router system prompt file | — |
 
 > 💡 All env vars are loaded by `python-dotenv` from `.env` at startup. They take **precedence** over values in `config.yaml`.
+
+> ⚠️ This table predates multi-context support and is incomplete/stale (missing `EMBEDDING_*`, `JWT_*`, per-context path vars). See [Section 32](#32-configyaml-vs-env--ownership-dead-variables--cleanup-status) for the current, verified variable-by-variable audit.
 
 ---
 
@@ -4998,7 +5001,7 @@ Pending — plan recorded 2026-06-27. No code changes made yet.
 | P1 | `alembic/env.py` `include_object` will not detect `app`-schema ORM models for autogenerate | `alembic/env.py:26–35` | Fix before any `--autogenerate` run; write first migration by hand |
 | P2 | `GRANT ALL PRIVILEGES ON ALL TABLES` does not cover future tables | Section 31 Bootstrap SQL | Add `ALTER DEFAULT PRIVILEGES` — see Section 31 |
 | P2 | `user_contexts.is_default` has no DB-level uniqueness constraint | TODO 3 | Add partial unique index `WHERE is_default = TRUE` |
-| P2 | No error when user has zero assigned contexts — unhandled 500 | TODO 18 | Return `HTTP 422` with clear message |
+| P2 | No error when user has zero assigned contexts — unhandled 500 | TODO 18 ✅ | Return `HTTP 422` with clear message |
 | P2 | Full schema docs injected on every request including greetings — high token cost | TODO 20 | Use `schema_summary.json` instead of full table docs for prompt injection |
 | P3 | Context CRUD placed in `auth/repository.py` — wrong module | TODO 4 | Move to new `context/repository.py` |
 | P3 | Context switching within same `thread_id` is undefined | TODO 10 | Document behavior — require new `thread_id` per context switch |
@@ -5301,7 +5304,7 @@ class StreamRequest(BaseModel):
     context_id: Optional[str] = None   # if None, use user's default context
 ```
 
-#### TODO 18 — Update the `/stream` route to resolve and inject context
+#### TODO 18 — Update the `/stream` route to resolve and inject context ✅ COMPLETED
 
 File: `server.py:245`
 
@@ -5314,6 +5317,8 @@ After authenticating the user (JWT), resolve `context_id` in this order:
    - If that also returns `None` (user has no assigned contexts): raise `HTTP 422` with message `"No context assigned to this user. Contact an administrator."` — do NOT allow this to propagate to a 500 error.
 3. Inject `db_context_id` into the initial `AgentState` before calling `graph.astream_events()`.
 
+**Implemented as `_resolve_stream_context()` in `server.py:67-102`, called from `/stream` at `server.py:346`.** Matches the spec with one refinement: when `context_id` is omitted, the resolver first checks the thread's existing checkpointed `db_context_id` (via `graph.get_state()`) before falling back to `get_default_context()` — this lets a conversation continue on its original context across turns without needing the client to re-send `context_id`, and prevents a later default-context change from silently retargeting an already-started thread. The outer route still has `except HTTPException: raise` before its generic 500 handler (`server.py:411-412`), so the 403/400/422 responses are not swallowed.
+
 #### TODO 19 — Add `GET /contexts` endpoint for the frontend ✅ COMPLETED (as part of TODO 5)
 
 Implemented as `GET /context` in `context/router.py` — see TODO 5 for the full router placement decision. Returns the list of contexts the current user is allowed to access, with `context_id`, `display_name`, and `is_default` flag, used by the frontend to render a context-switcher UI element. No separate implementation was needed once TODO 5 was done.
@@ -5322,7 +5327,7 @@ Implemented as `GET /context` in `context/router.py` — see TODO 5 for the full
 
 ### Phase 6 — System Prompt Refactor
 
-#### TODO 20 — Decouple table knowledge from `system_prompt.md`
+#### TODO 20 — Decouple table knowledge from `system_prompt.md` ✅ COMPLETED
 
 The current `system_prompt.md` has 5 table names, column listings, and ~50 hardcoded SQL examples baked in statically. This makes it unusable for a second context.
 
@@ -5334,9 +5339,25 @@ The current `system_prompt.md` has 5 table names, column listings, and ~50 hardc
 - Inject `ctx_loader.load_schema_summary()` at the `{schema_summary}` placeholder in `prompt_loader.py`.
 - Create a separate `system_prompt.md` per context under `prompts/context_{id}/system_prompt.md`, keeping only context-independent instructions in a shared base template.
 
+**Investigation findings (pre-implementation):** most of the surrounding plumbing was already in place from TODO 14–16 before this TODO started — `prompt_loader.get_system_prompt()`/`get_router_prompt()` already accepted per-context path overrides, `db_context_id` was already threaded through `router.py`/`generate_sql.py`, and `schema_summary.json` was already auto-generated per context by `generate_schema_summary()` (`application/transform_schema_to_text.py`) as part of the `/schemaText` ingest step — no new generation step was needed. What was actually missing was narrower than the doc implied: `system_prompt.md` had no `{schema_summary}` placeholder at all, and two things the doc's problem statement calls out (`~50 hardcoded SQL examples`; the alias/view-preference specifics baked into the SQL generation rules) weren't addressed by the doc's own "Changes" bullets, which only covered the table/column sections. Also found: the "shared base template" the third bullet asks for had zero precedent in the codebase — every context previously got one fully standalone `system_prompt.md`.
+
+**Actual implementation — three-way split instead of a single monolith:**
+
+- `prompts/base_system_prompt.md` (**new**) — shared, context-independent template: generic SQL generation rules, intent classification table, visualization query-structure rules, plus `{formatted_date}`, `{schema_summary}`, and `{context_extra}` placeholders. Used by every context.
+- `prompts/demo_01/system_prompt.md` (**rewritten**, 1410 → ~70 lines) — shrunk to a per-context fragment only: business glossary/definitions, order lifecycle state machine, preferred-view note (`v_sales_summary`), and table-alias convention. Loaded raw and substituted at `{context_extra}` — this file has no format placeholders of its own.
+- `prompts/demo_01/sql_examples.md` (**new**) — the ~50 example Q→SQL pairs (including the visualization-targeted ones), split out of the monolith entirely since they're SQL-generation aids, not routing/greeting content.
+- `prompt_loader.get_system_prompt(system_prompt_path, schema_summary="")` — now loads `base_system_prompt.md`, substitutes the per-context fragment at `{context_extra}` and the caller-supplied summary at `{schema_summary}`, and still injects `{formatted_date}`. Backward-incompatible signature change was unavoidable: adding `{schema_summary}`/`{context_extra}` to the template meant every existing call site had to pass (or default) both in the same change, or `.format()` would `KeyError` immediately.
+- `router.py` passes the `schema_summary_text` it already computes for the router prompt's own `{schema_text}` placeholder into `get_system_prompt()` too (no duplicate computation) — keeps routing/greeting/clarification calls cheap (no SQL examples, no full column docs).
+- `generate_sql.py` loads `sql_examples.md` via the new `ctx.sql_examples_path` config field and injects it into its own prompt only (where `retrieved_tables` DDL already supplies precise column detail); does *not* pass `schema_summary` — the base template's placeholder just resolves to an empty string there, which is fine. Also dropped a hardcoded `— prefer v_sales_summary whenever it appears` clause from this node's own f-string in favor of the generic "prefer summary views" rule backed by the context fragment's note, removing a second, redundant hardcode the doc hadn't flagged.
+- `DbContextConfig` gained a new required field `sql_examples_path: str`; `config.yaml`'s `sales` context sets it to `src/ai_agentic_chatbot/prompts/demo_01/sql_examples.md`.
+
+**Verified live:** `get_system_prompt()` run end-to-end against the real `demo_01` files in both call shapes (with and without `schema_summary`) — no leftover `{...}` placeholders in the output, correct content substitution. `config.yaml` parses and `DbContextRegistry` picks up `sql_examples_path` correctly. Existing test suite (`test_router_node.py`, `test_agent_graph_e2e.py`) shows the same 6 pre-existing failures with and without this change (confirmed via `git stash` comparison) — unrelated stale mock (`patch("...router.SchemaLoader")` against a module that only exports `get_schema_loader`), not a regression from this work.
+
+**Net effect:** router/greeting/clarification turns now carry roughly 9.4 KB of prompt (base + context fragment + schema summary) instead of the full ~1410-line monolith — directly addresses the doc's token-cost warning above.
+
 ---
 
-### Phase 7 — Pre-launch Dead Code Cleanup (Optional but Recommended)
+### Phase 7 — Pre-launch Dead Code Cleanup (Optional but Recommended) ✅ COMPLETED
 
 Do this before starting Phase 1 to reduce noise during review:
 
@@ -5346,17 +5367,41 @@ Do this before starting Phase 1 to reduce noise during review:
 | `agent/subgraphs/sql_query/nodes/retrieve_schemas.py:58–186` | Commented-out `_semantic_search` function | Delete |
 | `schema_extractor/schema_loader.py:231–261` | Unused `_generate_ddl_from_doc` method | Delete |
 
+**Actually done well after Phase 1 (this was never executed pre-launch as recommended — the codebase moved through TODOs 14–20 with this dead code still present), and the scope turned out larger than documented:**
+
+- **`agent/graph.py`** — the three-column table undersold this. `_semantic_search`'s counterpart aside, this file actually had **seven** dead functions, not six: alongside the five listed here plus `format_sql_response_with_visualization`, there was also `create_clean_json_response` (~line 154) — never called anywhere, not flagged in this table, found only during the pre-deletion verification pass. All seven removed (~281 lines). No top-level imports were affected — each dead function had its own local `import json`/`import sqlparse`, which disappeared with the function bodies.
+- **`agent/subgraphs/sql_query/nodes/retrieve_schemas.py`** — the doc undersold this too. The "commented-out `_semantic_search` function" was actually two things: a small commented docstring stub *and*, immediately below it, a live, uncommented, fully unused duplicate `_semantic_search()` function (the real replacement, `_semantic_searchV2`, is what's actually called). Deleting it also orphaned `_cosine_similarity()` (its only caller) and the `get_azure_openai_embedding` import (used only inside the dead function — `_semantic_searchV2` gets its embedding indirectly via `PgVectorSchemaStore.search()` instead). All three plus the now-dead import removed (~151 lines total).
+- **`schema_extractor/schema_loader.py`** — matched the doc as described; `_generate_ddl_from_doc` removed cleanly (~33 lines), single-blank-line convention preserved between the surrounding methods.
+
+**Verification:** a researcher agent did a repo-wide reference check (not just `src/`) before any deletion — no test mocks, no dynamic/string references, no `__init__.py` re-exports, no LangGraph `add_node` wiring for any of the 8 removed symbols. After deletion: import sanity check passed for all three touched modules, and the full test suite showed zero new failures — same 6 pre-existing `test_router_node.py` failures and the same `test_db_connection.py`/`test_agent_graph_e2e.py` collection errors as on unmodified `main` (confirmed via `git stash` comparison both before and after this cleanup), all caused by a stale `patch("...router.SchemaLoader")` mock and an unrelated in-progress module path, neither connected to this cleanup.
+
+**Process note:** the code-writer agent that performed the deletion self-reported completing all four target removals, but its diff was missing `create_clean_json_response` — caught only by re-reading the file directly after the agent reported done, not by trusting the summary. Fixed by hand and re-verified (import check + full test suite) afterward.
+
+Net: 465 lines of dead code removed across 3 files, 0 lines added, 0 regressions.
+
 ---
 
 ### Phase 8 — Testing & Hardening
 
-#### TODO 21 — Write integration tests for context isolation
+#### TODO 21 — Write integration tests for context isolation ✅ COMPLETED
 
 - Verify a query from context A never touches context B's tables or vector collection.
 - Verify a user not assigned to any context gets `HTTP 422`, not `HTTP 500`.
 - Verify a user not assigned to a specific context gets `HTTP 403` when requesting that context.
 - Verify `SET LOCAL search_path` resets correctly between requests (pool connection reuse test) — connect to the same pooled connection twice and confirm the second query does not inherit the first request's search_path.
 - Verify context switching on the same `thread_id` returns `HTTP 400`.
+
+**Implemented in `tests/test_context_isolation.py` (new file) — one test method per bullet, in order:**
+
+1. `test_context_a_query_never_touches_context_b_tables_or_vectors` — real Postgres, covers both halves of this bullet in one method: (a) SQL isolation via two throwaway schemas (`test_iso_ctx_a`/`test_iso_ctx_b`), mirroring `execute_query.py`'s exact `SET LOCAL search_path` pattern, asserting an unqualified query under context A's search_path only ever sees A's row; (b) pgvector collection isolation via two throwaway `PgVectorSchemaStore` collections, with `get_azure_openai_embedding` patched to a deterministic fake `Embeddings` implementation (hash-derived vectors) so the test needs no real Azure credentials while still exercising real Postgres/pgvector storage and search. Both halves clean up via `try/finally` (drop schemas, `reset_collection()`) even on assertion failure.
+2. `test_zero_assigned_contexts_returns_422_not_500` — pure mock test against `_resolve_stream_context`, no infra.
+3. `test_unassigned_context_returns_403` — pure mock test.
+4. `test_search_path_resets_between_pooled_connections` — real Postgres, proves a `SET LOCAL` set in one connection/transaction doesn't leak into the next `engine.connect()` call, regardless of pool reuse.
+5. `test_context_switch_on_same_thread_returns_400` — pure mock test.
+
+**Infra-dependent tests skip, don't fail, when Postgres is unreachable:** Tests 1 and 4 attempt a genuine `engine.connect()` (via a shared `_get_pg_engine_or_skip()` helper that also calls `initialize_datasources()` first, since that registration normally only happens in FastAPI's `lifespan()`, which pytest never triggers) and call `pytest.skip(...)` on failure rather than hard-failing or being unconditionally skipped. In this environment `config.yaml`'s `postgresql.primary` has no configured host/username/password, so both currently skip — they have not yet been verified to pass against a real reachable Postgres instance with pgvector enabled. Tests 2, 3, 5 need no external infrastructure and always run.
+
+**Verified:** ran independently (not just trusting the implementing agent's self-report) — `pytest tests/test_context_isolation.py -v` → 3 passed, 2 skipped (expected, no reachable DB here); full suite (`pytest tests/ -q --continue-on-collection-errors`) → same pre-existing baseline (6 known `test_router_node.py` failures, `test_db_connection.py`/`test_agent_graph_e2e.py` collection errors) plus the 3 new passes, zero regressions.
 
 #### TODO 22 — Seed a second context end-to-end
 
@@ -5603,6 +5648,62 @@ The following steps are all required. "No code changes" is accurate for Python a
 7. Populate the business data tables in `context_finance` schema (out of scope for this app).
 8. Call `GET /schemaJson?context_id=finance` → `GET /schemaText?context_id=finance` → `GET /ingest?context_id=finance`.
 9. Assign the context to users via `PUT /admin/contexts/finance/users/{username}`.
+
+---
+
+## 32. `config.yaml` vs `.env` — Ownership, Dead Variables & Cleanup Status
+
+> **Trigger:** After multi-context support (Section 30/31) moved several paths that used to live only in `.env` into `config.yaml`'s new `contexts.<id>.*` block, it was unclear whether the old top-level `.env` path keys were still load-bearing or now dead. This section is the audit + the resulting cleanup.
+
+### Ownership Split
+
+| File | Owns | Loaded by |
+|---|---|---|
+| `config.yaml` | Structural/topology config: which LLM providers/models exist, which datasources exist, which DB contexts exist and their per-context paths | Three independent Pydantic-settings singletons, each with its own `from_config_file()`: `infrastructure/llm/settings.py`, `infrastructure/datasource/datasource_settings.py`, `infrastructure/context/context_settings.py` (`DbContextRegistry`) |
+| `.env` | Secrets (API keys, DB password, JWT secret) + env-specific overrides merged **on top of** `config.yaml`'s structural entries | `load_dotenv()` — called in `server.py`, `alembic/env.py`, `auth/seed.py`, `utils/utils.py`, `embedding_connection.py`, `transform_schema_to_text.py` |
+
+`config.yaml`'s `datasources.postgresql.primary` block ships with blank `host`/`username`/`password` by design — those three fields are always supplied by `.env` via each settings class's `_apply_env_overrides` (e.g. `datasource_settings.py:85-97`, `llm/settings.py:136-153`).
+
+### DB Connection String Sourcing (confirmed)
+
+`POSTGRESQL_HOST/PORT/DB/USER/PASSWORD` (`.env`) → `DataSourceSettings._apply_env_overrides` → merged into the `postgresql.primary` entry parsed from `config.yaml` → `initialize_datasources()` registers it with `DataSourceFactory` → on first `get_engine("postgresql.primary")`, `PostgreSQLConfig.get_connection_string()` builds `postgresql+psycopg2://{user}:{password}@{host}:{port}/{database}?sslmode=...` and `factory.py` calls `create_engine(...)`.
+
+### Path-Variable Redundancy Audit
+
+Four `.env` keys were suspected redundant now that `config.yaml.contexts.<id>.*` carries per-context paths:
+
+| `.env` key | Verdict | Superseded by | Notes |
+|---|---|---|---|
+| `SCHEMA_PATH` | Fully dead — zero references in `src/` | `DbContextConfig.schema_dir` | `SchemaLoader` now takes `schema_dir` per context (`schema_loader.py`, called via `get_schema_loader(context_id, schema_dir)` in `router.py`/`retrieve_schemas.py`) |
+| `SCHEMA_SUMMARY_PATH` | Fully dead — zero references in `src/` | Same `schema_dir`-based loading | |
+| `VECTOR_COLLECTION_NAME` | Fully dead — zero references in `src/` | `DbContextConfig.vector_collection_name` | Found during this audit, not originally suspected |
+| `ROUTER_PROMPT_PATH` | **Unreachable fallback**, not literally dead code | `DbContextConfig.router_prompt_path` | `prompt_loader.py` still has `router_prompt_path or os.environ["ROUTER_PROMPT_PATH"]` (`get_router_prompt`), but every caller (`router.py`) now always passes `ctx.router_prompt_path`, a required field — the `or` short-circuits before the env lookup runs |
+| `SYSTEM_PROMPT_PATH` | **Unreachable fallback**, same pattern | `DbContextConfig.system_prompt_path` | `prompt_loader.py`'s `get_system_prompt`: `system_prompt_path or os.environ["SYSTEM_PROMPT_PATH"]`; callers (`router.py`, `generate_sql.py`) always pass `ctx.system_prompt_path` |
+| `MYSQL_*` (5 vars) | Fully dead | n/a | Leftover from the completed MySQL→PostgreSQL migration (see `project_mysql_to_postgres_migration.md` history); `config.yaml` no longer has a `mysql:` block either |
+| `LLM_SMITH_API_KEY` | Fully dead — zero references in `src/` | n/a | Found during this audit; blank in both `.env` and `.env.example`, unrelated to multi-context work |
+
+Precedence where it still theoretically matters: explicit per-context arg always wins over the env fallback — but since callers never pass `None`, `config.yaml` is the only value that's ever actually used for these four paths today.
+
+### JWT & AI/LLM API Keys (confirmed live)
+
+- `JWT_SECRET_KEY` / `JWT_ALGORITHM` / `JWT_ACCESS_TOKEN_EXPIRE_MINUTES` — `auth/jwt_utils.py`; `JWT_REFRESH_TOKEN_EXPIRE_DAYS` — `auth/router.py`. Sign/verify access + refresh tokens.
+- `AZURE_OPENAI_API_KEY/ENDPOINT/API_VERSION`, `AZURE_AI_FOUNDRY_API_KEY/ENDPOINT` — override the blank placeholder fields under `config.yaml.llm.*` (`llm/settings.py`), feed `get_llm()`.
+- `EMBEDDING_API_KEY/ENDPOINT/MODEL_NAME/API_VERSION` — read directly (not via `config.yaml`) in `infrastructure/embedding/embedding_connection.py`.
+
+### Cleanup Status (as of 2026-07-02)
+
+**Done** — removed from the live `.env`:
+- `MYSQL_*` (5 vars) ✅
+- `SCHEMA_PATH` ✅
+- `SCHEMA_SUMMARY_PATH` ✅
+- `VECTOR_COLLECTION_NAME` ✅
+
+**Outstanding** — deferred, not yet actioned:
+1. `ROUTER_PROMPT_PATH` / `SYSTEM_PROMPT_PATH` still present in `.env`. Removing them requires first dropping the `or os.environ[...]` fallback in `prompt_loader.py:58,81` (making the params required) — otherwise the app breaks the moment these env vars are absent, since the fallback path is still technically reachable code even though it's never hit today.
+2. `entrypoint.sh:39-40` — `check_var ROUTER_PROMPT_PATH` / `check_var SYSTEM_PROMPT_PATH` — will fail Docker startup on a missing var that nothing in the app actually reads. Needs to be removed in lockstep with (1).
+3. `.env.docker` (template) — still lists `SCHEMA_PATH`, `SCHEMA_SUMMARY_PATH`, `VECTOR_COLLECTION_NAME`, and the full `MYSQL_*` block, and marks `ROUTER_PROMPT_PATH`/`SYSTEM_PROMPT_PATH` as `REQUIRED`. Not yet mirrored to match the live `.env` cleanup.
+4. `.env.example` — still has `MYSQL_*` (6 vars). Also missing `EMBEDDING_*` and `AZURE_AI_FOUNDRY_*`, which are live and required — incomplete independent of this cleanup.
+5. `LLM_SMITH_API_KEY` — dead, not yet removed from `.env` / `.env.example`.
 
 ---
 

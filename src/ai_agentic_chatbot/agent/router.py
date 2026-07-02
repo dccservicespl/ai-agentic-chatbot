@@ -17,10 +17,9 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 PROMPT_PATH = BASE_DIR / "prompts" / "custom_prompts.md"
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 
-# TODO 18 (not yet done): /stream will inject the real db_context_id (from the
-# user's assigned/default context) into AgentState. Until then, every request
-# resolves against this one real, configured context — "default" is not a
-# registered context_id in config.yaml, so it can't be used as a registry fallback.
+# Fallback only for state that predates TODO 18 (checkpoints saved before
+# db_context_id was injected into AgentState). "default" is not a registered
+# context_id in config.yaml, so it can't be used as a registry fallback.
 _FALLBACK_CONTEXT_ID = "sales"
 
 
@@ -89,7 +88,9 @@ class RouterNode:
                 for t in schema_summary.get("tables", [])
             ]
         )
-        base_prompt = SystemMessage(content=get_system_prompt(ctx.system_prompt_path))
+        base_prompt = SystemMessage(
+            content=get_system_prompt(ctx.system_prompt_path, schema_summary=schema_summary_text)
+        )
         prompt = SystemMessage(
             content=prompt_text.format(schema_text=schema_summary_text)
         )

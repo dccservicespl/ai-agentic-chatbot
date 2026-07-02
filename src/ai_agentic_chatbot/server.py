@@ -1,5 +1,6 @@
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Optional
 
 import uvicorn
 from dotenv import load_dotenv
@@ -41,6 +42,11 @@ from ai_agentic_chatbot.auth.dependencies import get_auth_db, get_current_user
 from ai_agentic_chatbot.auth.models import User
 from ai_agentic_chatbot.auth.repository import count_prompts_today, create_prompt_log
 from ai_agentic_chatbot.context.router import router as context_router
+from ai_agentic_chatbot.context.repository import (
+    get_context_by_slug,
+    get_default_context,
+    is_user_assigned_to_context,
+)
 
 load_dotenv()
 
@@ -56,6 +62,44 @@ def _resolve_context(context_id: str) -> DbContextConfig:
         return get_context_registry().get_context(context_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
+
+
+def _resolve_stream_context(
+    db: Session,
+    current_user: User,
+    requested_context_id: Optional[str],
+    existing_context_id: Optional[str],
+) -> str:
+    """Resolve which context_id a /stream request should run against.
+
+    requested_context_id: stream_request.context_id from the client (may be None).
+    existing_context_id: db_context_id already stored in this thread_id's
+    LangGraph checkpoint, if any (None for a brand-new thread_id).
+    """
+    if requested_context_id is not None:
+        ctx = get_context_by_slug(db, requested_context_id)
+        if ctx is None or not ctx.is_active:
+            raise HTTPException(status_code=404, detail=f"Unknown context_id: {requested_context_id!r}")
+        if not is_user_assigned_to_context(db, current_user.id, ctx.id):
+            raise HTTPException(status_code=403, detail="You do not have access to this context")
+        if existing_context_id is not None and existing_context_id != ctx.context_id:
+            raise HTTPException(status_code=400, detail="Context switch requires a new thread_id")
+        return ctx.context_id
+
+    # No context_id supplied — continue an in-progress conversation's existing
+    # context rather than re-resolving the user's default on every turn (that
+    # would let a later default-context change silently retarget an
+    # already-started thread with no error).
+    if existing_context_id is not None:
+        return existing_context_id
+
+    default_ctx = get_default_context(db, current_user.id)
+    if default_ctx is None:
+        raise HTTPException(
+            status_code=422,
+            detail="No context assigned to this user. Contact an administrator.",
+        )
+    return default_ctx.context_id
 
 
 @asynccontextmanager
@@ -271,7 +315,10 @@ def build_stream_response_data(content: str, accumulated_state: dict) -> dict:
     ),
     responses={
         200: {"description": "SSE stream — JSON events with content and optional visualization"},
-        400: {"description": "Bad request — messages list is empty"},
+        400: {"description": "Bad request — messages list is empty, or context switch requires a new thread_id"},
+        403: {"description": "User is not assigned to the requested context"},
+        404: {"description": "Unknown context_id"},
+        422: {"description": "No context assigned to this user"},
         500: {"description": "Internal server error during agent execution"},
     },
 )
@@ -288,6 +335,21 @@ async def stream_endpoint(
         if not messages:
             raise HTTPException(status_code=400, detail="messages cannot be empty")
 
+        config = {"configurable": {"thread_id": thread_id}}
+        state_snapshot = graph.get_state(config)
+        existing_context_id = (
+            state_snapshot.values.get("db_context_id")
+            if state_snapshot and state_snapshot.values
+            else None
+        )
+
+        db_context_id = _resolve_stream_context(
+            db=db,
+            current_user=current_user,
+            requested_context_id=stream_request.context_id,
+            existing_context_id=existing_context_id,
+        )
+
         if current_user.daily_prompt_limit > 0:
             used_today = count_prompts_today(db, current_user.id)
             if used_today >= current_user.daily_prompt_limit:
@@ -300,10 +362,10 @@ async def stream_endpoint(
             prompt_text=messages[-1].content,
         )
 
-        config = {"configurable": {"thread_id": thread_id}}
-        inputs = {"messages": [HumanMessage(content=messages[-1].content)]}
-
-        state_snapshot = graph.get_state(config)
+        inputs = {
+            "messages": [HumanMessage(content=messages[-1].content)],
+            "db_context_id": db_context_id,
+        }
 
         if state_snapshot and state_snapshot.values:
             existing_messages = state_snapshot.values.get("messages", [])

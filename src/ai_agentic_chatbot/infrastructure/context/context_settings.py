@@ -13,6 +13,7 @@ class DbContextConfig(BaseModel):
     schema_name: str
     include_tables: List[str]
     system_prompt_path: str
+    sql_examples_path: str
     router_prompt_path: str
     schema_dir: str
     vector_collection_name: str
