@@ -133,18 +133,32 @@ def unassign_context(
 @router.get(
     "",
     response_model=list[UserContextResponse],
-    summary="List the calling user's assigned contexts",
+    summary="List contexts assigned to the caller, or (superuser-only) another user",
     description=(
-        "Returns the contexts assigned to the authenticated user, with an "
-        "is_default flag — used by the frontend to render a context switcher."
+        "Requires a valid JWT. Omit `username` to get the calling user's own "
+        "assigned contexts, with an is_default flag. Pass `?username=<name>` "
+        "matching your own username for the same result. Passing `?username=<name>` "
+        "for a *different* user requires the caller to be a superuser — non-superusers "
+        "get a 403; if the target username does not exist, returns 404."
     ),
 )
 def list_my_contexts(
+    username: str | None = None,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_auth_db),
 ):
-    contexts = get_contexts_for_user(db, current_user.id)
-    default_ctx = get_default_context(db, current_user.id)
+    if username is not None and username != current_user.username:
+        if not current_user.is_superuser:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Superuser access required")
+        assert username is not None
+        target_user = get_user_by_username(db, username)
+        if target_user is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+    else:
+        target_user = current_user
+
+    contexts = get_contexts_for_user(db, target_user.id)
+    default_ctx = get_default_context(db, target_user.id)
     default_id = default_ctx.id if default_ctx else None
     return [
         UserContextResponse(

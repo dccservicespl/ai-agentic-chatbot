@@ -43,6 +43,7 @@
 35. [Bug Fix — Hardcoded Out-of-Scope Refusal Message Leaked demo_01's Domain Into Every Context](#35-bug-fix--hardcoded-out-of-scope-refusal-message-leaked-demo_01s-domain-into-every-context)
 36. [`v_sales_summary` Materialized View — Query Performance Analysis & Runbook (Pending)](#36-v_sales_summary-materialized-view--query-performance-analysis--runbook-pending)
 37. [Follow-Up Question Suggestions After Each Answer (Pending)](#37-follow-up-question-suggestions-after-each-answer-pending)
+38. [Prompt History + NL→SQL Caching — Analysis & Implementation Plan (Pending)](#38-prompt-history--nlsql-caching--analysis--implementation-plan-pending)
 
 ---
 
@@ -6000,4 +6001,251 @@ Return JSON: {"follow_up_questions": ["...", "...", "..."]}
 
 ---
 
-*Generated: 2026-05-29 | Updated: 2026-07-03 | Repository: `ai-agentic-chatbot` | Branch: `27-feature-multi-database-context-support`*
+## 38. Prompt History + NL→SQL Caching — Analysis & Implementation Plan (Pending)
+
+> **Trigger:** User wants a "prompt history" feature (let users see and re-run prompts they've submitted before) but flagged a real concern up front: naively re-sending a stored prompt back through the full LLM pipeline on every replay is wasteful. Four `researcher` agent passes (pipeline cost audit → external-review comparison → schema-invalidation-signal design → full implementation plan) were run across 2026-07-07/08 to ground the design in the actual codebase before writing code. **No code has been changed yet — this section exists so the work can be picked up later.**
+
+### Analysis Process (chronological)
+
+1. **Pipeline cost audit** — traced the full `/stream` request path end-to-end to find out which steps are actually expensive, rather than assuming "replay = re-run everything = wasteful" applied uniformly to every step.
+2. **External second opinion** — a shared Claude conversation proposing a "multi-tier caching strategy to eliminate redundant LLM calls" was fetched and cross-checked line-by-line against this codebase (see below for what was adopted vs. corrected).
+3. **Schema-invalidation reality check** — the external review assumed existing "schema/glossary versioning infrastructure" could be reused for cache invalidation; verified this doesn't exist and designed a minimal real signal instead.
+4. **Full implementation plan** — turned the agreed design into concrete files, table schemas, LangGraph wiring, and endpoints, grounded in this repo's actual migration tooling, existing models, and session-lifetime conventions.
+
+### Pipeline Cost Breakdown (grounded findings)
+
+| Step | Node | LLM call? | Model | Cost |
+|---|---|---|---|---|
+| Intent classification | `router_node` (`agent/router.py`) | Yes — call #1 | `gpt-4o-mini` (cheap) | Low |
+| Schema retrieval | `retrieve_schemas_node` (`subgraphs/sql_query/nodes/retrieve_schemas.py`) | Embedding call + pgvector search | — | Low |
+| **NL → SQL generation** | `generate_sql_node` (`subgraphs/sql_query/nodes/generate_sql.py:66`) | Yes — call #2, up to 3× with retries | `gpt-4.1` (expensive) | **High — the real cost driver** |
+| SQL validation | `validate_query_node` | No — regex/string checks only | — | Free |
+| SQL execution | `execute_query_node` | No — plain SQLAlchemy | — | DB-only, needed for freshness |
+| Chart type selection | `visualizer_node` (`agent/nodes/visualizer.py:_apply_heuristics`) | **No — already a pandas heuristic**, confirmed via code read (stale `# TODO: apply intelligent heuristics using LLMs` comment at line 48 overstates what's implemented) | — | Free |
+| Answer prose | inline in `sql_query_node` (`agent/graph.py:117-133`) | Yes — call #3 | `gpt-4o-mini` (cheap) | Low |
+
+**Conclusion:** only `generate_sql_node` (and, to a lesser extent, `router_node`) are worth avoiding on replay. Chart-type selection was never expensive — it's already free — so no caching benefit exists there; the plan below must not regress it toward an LLM call.
+
+### Design: Three Operations Replace "Always Regenerate"
+
+Today's `/stream` collapses every prompt (fresh or replayed) into the same expensive path. The design splits history interactions into three distinct operations with very different costs:
+
+| Operation | What it needs | LLM call? | DB call? | Cost |
+|---|---|---|---|---|
+| **View** — "show me what I asked and got" | Stored prompt + stored SQL + stored result/chart snapshot | No | No | Free |
+| **Refresh** — "same question, current data" | Stored SQL, re-executed | No | Yes | Cheap |
+| **Regenerate** — "re-interpret the prompt" | Full NL→SQL pipeline | Yes | Yes | Expensive |
+
+Most history interactions are View or Refresh, not Regenerate — the user is revisiting a known question, not asking a new one.
+
+### External Review Comparison — What Was Adopted vs. Corrected
+
+A shared conversation proposing a multi-tier caching strategy was fetched (after an initial WebFetch failure on the raw `claude.ai/share/...` link — confirmed as a known limitation, [anthropics/claude-code#7162](https://github.com/anthropics/claude-code/issues/7162) — the user pasted the content directly instead) and checked against the real pipeline:
+
+**Adopted:**
+- The View / Refresh / Regenerate framing — better than this project's own first-draft recommendation ("always re-execute on replay"), since it makes "View" free instead of defaulting to a DB round-trip.
+- Splitting a shared, SQL-only `prompt_cache` (safe to reuse across users) from a per-user `prompt_history` log (has row-level result data, inherently scoped to the user who ran it) — with the explicit caveat that only SQL text/config is shared across users, never cached result rows, because row-level access can differ per user/role.
+- The relative-date fix: generated SQL should use `CURRENT_DATE`/`EXTRACT(YEAR FROM CURRENT_DATE)` instead of hardcoded literal years, so cached SQL for "this year"-style prompts doesn't silently go stale.
+
+**Corrected (external review was wrong about this codebase specifically):**
+- It assumed "you already have versioning infrastructure for schema/glossary changes" and suggested keying cache invalidation off `schema_metadata`. Verified false: `schema_metadata` and `business_glossary` (`agent/subgraphs/sql_query/nodes/glossary_lookup.py`) are plain content tables (column descriptions, business term definitions) with no version/timestamp column. There's also a red herring already in the codebase — `vector_schema_builder.py` stamps every vector chunk with `"schema_version": "v1"`, but that string is a hardcoded literal in `application/transform_schema_to_text.py:57,86` that never changes; it is not a real signal and must not be reused as one.
+- Chart-type-via-LLM was flagged by the external review as something to fix — but it's already free in this codebase (see cost table above), so that recommendation was a no-op here, not a gap to close.
+
+### Decision: Schema-Change Invalidation Signal (`schema_hash`)
+
+Since no real versioning signal exists, one had to be designed from scratch, chosen for being the minimal thing that's actually causally tied to schema changes (rejecting a manual `config.yaml` counter as strictly weaker — it relies on an admin remembering to bump it, for the same implementation effort):
+
+- Compute a SHA-256 hash of the **structural** output of `SchemaExtractor.extract_database_schema()` — table/column/PK/FK names and types, sorted deterministically so introspection order never changes the hash for an unchanged schema. Not a hash of LLM-generated documentation prose (regenerating docs via `/schemaText` shouldn't bust the cache).
+- Computed at the one point in the system already causally tied to "the admin believes the schema changed": the `/schemaJson` endpoint (`server.py:197-232`), which the codebase already documents as "re-run whenever the database schema changes."
+- Stored per-context as new `schema_hash` + `schema_updated_at` columns on the existing `app.db_contexts` row (`context/models.py`), following the same precedent already set by `is_active`/`created_at` — columns that `seed_contexts_from_config` deliberately never touches on config-driven upsert; only a dedicated function writes them.
+- Cache key becomes `(normalized_prompt, db_context_id, schema_hash)`. This composite key **is** the entire invalidation mechanism — no explicit "invalidate" step is needed; once the hash changes, old rows simply stop matching new lookups and become inert (eviction of dead rows is a separate, explicitly deferred decision — see Open Decisions).
+- Residual gap: if the DB schema changes but nobody re-runs `/schemaJson`, the hash won't reflect it. The fallback for this is a targeted routing rule — a cache-hit that fails execution with a schema-related error (`execute_query.py`'s error categorization, `"not_found"` category) is treated as a stale hit and falls through to full regeneration exactly once, guarded by a `cache_fallback_used` flag to avoid loops.
+
+### Implementation Plan
+
+#### Phase 1 — Database Schema Changes (Alembic)
+
+This project's migrations are hand-written (not `--autogenerate`) for schema-qualified tables — the existing `alembic/versions/c7b3a9f2e1d4_add_app_schema_and_context_tables.py` is explicitly commented "do NOT replace with --autogenerate" because `alembic/env.py`'s `include_object` only recognizes ORM models explicitly imported there. New revision: `down_revision = "c7b3a9f2e1d4"`.
+
+**1a. `app.db_contexts`** — add two nullable columns: `schema_hash VARCHAR(64)`, `schema_updated_at TIMESTAMPTZ`.
+
+**1b. New table `app.prompt_cache`** — the efficiency layer:
+
+```python
+op.create_table(
+    "prompt_cache",
+    sa.Column("id", sa.BigInteger(), autoincrement=True, nullable=False),
+    sa.Column("normalized_prompt", sa.Text(), nullable=False),
+    sa.Column("db_context_id", sa.BigInteger(), nullable=False),
+    sa.Column("schema_hash", sa.String(length=64), nullable=False),
+    sa.Column("generated_sql", sa.Text(), nullable=False),
+    sa.Column("explanation", sa.Text(), nullable=True),
+    sa.Column("chart_type", sa.String(length=50), nullable=True),
+    sa.Column("chart_config", JSONB(), nullable=True),
+    sa.Column("result_columns", JSONB(), nullable=True),
+    sa.Column("hit_count", sa.BigInteger(), server_default="0", nullable=False),
+    sa.Column("last_used_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
+    sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
+    sa.ForeignKeyConstraint(["db_context_id"], ["app.db_contexts.id"], ondelete="CASCADE", name="fk_prompt_cache_context_id"),
+    sa.PrimaryKeyConstraint("id"),
+    sa.UniqueConstraint("normalized_prompt", "db_context_id", "schema_hash", name="uq_prompt_cache_key"),
+    schema="app",
+)
+op.create_index("ix_prompt_cache_context_schema", "prompt_cache", ["db_context_id", "schema_hash"], schema="app")
+```
+
+`chart_config` stores only the small axis/column-mapping sub-dict from the visualizer payload — never row data.
+
+**1c. New table `prompt_history`** — the per-user log/UI concern, kept **separate from the existing `PromptLog`** (`auth/models.py`). Investigated first: `create_prompt_log` (`auth/repository.py`) is called in `/stream` for *every* message — greetings, nonsense, everything — and `count_prompts_today` uses it for the daily rate limit. Bolting SQL-specific columns (generated SQL, chart snapshot, cache linkage) onto it would leave those columns null on most rows and risks the rate-limit query. Firm decision: new table, `PromptLog`/`create_prompt_log`/`count_prompts_today` untouched.
+
+```python
+op.create_table(
+    "prompt_history",
+    sa.Column("id", sa.BigInteger(), autoincrement=True, nullable=False),
+    sa.Column("user_id", sa.BigInteger(), nullable=False),
+    sa.Column("thread_id", sa.String(length=255), nullable=False),
+    sa.Column("db_context_id", sa.BigInteger(), nullable=False),
+    sa.Column("raw_prompt", sa.Text(), nullable=False),
+    sa.Column("prompt_cache_id", sa.BigInteger(), nullable=True),
+    sa.Column("generated_sql", sa.Text(), nullable=True),
+    sa.Column("was_cache_hit", sa.Boolean(), server_default="false", nullable=False),
+    sa.Column("chart_type", sa.String(length=50), nullable=True),
+    sa.Column("result_snapshot", JSONB(), nullable=True),
+    sa.Column("executed_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
+    sa.ForeignKeyConstraint(["user_id"], ["users.id"], ondelete="CASCADE", name="fk_prompt_history_user_id"),
+    sa.ForeignKeyConstraint(["db_context_id"], ["app.db_contexts.id"], ondelete="CASCADE", name="fk_prompt_history_context_id"),
+    sa.ForeignKeyConstraint(["prompt_cache_id"], ["app.prompt_cache.id"], ondelete="SET NULL", name="fk_prompt_history_cache_id"),
+    sa.PrimaryKeyConstraint("id"),
+)
+op.create_index("ix_prompt_history_user_executed", "prompt_history", ["user_id", "executed_at"])
+op.create_index("ix_prompt_history_thread_id", "prompt_history", ["thread_id"])
+```
+
+`result_snapshot` stores the **full** visualizer payload (type/title/data/columns/config/summary/row_count) — this is what makes View free (zero DB/LLM calls). It's per-user, so full result rows are safe here even though `prompt_cache` never stores them.
+
+New model files: `context/prompt_cache_models.py` (`PromptCache`, schema="app", next to `DbContext`), `PromptHistory` added to `auth/models.py` alongside `PromptLog`. `alembic/env.py` needs a new `import ai_agentic_chatbot.context.prompt_cache_models` line (mirroring the existing `context.models` import) so `Base.metadata` sees it.
+
+#### Phase 2 — `schema_hash` Computation + Storage
+
+New file `schema_extractor/schema_hash.py`:
+
+```python
+import hashlib, json
+from ai_agentic_chatbot.schema_extractor.SchemaModels import DatabaseSchema
+
+def compute_schema_hash(schema: DatabaseSchema) -> str:
+    """Deterministic hash of structural schema. Sorted explicitly so
+    introspection order (not guaranteed stable across runs/DB versions)
+    never changes the hash for an unchanged schema.
+    """
+    canonical = sorted(
+        (
+            t.schema_name, t.table_name, t.object_type,
+            sorted((c.name, c.data_type, c.nullable) for c in t.columns),
+            sorted(t.primary_keys),
+            sorted((fk.column, fk.referred_table, fk.referred_column) for fk in t.foreign_keys),
+        )
+        for t in schema.tables
+    )
+    payload = json.dumps(canonical, sort_keys=True, default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+```
+
+`context/repository.py` gets `update_schema_hash(db, *, context_id, schema_hash)`, mirroring `seed_contexts_from_config`'s session style. `server.py`'s `/schemaJson` handler gains a `db: Session = Depends(get_auth_db)` parameter and calls `update_schema_hash` right after `extractor.extract_database_schema()`; response payload gains `"schema_hash"` for observability. This turns `/schemaJson` from a pure introspection/file-write endpoint into a DB-writing one — no conflict with existing callers (already `current_user`-gated), but worth noting in its endpoint description.
+
+#### Phase 3 — `prompt_cache` Read/Write Wiring Into the LangGraph Graph
+
+**Normalization** (new `utils/text_normalize.py` — no existing normalization utility found anywhere in the codebase, grepped project-wide): `normalize_prompt()` lowercases, trims, and collapses whitespace only. Deliberately does not strip punctuation or handle synonyms — "top 10 customers" and "top ten customers" are different cache keys under v1. Ship the simple version first and measure hit rate before investing in fuzzier matching (see Open Decisions).
+
+**`SQLSubgraphState`** (`subgraphs/sql_query/state.py`) gains: `normalized_prompt`, `schema_hash`, `cache_hit`, `cache_row_id`, `cache_fallback_used`, `force_regenerate`, `cached_chart_type`, `cached_chart_config`.
+
+**New node `cache_lookup_node`** (`subgraphs/sql_query/nodes/cache_lookup.py`) becomes the subgraph's **entry point** (replacing `retrieve_schemas`). It normalizes the prompt, looks up the context's current `schema_hash` on `db_contexts`, and queries `prompt_cache` on `(normalized_prompt, db_context_id, schema_hash)`. On a hit, it returns `generated_sql`/`is_safe=True`/`confidence=1.0` directly (the cached SQL already passed `validate_query_node` at write time) so a new conditional edge routes straight to `execute_query_node`, skipping `retrieve_schemas` → `generate_sql` → `validate_query` entirely. On a miss (including when `force_regenerate=True`, used by the Regenerate endpoint), it routes to `retrieve_schemas` as today.
+
+**Subtlety caught during planning:** a cache-hit that then fails execution *cannot* route to `generate_sql` for a retry, because `generate_sql_node` hard-requires a non-empty `retrieved_tables` — which never got populated on the hit path (schema retrieval was skipped). The fallback route must go to `retrieve_schemas` instead, and only once (`cache_fallback_used` guards against a loop). This is encoded as an addition to `execute_query_node`'s existing error-categorization branch, not as in-place state mutation inside the routing function — keeping the pattern consistent with how every other node in this subgraph already works (routing functions only read state; nodes return the state changes).
+
+**Cache write** happens as a **plain function call**, not a graph node — `sync_prompt_cache(subgraph_result, visualization)` in a new `subgraphs/sql_query/cache_sync.py`, called from the parent graph's `sql_query_node` (`agent/graph.py`) right after the existing `visualizer_node` call. This is deliberate: chart type is only known *after* the subgraph returns and the parent computes `visualization`, so the write can't happen inside the subgraph itself. It's a no-op if `execution_error`/`validation_errors` are present (never cache a failed generation), increments `hit_count`/`last_used_at` on a cache-hit replay, and inserts-or-overwrites keyed on the same `(normalized_prompt, db_context_id, schema_hash)` tuple on a fresh generation.
+
+**Visualizer support for Refresh** — `VisualizationNode.determine_visualization` gains an optional `forced_type` parameter so Refresh can reuse the stored chart type instead of re-deriving it; `_apply_heuristics` gets refactored into small per-type builder methods so a forced type can invoke the matching builder directly. If the fresh data no longer structurally fits the forced type, falls back to normal heuristic detection with a `"type_reused": False` flag for the UI (proposed default — see Open Decisions).
+
+#### Phase 4 — `prompt_history` Persistence + View/Refresh/Regenerate Endpoints
+
+New domain package `history/` (parallel to `context/`): `models.py`, `repository.py` (`write_prompt_history`, `get_history_item`, `list_history_for_user`), `schemas.py`, `router.py`.
+
+```
+GET  /history                    -> list_history_for_user (paginated)
+GET  /history/{id}                -> View: pure read of the stored PromptHistory row, zero LLM/DB calls beyond the row itself
+POST /history/{id}/refresh        -> Refresh: calls execute_query_node directly (no LLM, no router, no subgraph invocation at all), reuses forced chart_type
+POST /history/{id}/regenerate      -> Regenerate: invokes sql_subgraph directly with force_regenerate=True, overwrites the prompt_cache row
+```
+
+Both Refresh and Regenerate deliberately bypass the parent graph and router entirely — Refresh has no LLM in its call path at all, matching the design goal exactly; Regenerate skips only the router (intent is already known from history) but still goes through the full SQL subgraph.
+
+**Real bug avoided during planning:** writing `prompt_history` for the normal `/stream` flow must happen **inside** `event_generator`, after the `graph.astream` loop — but by that point the endpoint function has already returned its `StreamingResponse`, so the `Depends(get_auth_db)`-injected session is no longer safe to use (this is exactly why the existing `create_prompt_log` call in `/stream` happens *before* the `return`, not inside the generator). The history write must open its **own** session via `get_session("postgresql.primary")`, following the same pattern already used in `server.py`'s `lifespan()`.
+
+Auth pattern reuses `Depends(get_current_user)` + `Depends(get_auth_db)` exactly as `context/router.py` already does; ownership check is `row.user_id != current_user.id` — no superuser bypass unless explicitly requested (see Open Decisions).
+
+#### Phase 5 — Relative-Date System Prompt Fix
+
+`base_system_prompt.md` already has a rule against hardcoded dates (rule 12), and per-context `sql_examples.md` files already model the correct pattern — so this isn't a missing rule, it's a missing *warning about a specific trap*. `get_system_prompt()` (`utils/prompt_loader.py`) injects the literal string `Today's date: {formatted_date}` (e.g. "Wednesday, July 08, 2026") directly into every prompt — which is exactly what tempts an LLM to embed that literal year in generated SQL instead of computing it. New rule 12a added immediately after rule 12, explicitly telling the model the injected date is for reference only, not a value to embed — and ties the stakes directly to caching: a hardcoded literal silently goes stale under `prompt_cache` replay, while a `CURRENT_DATE`-based query stays correct indefinitely. Single shared-template change; no per-context files need touching.
+
+#### Phase 6 — Testing Plan
+
+Follows the existing `tests/test_context_isolation.py` conventions (pure-unit tests with mocks where no DB is needed; DB-dependent tests skip gracefully rather than fail when Postgres is unreachable).
+
+New `tests/test_prompt_cache.py`:
+- `normalize_prompt` whitespace/case-fold unit test
+- `compute_schema_hash` determinism (order-independent) and change-detection (column add flips the hash)
+- `route_after_cache_lookup` pure routing unit test
+- `route_after_execution` schema-drift fallback: one retry to `retrieve_schemas` on a cache-hit `"not_found"` failure, no infinite loop on a second failure
+- `cache_lookup_node` miss when `schema_hash` is `None` (schema never captured for this context)
+- `cache_lookup_node` hit returns cached SQL without invoking `retrieve_schemas`/`generate_sql` (mocked, `assert_not_called()`)
+- `sync_prompt_cache` skips writing on `execution_error`
+
+New `tests/test_prompt_history_endpoints.py`:
+- 404 on viewing another user's history item (ownership check)
+- Refresh never calls the LLM (patch `get_llm`/`generate_sql_node` to raise if invoked)
+- Refresh reuses forced chart type where the fresh data shape still allows it
+- Regenerate forces a cache miss and overwrites the existing row
+- `prompt_history` is not written for non-SQL turns (greeting/fallback), mirroring the existing `went_through_sql_node` gating already used for `visualization`/`analysis`
+
+Optional: a migration smoke test running `alembic upgrade head` against a throwaway schema, asserting the new tables/columns exist — matching the seriousness with which `c7b3a9f2e1d4` was hand-verified.
+
+### Files To Add / Modify
+
+| Action | File |
+|---|---|
+| Add | `alembic/versions/<hash>_add_prompt_cache_and_history.py` |
+| Add | `context/prompt_cache_models.py` (`PromptCache`) |
+| Add | `schema_extractor/schema_hash.py` (`compute_schema_hash`) |
+| Add | `utils/text_normalize.py` (`normalize_prompt`) |
+| Add | `subgraphs/sql_query/nodes/cache_lookup.py` (`cache_lookup_node`) |
+| Add | `subgraphs/sql_query/cache_sync.py` (`sync_prompt_cache`) |
+| Add | `history/__init__.py`, `models.py`, `repository.py`, `schemas.py`, `router.py` |
+| Add | `tests/test_prompt_cache.py`, `tests/test_prompt_history_endpoints.py` |
+| Modify | `alembic/env.py` — import `context.prompt_cache_models` |
+| Modify | `context/models.py` — `schema_hash`, `schema_updated_at` on `DbContext` |
+| Modify | `context/repository.py` — `update_schema_hash` |
+| Modify | `auth/models.py` — add `PromptHistory` (leave `PromptLog` untouched) |
+| Modify | `subgraphs/sql_query/state.py` — new cache-related state fields |
+| Modify | `subgraphs/sql_query/graph.py` — new entry point + conditional edges |
+| Modify | `subgraphs/sql_query/routes.py` — `route_after_cache_lookup`, modified `route_after_execution` |
+| Modify | `subgraphs/sql_query/nodes/execute_query.py` — schema-drift fallback passthrough |
+| Modify | `agent/graph.py` — `sql_query_node` calls `sync_prompt_cache`, new default state fields |
+| Modify | `agent/nodes/visualizer.py` — `forced_type` param, per-type builder refactor |
+| Modify | `server.py` — `/schemaJson` hash write, `include_router(history_router)`, post-stream history write in its own session |
+| Modify | `prompts/base_system_prompt.md` — rule 12a (anti-hardcoded-date, cache-aware) |
+
+### Open Decisions Requiring a Human Call
+
+1. **`prompt_cache` TTL/eviction policy** — the unique-key design lets stale rows (old `schema_hash` values) accumulate silently with no cleanup mechanism specified. Candidates: periodic job/admin endpoint deleting rows where the context's current `schema_hash` no longer matches, or a simple `last_used_at`-based TTL (e.g. 90 days).
+2. **`normalize_prompt` fuzziness** — simple whitespace/case-fold proposed as v1; punctuation-stripping, stopword removal, or synonym normalization would raise the cache hit rate but add complexity. Recommend shipping v1 and measuring before investing further.
+3. **Refresh chart-type mismatch behavior** — when fresh data no longer structurally fits the forced/reused chart type, graceful degradation with a `type_reused: false` flag was proposed over a hard error, but not confirmed.
+4. **Admin visibility into other users' history** — currently scoped strictly to the owning user; whether superusers should be able to browse others' `prompt_history` is unspecified.
+
+### Status
+
+**Pending — design and full implementation plan recorded 2026-07-08 across four research passes. No code changes made yet.** Pick up at Phase 1 (Alembic migration) when ready; Phases 1–3 (schema, hash computation, graph wiring) should land together since the cache read/write path is meaningless without the table and invalidation key it depends on. Phases 4–5 (endpoints, prompt fix) can follow independently.
+
+---
+
+*Generated: 2026-05-29 | Updated: 2026-07-08 | Repository: `ai-agentic-chatbot` | Branch: `develop`*
