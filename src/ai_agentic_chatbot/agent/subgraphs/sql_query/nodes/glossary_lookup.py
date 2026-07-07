@@ -1,5 +1,6 @@
 """Runtime glossary and column-hint lookups for SQL generation prompt enrichment."""
 
+import re
 from typing import List
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
@@ -7,18 +8,29 @@ from ai_agentic_chatbot.logging_config import get_logger
 
 logger = get_logger(__name__)
 
+# Same validation as execute_query.py's SET LOCAL search_path (TODO 15) —
+# schema_name is interpolated directly into SQL (identifiers can't be bound
+# params), so it must be checked before use even though it traces back to
+# a trusted config.yaml value, not raw user input.
+_VALID_SCHEMA_NAME = re.compile(r"^[a-z_][a-z0-9_]*$")
 
-def fetch_glossary_hints(user_query: str, engine: Engine) -> str:
+
+def fetch_glossary_hints(user_query: str, engine: Engine, schema_name: str) -> str:
     """Query business_glossary for terms that appear in the user query.
 
     Performs a case-insensitive substring match of each glossary term against
     the full user query text. Returns a formatted prompt block, or an empty
-    string if no terms match or the table does not exist yet (pre-P0).
+    string if no terms match, schema_name is invalid, or the table does not
+    exist yet (pre-P0).
     """
+    if not _VALID_SCHEMA_NAME.match(schema_name):
+        logger.warning(f"Invalid schema_name for glossary lookup: {schema_name!r} — skipping")
+        return ""
+
     try:
-        sql = text("""
+        sql = text(f"""
             SELECT term, sql_meaning
-            FROM business_glossary
+            FROM {schema_name}.business_glossary
             WHERE :query ILIKE '%' || term || '%'
             ORDER BY LENGTH(term) DESC
         """)
@@ -44,20 +56,25 @@ def fetch_glossary_hints(user_query: str, engine: Engine) -> str:
         return ""
 
 
-def fetch_column_hints(table_names: List[str], engine: Engine) -> str:
+def fetch_column_hints(table_names: List[str], engine: Engine, schema_name: str) -> str:
     """Query schema_metadata for column descriptions of the retrieved tables.
 
     Returns a formatted prompt block with per-column descriptions, data types,
     sample values, and join-key flags. Returns empty string if no tables
-    provided, no rows found, or the table does not exist yet (pre-P0).
+    provided, schema_name is invalid, no rows found, or the table does not
+    exist yet (pre-P0).
     """
     if not table_names:
         return ""
 
+    if not _VALID_SCHEMA_NAME.match(schema_name):
+        logger.warning(f"Invalid schema_name for column hints lookup: {schema_name!r} — skipping")
+        return ""
+
     try:
-        sql = text("""
+        sql = text(f"""
             SELECT table_name, column_name, data_type, description, sample_values, is_join_key
-            FROM schema_metadata
+            FROM {schema_name}.schema_metadata
             WHERE table_name = ANY(:tables)
               AND column_name IS NOT NULL
             ORDER BY table_name, column_name

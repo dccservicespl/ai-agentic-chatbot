@@ -1,10 +1,10 @@
-import os
 from pathlib import Path
 from typing import Literal, Optional
 
 from ai_agentic_chatbot.logging_config import get_logger
-from ai_agentic_chatbot.schema_extractor.schema_loader import SchemaLoader
-from ai_agentic_chatbot.utils.prompt_loader import get_system_prompt
+from ai_agentic_chatbot.schema_extractor.schema_loader import get_schema_loader
+from ai_agentic_chatbot.utils.prompt_loader import get_system_prompt, get_router_prompt
+from ai_agentic_chatbot.infrastructure.context.context_settings import get_context_registry
 from langchain_core.messages import AIMessage, SystemMessage
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import PydanticOutputParser
@@ -15,6 +15,12 @@ from ai_agentic_chatbot.infrastructure.llm import get_llm
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 PROMPT_PATH = BASE_DIR / "prompts" / "custom_prompts.md"
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
+
+# Fallback only for state that predates TODO 18 (checkpoints saved before
+# db_context_id was injected into AgentState). "default" is not a registered
+# context_id in config.yaml, so it can't be used as a registry fallback.
+_FALLBACK_CONTEXT_ID = "sales"
 
 
 class ClarificationDecision(BaseModel):
@@ -70,9 +76,11 @@ class RouterNode:
         structured_llm = self.llm.with_structured_output(RouterDecision)
         msgs = self.state["messages"]
 
-        with open(os.environ["ROUTER_PROMPT_PATH"], "r") as f:
-            prompt_text = f.read()
-        schema_loader = SchemaLoader()
+        db_context_id = self.state.get("db_context_id") or _FALLBACK_CONTEXT_ID
+        ctx = get_context_registry().get_context(db_context_id)
+
+        prompt_text = get_router_prompt(ctx.router_prompt_path)
+        schema_loader = get_schema_loader(context_id=db_context_id, schema_dir=PROJECT_ROOT / ctx.schema_dir)
         schema_summary = schema_loader.load_schema_summary()
         schema_summary_text = "\n".join(
             [
@@ -80,7 +88,9 @@ class RouterNode:
                 for t in schema_summary.get("tables", [])
             ]
         )
-        base_prompt = SystemMessage(content=get_system_prompt())
+        base_prompt = SystemMessage(
+            content=get_system_prompt(ctx.system_prompt_path, schema_summary=schema_summary_text)
+        )
         prompt = SystemMessage(
             content=prompt_text.format(schema_text=schema_summary_text)
         )
@@ -107,10 +117,7 @@ class RouterNode:
             }
 
         if decision.intent == "out_of_scope":
-            response_msg = (
-                "I'm sorry, I can't help with that. "
-                "I can only assist with questions related to sales, orders, inventory, products, and customers."
-            )
+            response_msg = ctx.out_of_scope_message
             return {
                 **reset_state,
                 "next_step": "nonsense",

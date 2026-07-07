@@ -20,3 +20,7 @@ class StreamRequest(BaseModel):
         ..., description="Unique identifier for the conversation thread."
     )
     messages: List[Message]
+    context_id: Optional[str] = Field(
+        default=None,
+        description="Context slug from config.yaml's contexts: block. If omitted, the user's default context is used (see TODO 18).",
+    )

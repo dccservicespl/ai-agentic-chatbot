@@ -33,7 +33,7 @@ class VectorSchemaBuilder:
             lines.append(f"- {field['field_name']}: {field['meaning']}")
 
         lines.append("\nImportant Dates:")
-        for field in table.get("important_dates", []):
+        for field in (table.get("important_dates") or []):
             lines.append(f"- {field['field_name']}: {field['meaning']}")
 
         if table.get("relationships"):
@@ -54,7 +54,7 @@ class VectorSchemaBuilder:
 
         return "\n".join(lines)
 
-    def build_all_tables(self, schema: Dict) -> List[Dict]:
+    def build_all_tables(self, schema: Dict, context_id: str) -> List[Dict]:
         """
         Returns a list of:
         {
@@ -62,6 +62,10 @@ class VectorSchemaBuilder:
             content: str,
             metadata: dict
         }
+
+        context_id namespaces the deterministic UUID (uuid5) so that two
+        contexts with an identically-named table don't collide on the same
+        pgvector row id.
         """
         results = []
 
@@ -72,7 +76,7 @@ class VectorSchemaBuilder:
                 {
                     "table_name": table["table_name"],
                     "content": content,
-                    "id": str(uuid.uuid5(uuid.NAMESPACE_DNS, table["table_name"])),
+                    "id": str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{context_id}:{table['table_name']}")),
                     "metadata": {
                         "database": schema["database_name"],
                         "schema_version": schema["version"],

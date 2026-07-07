@@ -1,5 +1,7 @@
 import os
 from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Optional
 
 import uvicorn
 from dotenv import load_dotenv
@@ -13,19 +15,21 @@ from starlette.responses import StreamingResponse
 
 from ai_agentic_chatbot.agent.graph import build_graph
 from ai_agentic_chatbot.agent.schema import StreamRequest
-from ai_agentic_chatbot.application.ingest_vector_schema import (
-    ingest_schema,
-    SCHEMA_TO_TEXT_PATH,
-)
-from ai_agentic_chatbot.infrastructure.vector_store.pgvector_store import get_vector_store
+from ai_agentic_chatbot.application.ingest_vector_schema import ingest_schema
+from ai_agentic_chatbot.infrastructure.vector_store.pgvector_store import PgVectorSchemaStore
 from ai_agentic_chatbot.infrastructure.datasource.datasource_init import (
     initialize_datasources,
 )
 from ai_agentic_chatbot.infrastructure.datasource.factory import (
     get_datasource_factory,
     get_engine,
+    get_session,
 )
 from ai_agentic_chatbot.infrastructure.db_depency import get_db_session
+from ai_agentic_chatbot.infrastructure.context.context_settings import (
+    DbContextConfig,
+    get_context_registry,
+)
 from ai_agentic_chatbot.logging_config import setup_logging, get_logger
 from ai_agentic_chatbot.schema_extractor.SaveSchemaJson import save_schema_temp_file
 from ai_agentic_chatbot.schema_extractor.SchemaExtractionConfig import (
@@ -36,17 +40,70 @@ from ai_agentic_chatbot.application.transform_schema_to_text import (
     transform_schema_to_text,
     generate_schema_summary,
 )
-from ai_agentic_chatbot.utils.utils import get_db_connection_string
 from ai_agentic_chatbot.auth.router import router as auth_router
 from ai_agentic_chatbot.auth.dependencies import get_auth_db, get_current_user
 from ai_agentic_chatbot.auth.models import User
 from ai_agentic_chatbot.auth.repository import count_prompts_today, create_prompt_log
+from ai_agentic_chatbot.context.router import router as context_router
+from ai_agentic_chatbot.context.repository import (
+    get_context_by_slug,
+    get_default_context,
+    is_user_assigned_to_context,
+    seed_contexts_from_config,
+)
 
 load_dotenv()
 
 # Setup logging
 setup_logging()
 logger = get_logger(__name__)
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+
+
+def _resolve_context(context_id: str) -> DbContextConfig:
+    try:
+        return get_context_registry().get_context(context_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+
+def _resolve_stream_context(
+    db: Session,
+    current_user: User,
+    requested_context_id: Optional[str],
+    existing_context_id: Optional[str],
+) -> str:
+    """Resolve which context_id a /stream request should run against.
+
+    requested_context_id: stream_request.context_id from the client (may be None).
+    existing_context_id: db_context_id already stored in this thread_id's
+    LangGraph checkpoint, if any (None for a brand-new thread_id).
+    """
+    if requested_context_id is not None:
+        ctx = get_context_by_slug(db, requested_context_id)
+        if ctx is None or not ctx.is_active:
+            raise HTTPException(status_code=404, detail=f"Unknown context_id: {requested_context_id!r}")
+        if not is_user_assigned_to_context(db, current_user.id, ctx.id):
+            raise HTTPException(status_code=403, detail="You do not have access to this context")
+        if existing_context_id is not None and existing_context_id != ctx.context_id:
+            raise HTTPException(status_code=400, detail="Context switch requires a new thread_id")
+        return ctx.context_id
+
+    # No context_id supplied — continue an in-progress conversation's existing
+    # context rather than re-resolving the user's default on every turn (that
+    # would let a later default-context change silently retarget an
+    # already-started thread with no error).
+    if existing_context_id is not None:
+        return existing_context_id
+
+    default_ctx = get_default_context(db, current_user.id)
+    if default_ctx is None:
+        raise HTTPException(
+            status_code=422,
+            detail="No context assigned to this user. Contact an administrator.",
+        )
+    return default_ctx.context_id
 
 
 @asynccontextmanager
@@ -61,6 +118,17 @@ async def lifespan(api: FastAPI):
         logger.info(f"Datasources initialized successfully: {datasources}")
     except Exception as e:
         logger.error(f"Failed to initialize datasources: {e}", exc_info=True)
+
+    logger.info("Seeding contexts from config.yaml...")
+    try:
+        db = get_session("postgresql.primary")
+        try:
+            seed_contexts_from_config(db, get_context_registry())
+            logger.info("Contexts synced to app.db_contexts")
+        finally:
+            db.close()
+    except Exception as e:
+        logger.error(f"Failed to seed contexts: {e}", exc_info=True)
 
     yield
 
@@ -82,6 +150,7 @@ app = FastAPI(
 )
 
 app.include_router(auth_router)
+app.include_router(context_router)
 
 app.add_middleware(
     CORSMiddleware,
@@ -131,26 +200,32 @@ graph = build_graph()
     summary="Extract database schema to JSON",
     description=(
             "Introspects the PostgreSQL database using SQLAlchemy and extracts the structural schema "
-            "(tables, columns, primary keys, foreign keys) for the configured table whitelist: "
-            "`orders`, `customer`, `sales`, `product`, `inventory`. "
-            "The result is serialised to `temp/db_schema.json` and the file path is returned. "
+            "(tables, columns, primary keys, foreign keys) for the given context's PostgreSQL schema "
+            "and table whitelist (both defined in config.yaml under `contexts.<context_id>`). "
+            "The result is serialised to `<context.schema_dir>/db_schema.json` and the file path is returned. "
             "\n\n**Run this as Step 1 of the schema setup pipeline** before calling `/schemaText` or `/ingest`."
     ),
     responses={
         200: {"description": "Schema extracted successfully — returns path to the JSON file"},
+        404: {"description": "Unknown context_id"},
         503: {"description": "Extraction failed — database unreachable or introspection error"},
     },
 )
-def schema_json(current_user: User = Depends(get_current_user)):
+def schema_json(
+    context_id: str = Query(..., description="Context slug from config.yaml's contexts: block"),
+    current_user: User = Depends(get_current_user),
+):
+    ctx = _resolve_context(context_id)
     try:
         db_engine = get_engine("postgresql.primary")
         config = SchemaExtractionConfig(
-            include_tables=["orders", "customer", "sales", "product", "inventory", "v_sales_summary"]
+            include_schemas=[ctx.schema_name],
+            include_tables=ctx.include_tables,
         )
 
         extractor = SchemaExtractor(db_engine, config)
         schema = extractor.extract_database_schema()
-        schema_file_path = save_schema_temp_file(schema)
+        schema_file_path = save_schema_temp_file(schema, PROJECT_ROOT / ctx.schema_dir)
 
         return {"SchemaPath": schema_file_path}
     except Exception as exc:
@@ -162,20 +237,26 @@ def schema_json(current_user: User = Depends(get_current_user)):
     tags=["SchemaExtractor"],
     summary="Convert schema JSON to LLM-enriched documentation",
     description=(
-            "Reads the schema JSON produced by `/schemaJson` and sends each table to the LLM, "
+            "Reads the schema JSON produced by `/schemaJson` for this context and sends each table to the LLM, "
             "which generates a human-readable `TableSchemaDocumentation` (business purpose, key fields, "
-            "relationships, example questions). The output is saved as `schema_documentation.yaml`. "
+            "relationships, example questions). The output is saved as `<context.schema_dir>/schema_documentation.yaml`. "
             "\n\n**Run this as Step 2 of the schema setup pipeline** after `/schemaJson` and before `/ingest`."
     ),
     responses={
         200: {"description": "Schema converted to text documentation successfully"},
+        404: {"description": "Unknown context_id"},
         503: {"description": "Conversion failed — missing schema JSON or LLM error"},
     },
 )
-def schema_text(current_user: User = Depends(get_current_user)):
+def schema_text(
+    context_id: str = Query(..., description="Context slug from config.yaml's contexts: block"),
+    current_user: User = Depends(get_current_user),
+):
+    ctx = _resolve_context(context_id)
     try:
-        transform_schema_to_text()
-        generate_schema_summary()
+        schema_dir = PROJECT_ROOT / ctx.schema_dir
+        transform_schema_to_text(schema_dir)
+        generate_schema_summary(schema_dir)
 
         return {"Schema to text conversion completed"}
     except Exception as exc:
@@ -187,28 +268,37 @@ def schema_text(current_user: User = Depends(get_current_user)):
     tags=["SchemaExtractor"],
     summary="Ingest schema into vector store",
     description=(
-            "Reads the LLM-generated schema documentation (`schema_documentation.yaml`), chunks it per table, "
-            "embeds each chunk using Azure OpenAI embeddings, and upserts the vectors into the pgvector store in PostgreSQL. "
+            "Reads this context's LLM-generated schema documentation (`schema_documentation.yaml`), chunks it "
+            "per table, embeds each chunk using Azure OpenAI embeddings, and upserts the vectors into this "
+            "context's pgvector collection (`context.vector_collection_name`) in PostgreSQL. "
             "After this step the SQL agent can perform semantic table discovery at query time. "
             "\n\n**Run this as Step 3 of the schema setup pipeline** after `/schemaText`. "
             "Re-run whenever the database schema changes."
     ),
     responses={
         200: {"description": "Schema ingested into pgvector successfully"},
+        404: {"description": "Unknown context_id"},
         500: {"description": "Ingestion failed — embedding or database error"},
     },
 )
-def ingest_schema_endpoint(force_reset: bool = False, current_user: User = Depends(get_current_user)):
+def ingest_schema_endpoint(
+    context_id: str = Query(..., description="Context slug from config.yaml's contexts: block"),
+    force_reset: bool = False,
+    current_user: User = Depends(get_current_user),
+):
+    ctx = _resolve_context(context_id)
     try:
         if force_reset:
-            get_vector_store().reset_collection()
-            logger.info("force_reset=True: pgvector collection cleared before ingest")
+            PgVectorSchemaStore(collection_name=ctx.vector_collection_name).reset_collection()
+            logger.info(f"force_reset=True: pgvector collection '{ctx.vector_collection_name}' cleared before ingest")
 
+        schema_dir = PROJECT_ROOT / ctx.schema_dir
         ingest_schema(
-            schema_path=SCHEMA_TO_TEXT_PATH,
-            pg_conn_str=get_db_connection_string(),
+            schema_path=schema_dir / "schema_documentation.yaml",
+            context_id=ctx.context_id,
+            collection_name=ctx.vector_collection_name,
         )
-        return {"status": "ingested", "force_reset": force_reset}
+        return {"status": "ingested", "force_reset": force_reset, "context_id": ctx.context_id}
     except Exception as exc:
         raise exc
 
@@ -248,7 +338,10 @@ def build_stream_response_data(content: str, accumulated_state: dict) -> dict:
     ),
     responses={
         200: {"description": "SSE stream — JSON events with content and optional visualization"},
-        400: {"description": "Bad request — messages list is empty"},
+        400: {"description": "Bad request — messages list is empty, or context switch requires a new thread_id"},
+        403: {"description": "User is not assigned to the requested context"},
+        404: {"description": "Unknown context_id"},
+        422: {"description": "No context assigned to this user"},
         500: {"description": "Internal server error during agent execution"},
     },
 )
@@ -265,6 +358,21 @@ async def stream_endpoint(
         if not messages:
             raise HTTPException(status_code=400, detail="messages cannot be empty")
 
+        config = {"configurable": {"thread_id": thread_id}}
+        state_snapshot = graph.get_state(config)
+        existing_context_id = (
+            state_snapshot.values.get("db_context_id")
+            if state_snapshot and state_snapshot.values
+            else None
+        )
+
+        db_context_id = _resolve_stream_context(
+            db=db,
+            current_user=current_user,
+            requested_context_id=stream_request.context_id,
+            existing_context_id=existing_context_id,
+        )
+
         if current_user.daily_prompt_limit > 0:
             used_today = count_prompts_today(db, current_user.id)
             if used_today >= current_user.daily_prompt_limit:
@@ -277,10 +385,10 @@ async def stream_endpoint(
             prompt_text=messages[-1].content,
         )
 
-        config = {"configurable": {"thread_id": thread_id}}
-        inputs = {"messages": [HumanMessage(content=messages[-1].content)]}
-
-        state_snapshot = graph.get_state(config)
+        inputs = {
+            "messages": [HumanMessage(content=messages[-1].content)],
+            "db_context_id": db_context_id,
+        }
 
         if state_snapshot and state_snapshot.values:
             existing_messages = state_snapshot.values.get("messages", [])

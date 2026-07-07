@@ -8,14 +8,20 @@ from ai_agentic_chatbot.infrastructure.datasource.factory import get_engine
 from langchain_core.messages import SystemMessage
 from pydantic import BaseModel, Field
 from typing import List, Optional
-from ai_agentic_chatbot.utils.prompt_loader import get_system_prompt
+from ai_agentic_chatbot.utils.prompt_loader import get_system_prompt, load_file_content
 from ai_agentic_chatbot.agent.subgraphs.sql_query.nodes.glossary_lookup import (
     fetch_glossary_hints,
     fetch_column_hints,
 )
+from ai_agentic_chatbot.infrastructure.context.context_settings import get_context_registry
 from ai_agentic_chatbot.logging_config import get_logger
 
 logger = get_logger(__name__)
+
+# Fallback only for state that predates TODO 18 (checkpoints saved before
+# db_context_id was injected into AgentState). "default" is not a registered
+# context_id in config.yaml, so it can't be used as a registry fallback.
+_FALLBACK_CONTEXT_ID = "sales"
 
 
 class SQLGeneration(BaseModel):
@@ -50,8 +56,10 @@ def generate_sql_node(state: dict) -> dict:
 
     previous_error = state.get("execution_error")
     generation_attempts = state.get("generation_attempts", 0)
+    db_context_id = state.get("db_context_id") or _FALLBACK_CONTEXT_ID
 
     try:
+        ctx = get_context_registry().get_context(db_context_id)
         engine = get_engine("postgresql.primary")
         table_names = [name for name, _ddl, _score in retrieved_tables]
 
@@ -63,8 +71,10 @@ def generate_sql_node(state: dict) -> dict:
             user_query=user_query,
             previous_error=previous_error,
             generation_attempts=generation_attempts,
-            glossary_hints=fetch_glossary_hints(user_query, engine),
-            column_hints=fetch_column_hints(table_names, engine),
+            glossary_hints=fetch_glossary_hints(user_query, engine, ctx.schema_name),
+            column_hints=fetch_column_hints(table_names, engine, ctx.schema_name),
+            system_prompt_path=ctx.system_prompt_path,
+            sql_examples=load_file_content(ctx.sql_examples_path),
         )
 
         prompt = SystemMessage(content=prompt_content)
@@ -110,13 +120,17 @@ def _create_generation_prompt(
         generation_attempts: int = 0,
         glossary_hints: str = "",
         column_hints: str = "",
+        system_prompt_path: Optional[str] = None,
+        sql_examples: str = "",
 ) -> str:
     """Create the SQL generation prompt."""
 
-    system_context = get_system_prompt()
+    system_context = get_system_prompt(system_prompt_path)
 
     hints_block = "\n\n".join(filter(None, [glossary_hints, column_hints]))
     hints_section = f"\n\n{hints_block}" if hints_block else ""
+
+    examples_section = f"\n\n## EXAMPLE QUERY PAIRS\n\n{sql_examples}" if sql_examples else ""
 
     base_prompt = f"""{system_context}
 
@@ -125,9 +139,9 @@ def _create_generation_prompt(
 ## RETRIEVED SCHEMA CONTEXT
 
 The following tables/views were retrieved as most relevant to the user's request.
-Use them as the authoritative DDL reference — prefer v_sales_summary whenever it appears:
+Use them as the authoritative DDL reference:
 
-{schema_text}{hints_section}
+{schema_text}{hints_section}{examples_section}
 
 ## USER REQUEST
 

@@ -3,7 +3,7 @@
 import json
 import yaml
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List
 from ai_agentic_chatbot.logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -12,9 +12,8 @@ logger = get_logger(__name__)
 class SchemaLoader:
     """Utility class to load pre-processed schema data."""
 
-    def __init__(self):
-        self.base_dir = Path(__file__).resolve().parent.parent.parent.parent
-        self.temp_dir = self.base_dir / "temp"
+    def __init__(self, schema_dir: Path):
+        self.temp_dir = Path(schema_dir)
 
     def load_schema_json(self) -> Dict:
         """Load the raw schema JSON data."""
@@ -66,7 +65,7 @@ class SchemaLoader:
                     field_desc = f"Field {field.get('field_name', '')}: {field.get('meaning', '')}"
                     search_text_parts.append(field_desc)
 
-                for date_field in table.get("important_dates", []):
+                for date_field in (table.get("important_dates") or []):
                     date_desc = f"Date {date_field.get('field_name', '')}: {date_field.get('meaning', '')}"
                     search_text_parts.append(date_desc)
 
@@ -87,7 +86,7 @@ class SchemaLoader:
                 columns = []
                 for field in table.get("key_fields", []):
                     columns.append(field.get("field_name", ""))
-                for date_field in table.get("important_dates", []):
+                for date_field in (table.get("important_dates") or []):
                     columns.append(date_field.get("field_name", ""))
 
                 table_docs.append(
@@ -100,7 +99,7 @@ class SchemaLoader:
                         "business_purpose": table.get("business_purpose", ""),
                         "example_questions": table.get("example_questions", []),
                         "key_fields": table.get("key_fields", []),
-                        "relationships": table.get("relationships", []),
+                        "relationships": table.get("relationships") or [],
                         "operational_notes": table.get("operational_notes", ""),
                     }
                 )
@@ -179,7 +178,7 @@ class SchemaLoader:
             col_line = f"  {field_name} {data_type}"
             col_lines.append(col_line)
 
-        for date_field in table.get("important_dates", []):
+        for date_field in (table.get("important_dates") or []):
             field_name = date_field.get("field_name", "")
             col_line = f"  {field_name} TIMESTAMP"
             col_lines.append(col_line)
@@ -228,39 +227,6 @@ class SchemaLoader:
 
         return "VARCHAR(255)"
 
-    def _generate_ddl_from_doc(self, table: Dict) -> str:
-        """Generate DDL from processed documentation (legacy method)."""
-        table_name = table.get("table_name", "")
-        schema_name = table.get("schema_name", "public")
-
-        lines = [f"CREATE TABLE {schema_name}.{table_name} ("]
-
-        col_lines = []
-        for col in table.get("columns", []):
-            col_line = f"  {col.get('name', '')} {col.get('data_type', '')}"
-            if not col.get("nullable", True):
-                col_line += " NOT NULL"
-            if col.get("default"):
-                col_line += f" DEFAULT {col.get('default')}"
-            col_lines.append(col_line)
-
-        primary_keys = table.get("primary_keys", [])
-        if primary_keys:
-            pk_cols = ", ".join(primary_keys)
-            col_lines.append(f"  PRIMARY KEY ({pk_cols})")
-
-        for fk in table.get("foreign_keys", []):
-            fk_line = (
-                f"  FOREIGN KEY ({fk.get('column', '')}) "
-                f"REFERENCES {fk.get('referred_table', '')}({fk.get('referred_column', '')})"
-            )
-            col_lines.append(fk_line)
-
-        lines.append(",\n".join(col_lines))
-        lines.append(");")
-
-        return "\n".join(lines)
-
     def _generate_ddl_from_raw(self, table: Dict) -> str:
         """Generate DDL from raw schema JSON."""
         table_name = table.get("table_name", "")
@@ -295,13 +261,20 @@ class SchemaLoader:
         return "\n".join(lines)
 
 
-# TODO: This global instance relating to the process... multi tenancy should not be having hat
-_schema_loader: Optional[SchemaLoader] = None
+_schema_loaders: Dict[str, SchemaLoader] = {}
 
 
-def get_schema_loader() -> SchemaLoader:
-    """Get the global schema loader instance."""
-    global _schema_loader
-    if _schema_loader is None:
-        _schema_loader = SchemaLoader()
-    return _schema_loader
+def get_schema_loader(context_id: str, schema_dir: Path) -> SchemaLoader:
+    """Return the cached SchemaLoader for this context, constructing it on first use.
+
+    SchemaLoader re-reads its JSON/YAML files from disk on every method call —
+    it holds no in-memory cache of file contents itself. This per-context dict
+    therefore only avoids reconstructing the object on every call; it is not a
+    staleness cache. If SchemaLoader ever gains internal file-content caching,
+    this dict must add an invalidation path (e.g. evict and re-create the entry
+    after /schemaText completes for that context), or callers will silently
+    see stale schema documentation.
+    """
+    if context_id not in _schema_loaders:
+        _schema_loaders[context_id] = SchemaLoader(schema_dir)
+    return _schema_loaders[context_id]

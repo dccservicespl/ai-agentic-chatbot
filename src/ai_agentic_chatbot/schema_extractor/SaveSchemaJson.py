@@ -10,13 +10,15 @@ import yaml
 from ai_agentic_chatbot.schema_extractor.SchemaModels import DatabaseSchema
 
 
-def save_schema_temp_file(schema: DatabaseSchema) -> Path:
-    schema_path = get_schema_file_path()
+def save_schema_temp_file(schema: DatabaseSchema, schema_dir: Path) -> Path:
+    schema_dir = Path(schema_dir)
+    schema_dir.mkdir(parents=True, exist_ok=True)
+    schema_path = schema_dir / "db_schema.json"
     schema_dict = asdict(schema)
 
     with tempfile.NamedTemporaryFile(
             mode="w",
-            dir=schema_path.parent,
+            dir=schema_dir,
             delete=False,
             encoding="utf-8"
     ) as tmp_file:
@@ -29,12 +31,6 @@ def save_schema_temp_file(schema: DatabaseSchema) -> Path:
 
 def serialize_schema(schema: DatabaseSchema) -> dict:
     return asdict(schema)
-
-
-def get_schema_file_path() -> Path:
-    temp_dir = Path.cwd().resolve() / "temp"
-    temp_dir.mkdir(parents=True, exist_ok=True)
-    return temp_dir / "db_schema.json"
 
 
 def get_temp_dir() -> Path:

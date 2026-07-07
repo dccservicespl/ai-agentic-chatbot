@@ -16,15 +16,13 @@ from ai_agentic_chatbot.utils.prompt_loader import load_file_content
 BASE_DIR = Path(__file__).resolve().parent.parent
 SCHEMA_TO_TEXT_PROMPT_PATH = BASE_DIR / "prompts" / "schema_to_text_prompts.md"
 USER_SCHEMA_TO_TEXT_PROMPT_PATH = BASE_DIR / "prompts" / "user_schema_to_text_prompt.md"
-DB_SCHEMA_JSON_PATH = Path(__file__).resolve().parent.parent.parent.parent / "temp" / "db_schema.json"
-YAML_OUT_PATH = Path(__file__).resolve().parent.parent.parent.parent / "temp"
-SCHEMA_DOC_PATH = YAML_OUT_PATH / "schema_documentation.yaml"
-SCHEMA_SUMMARY_PATH = YAML_OUT_PATH / "schema_summary.json"
 
 
-def transform_schema_to_text() -> None:
+def transform_schema_to_text(schema_dir: Path) -> None:
+    schema_dir = Path(schema_dir)
+    db_schema_json_path = schema_dir / "db_schema.json"
     llm = get_llm()
-    db_schema_json = json.loads(Path(DB_SCHEMA_JSON_PATH).read_text(encoding="utf-8"))
+    db_schema_json = json.loads(db_schema_json_path.read_text(encoding="utf-8"))
     system_prompt = load_file_content(SCHEMA_TO_TEXT_PROMPT_PATH)
     validated_tables: List[TableSchemaDocumentation] = []
     schema_summary = {}
@@ -60,31 +58,27 @@ def transform_schema_to_text() -> None:
         "tables": [table.model_dump() for table in validated_tables],
     }
 
-    #
-    # write_text_file(
-    #     directory=YAML_OUT_PATH,
-    #     filename="schema_documentation.yaml",
-    #     content=yaml_payload,
-    # )
-
     yaml_text = yaml.safe_dump(
         yaml_payload,
         sort_keys=False,
         allow_unicode=True,
     )
 
-    dir_path = Path(YAML_OUT_PATH)
-    dir_path.mkdir(parents=True, exist_ok=True)
+    schema_dir.mkdir(parents=True, exist_ok=True)
 
-    file_path = dir_path / "schema_documentation.yaml"
+    file_path = schema_dir / "schema_documentation.yaml"
     file_path.write_text(yaml_text, encoding="utf-8")
 
 
 logger = get_logger(__name__)
 
 
-def generate_schema_summary() -> None:
-    with open(SCHEMA_DOC_PATH, "r") as f:
+def generate_schema_summary(schema_dir: Path) -> None:
+    schema_dir = Path(schema_dir)
+    schema_doc_path = schema_dir / "schema_documentation.yaml"
+    schema_summary_path = schema_dir / "schema_summary.json"
+
+    with open(schema_doc_path, "r") as f:
         schema = yaml.safe_load(f)
 
     schema_summary = {
@@ -99,16 +93,17 @@ def generate_schema_summary() -> None:
             for table in schema.get("tables", [])
         ],
     }
-    SCHEMA_SUMMARY_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with open(SCHEMA_SUMMARY_PATH, "w") as f:
+    schema_summary_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(schema_summary_path, "w") as f:
         json.dump(schema_summary, f)
 
 
-def load_schema_summary() -> str:
-    with open(SCHEMA_SUMMARY_PATH, "r") as f:
+def load_schema_summary(schema_dir: Path) -> dict:
+    schema_summary_path = Path(schema_dir) / "schema_summary.json"
+    with open(schema_summary_path, "r") as f:
         return json.load(f)
 
 
 if __name__ == "__main__":
     load_dotenv()
-    generate_schema_summary()
+    generate_schema_summary(Path(__file__).resolve().parent.parent.parent.parent / "temp")

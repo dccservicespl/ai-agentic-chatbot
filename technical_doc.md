@@ -37,6 +37,12 @@
 29. [User Prompt Management — Implementation Plan ✅ COMPLETED](#29-user-prompt-management--implementation-plan-completed)
 30. [Multi-Database Context Support — Architecture & TODO List](#30-multi-database-context-support--architecture--todo-list)
 31. [Database Structure for Multi-Context — Decision & Schema Design](#31-database-structure-for-multi-context--decision--schema-design)
+32. [`config.yaml` vs `.env` — Ownership, Dead Variables & Cleanup Status](#32-configyaml-vs-env--ownership-dead-variables--cleanup-status)
+33. [Bug Fix — `seed_contexts_from_config()` Never Wired Into Startup](#33-bug-fix--seed_contexts_from_config-never-wired-into-startup)
+34. [Bug Fix — `/ingest` Crashes on Tables With No Date Fields (`important_dates: null`)](#34-bug-fix--ingest-crashes-on-tables-with-no-date-fields-important_dates-null)
+35. [Bug Fix — Hardcoded Out-of-Scope Refusal Message Leaked demo_01's Domain Into Every Context](#35-bug-fix--hardcoded-out-of-scope-refusal-message-leaked-demo_01s-domain-into-every-context)
+36. [`v_sales_summary` Materialized View — Query Performance Analysis & Runbook (Pending)](#36-v_sales_summary-materialized-view--query-performance-analysis--runbook-pending)
+37. [Follow-Up Question Suggestions After Each Answer (Pending)](#37-follow-up-question-suggestions-after-each-answer-pending)
 
 ---
 
@@ -281,6 +287,8 @@ logging:
 | `ROUTER_PROMPT_PATH` | Path to router system prompt file | — |
 
 > 💡 All env vars are loaded by `python-dotenv` from `.env` at startup. They take **precedence** over values in `config.yaml`.
+
+> ⚠️ This table predates multi-context support and is incomplete/stale (missing `EMBEDDING_*`, `JWT_*`, per-context path vars). See [Section 32](#32-configyaml-vs-env--ownership-dead-variables--cleanup-status) for the current, verified variable-by-variable audit.
 
 ---
 
@@ -4998,7 +5006,7 @@ Pending — plan recorded 2026-06-27. No code changes made yet.
 | P1 | `alembic/env.py` `include_object` will not detect `app`-schema ORM models for autogenerate | `alembic/env.py:26–35` | Fix before any `--autogenerate` run; write first migration by hand |
 | P2 | `GRANT ALL PRIVILEGES ON ALL TABLES` does not cover future tables | Section 31 Bootstrap SQL | Add `ALTER DEFAULT PRIVILEGES` — see Section 31 |
 | P2 | `user_contexts.is_default` has no DB-level uniqueness constraint | TODO 3 | Add partial unique index `WHERE is_default = TRUE` |
-| P2 | No error when user has zero assigned contexts — unhandled 500 | TODO 18 | Return `HTTP 422` with clear message |
+| P2 | No error when user has zero assigned contexts — unhandled 500 | TODO 18 ✅ | Return `HTTP 422` with clear message |
 | P2 | Full schema docs injected on every request including greetings — high token cost | TODO 20 | Use `schema_summary.json` instead of full table docs for prompt injection |
 | P3 | Context CRUD placed in `auth/repository.py` — wrong module | TODO 4 | Move to new `context/repository.py` |
 | P3 | Context switching within same `thread_id` is undefined | TODO 10 | Document behavior — require new `thread_id` per context switch |
@@ -5112,22 +5120,34 @@ Create `src/ai_agentic_chatbot/context/repository.py`:
 | `assign_context_to_user(db, user_id, context_db_id, is_default)` | Inserts a `user_contexts` row; if `is_default=True`, clears the existing default first |
 | `seed_contexts_from_config(db, registry)` | Called at startup — upserts config.yaml entries into `db_contexts` so the DB is always in sync with config |
 
-#### TODO 5 — Add admin API endpoints for context management; resolve the source-of-truth conflict
+#### TODO 5 — Add admin API endpoints for context management; resolve the source-of-truth conflict ✅ COMPLETED
 
 **Source-of-truth decision (was missing from original plan):**
 
-config.yaml is the **source of truth** for context definitions. The `db_contexts` table is a **DB mirror** populated by `seed_contexts_from_config()` at startup and used for user assignments. `POST /admin/contexts` must NOT be used to create new contexts — it only manages user assignments. To add a new context: add it to config.yaml first, then restart the service (which seeds it into the DB), then assign it to users.
+config.yaml is the **source of truth** for context definitions. The `db_contexts` table is a **DB mirror** populated by `seed_contexts_from_config()` at startup and used for user assignments. `POST /context/admin` must NOT be used to create new contexts — it only manages user assignments. To add a new context: add it to config.yaml first, then restart the service (which seeds it into the DB), then assign it to users.
 
-File: `auth/router.py`
+**Amendment during implementation — router placement (2026-07-01):** the original plan said `File: auth/router.py`, reusing the existing superuser-gated router (`/auth/users`, etc.). That was implemented first, then reverted after review: it made `auth/router.py` import from `context.repository`/`context.schemas`, i.e. **auth depending on context** — the reverse of the dependency direction TODO 4 already established for the repository layer (context must depend on auth, never the other way). It also produced `/auth/admin/contexts` and `/auth/contexts` instead of the clean paths below.
+
+**Final implementation:** a dedicated `context/router.py`, mounted in `server.py` via `app.include_router(context_router)` (the same one-line pattern already used for `auth_router` — unavoidable, since FastAPI has no router auto-discovery). It imports `get_current_user` / `get_auth_db` from `auth.dependencies` and `get_user_by_username` from `auth.repository` — a one-way dependency on `auth`. `auth/router.py` has zero knowledge of `context`.
+
+File: `context/router.py` (prefix `/context`)
 
 | Endpoint | Method | Notes |
 |---|---|---|
-| `/admin/contexts` | GET | List all active contexts from DB (superuser only) |
-| `/admin/contexts/{context_slug}/users/{username}` | PUT | Assign context to user (superuser only) |
-| `/admin/contexts/{context_slug}/users/{username}` | DELETE | Remove user's context access (superuser only) |
-| `/contexts` | GET | Return calling user's allowed contexts (for UI switcher) |
+| `/context/admin` | GET | List all active contexts from DB (superuser only) |
+| `/context/admin/{context_slug}/users/{username}` | PUT | Assign context to user (superuser only); `is_default` query param clears any prior default first |
+| `/context/admin/{context_slug}/users/{username}` | DELETE | Remove user's context access (superuser only); HTTP 404 if not assigned |
+| `/context` | GET | Return calling user's allowed contexts with an `is_default` flag (for UI switcher) — this also satisfies TODO 19, which specified the same endpoint; no separate work was needed there |
 
-> Removing `POST /admin/contexts` from the original plan — context creation is controlled by config.yaml, not the API.
+> Removing `POST /context/admin` from the original plan — context creation is controlled by config.yaml, not the API.
+
+**Repository additions beyond TODO 4's original list:** `context/repository.py` needed two more functions to back these endpoints — `list_active_contexts(db)` (all active `db_contexts` rows, for the admin list) and `remove_context_assignment(db, user_id, context_db_id) -> bool` (for the DELETE endpoint, returns `False` if no assignment existed so the route can 404).
+
+**Schema gap fixed along the way:** `db_contexts.display_name` is `NOT NULL` (TODO 3), but neither `DbContextConfig` (TODO 2) nor `config.yaml`'s `contexts:` block defined one. Added `display_name: Optional[str] = None` to `DbContextConfig` (defaults to the context slug if omitted) so `seed_contexts_from_config` has a value to write.
+
+**Verified against the live `ai_chatbot_db_v2` database** using real `admin`/`dcc` accounts via `TestClient` (with lifespan startup so `DataSourceFactory` is initialized): superuser list, non-superuser 403, assign with `is_default=true`, self-service list reflecting the assignment, unassign (204), repeat unassign (404), and confirmation the list reverts to empty. No test data left behind.
+
+**Unrelated bug found and fixed during verification:** `users_id_seq` was desynced from `public.users` (`last_value=2` while `id=3` already existed for user `dcc`), which would have broken the next `/auth/register` call with a `UniqueViolation`. Fixed via `SELECT setval('users_id_seq', (SELECT MAX(id) FROM users))`.
 
 ---
 
@@ -5266,12 +5286,13 @@ The `with conn.begin()` block opens an explicit transaction. Both statements exe
 
 **Also remove `autocommit=True`** from the existing `execute_query.py` — it is incompatible with `SET LOCAL` and is deprecated in SQLAlchemy 2.x for this pattern anyway.
 
-#### TODO 16 — Make glossary/column hint lookups context-aware
+#### TODO 16 — Make glossary/column hint lookups context-aware ✅ COMPLETED (during TODO 14)
 
-File: `agent/subgraphs/sql_query/nodes/glossary_lookup.py`
+**The doc's original plan here was wrong.** `business_glossary` and `schema_metadata` do live in each context's PostgreSQL schema (confirmed: `demo_01.business_glossary`, `demo_01.schema_metadata`), so the assumption was "rely on the `SET LOCAL search_path` set in TODO 15 — no additional changes needed." But `fetch_glossary_hints`/`fetch_column_hints` open their **own separate `engine.connect()`** calls in `glossary_lookup.py` — a different connection than the one `execute_query.py` sets `SET LOCAL search_path` on in TODO 15. `SET LOCAL` is transaction/connection-scoped, so it has zero effect here; relying on it would have left these lookups silently broken (always querying `public`, finding nothing) for any non-`public`-schema context.
 
-- If `business_glossary` and `schema_metadata` tables live in each context's PostgreSQL schema: rely on the `SET LOCAL search_path` set in TODO 15 — no additional changes needed.
-- If these tables live in a central `app` schema: add a `context_id` filter column to each table and pass `context_id` to the query.
+**Actual fix (done as part of TODO 14, since the two changes couldn't be separated without breaking the app):** both functions in `glossary_lookup.py` now take a required `schema_name: str` parameter and schema-qualify their queries directly (`FROM {schema_name}.business_glossary`, `FROM {schema_name}.schema_metadata`), validated against `^[a-z_][a-z0-9_]*$` before interpolation — same identifier-validation pattern as TODO 15, since `SET`/table names can't use bound params. `generate_sql.py` resolves `ctx.schema_name` via the context registry and passes it through at both call sites.
+
+Verified live: confirmed both tables exist in `demo_01` (not `public`), inserted a throwaway glossary row, confirmed `fetch_glossary_hints` correctly found it via the schema-qualified query, then cleaned it up. Also confirmed the schema-name validator blocks an injection attempt (`"demo_01; DROP TABLE users; --"`).
 
 ---
 
@@ -5288,7 +5309,7 @@ class StreamRequest(BaseModel):
     context_id: Optional[str] = None   # if None, use user's default context
 ```
 
-#### TODO 18 — Update the `/stream` route to resolve and inject context
+#### TODO 18 — Update the `/stream` route to resolve and inject context ✅ COMPLETED
 
 File: `server.py:245`
 
@@ -5301,17 +5322,17 @@ After authenticating the user (JWT), resolve `context_id` in this order:
    - If that also returns `None` (user has no assigned contexts): raise `HTTP 422` with message `"No context assigned to this user. Contact an administrator."` — do NOT allow this to propagate to a 500 error.
 3. Inject `db_context_id` into the initial `AgentState` before calling `graph.astream_events()`.
 
-#### TODO 19 — Add `GET /contexts` endpoint for the frontend
+**Implemented as `_resolve_stream_context()` in `server.py:67-102`, called from `/stream` at `server.py:346`.** Matches the spec with one refinement: when `context_id` is omitted, the resolver first checks the thread's existing checkpointed `db_context_id` (via `graph.get_state()`) before falling back to `get_default_context()` — this lets a conversation continue on its original context across turns without needing the client to re-send `context_id`, and prevents a later default-context change from silently retargeting an already-started thread. The outer route still has `except HTTPException: raise` before its generic 500 handler (`server.py:411-412`), so the 403/400/422 responses are not swallowed.
 
-File: `auth/router.py` or `server.py`
+#### TODO 19 — Add `GET /contexts` endpoint for the frontend ✅ COMPLETED (as part of TODO 5)
 
-Returns the list of contexts the current user is allowed to access — used by the frontend to render a context-switcher UI element. Response includes `context_id`, `display_name`, and `is_default` flag.
+Implemented as `GET /context` in `context/router.py` — see TODO 5 for the full router placement decision. Returns the list of contexts the current user is allowed to access, with `context_id`, `display_name`, and `is_default` flag, used by the frontend to render a context-switcher UI element. No separate implementation was needed once TODO 5 was done.
 
 ---
 
 ### Phase 6 — System Prompt Refactor
 
-#### TODO 20 — Decouple table knowledge from `system_prompt.md`
+#### TODO 20 — Decouple table knowledge from `system_prompt.md` ✅ COMPLETED
 
 The current `system_prompt.md` has 5 table names, column listings, and ~50 hardcoded SQL examples baked in statically. This makes it unusable for a second context.
 
@@ -5323,9 +5344,25 @@ The current `system_prompt.md` has 5 table names, column listings, and ~50 hardc
 - Inject `ctx_loader.load_schema_summary()` at the `{schema_summary}` placeholder in `prompt_loader.py`.
 - Create a separate `system_prompt.md` per context under `prompts/context_{id}/system_prompt.md`, keeping only context-independent instructions in a shared base template.
 
+**Investigation findings (pre-implementation):** most of the surrounding plumbing was already in place from TODO 14–16 before this TODO started — `prompt_loader.get_system_prompt()`/`get_router_prompt()` already accepted per-context path overrides, `db_context_id` was already threaded through `router.py`/`generate_sql.py`, and `schema_summary.json` was already auto-generated per context by `generate_schema_summary()` (`application/transform_schema_to_text.py`) as part of the `/schemaText` ingest step — no new generation step was needed. What was actually missing was narrower than the doc implied: `system_prompt.md` had no `{schema_summary}` placeholder at all, and two things the doc's problem statement calls out (`~50 hardcoded SQL examples`; the alias/view-preference specifics baked into the SQL generation rules) weren't addressed by the doc's own "Changes" bullets, which only covered the table/column sections. Also found: the "shared base template" the third bullet asks for had zero precedent in the codebase — every context previously got one fully standalone `system_prompt.md`.
+
+**Actual implementation — three-way split instead of a single monolith:**
+
+- `prompts/base_system_prompt.md` (**new**) — shared, context-independent template: generic SQL generation rules, intent classification table, visualization query-structure rules, plus `{formatted_date}`, `{schema_summary}`, and `{context_extra}` placeholders. Used by every context.
+- `prompts/demo_01/system_prompt.md` (**rewritten**, 1410 → ~70 lines) — shrunk to a per-context fragment only: business glossary/definitions, order lifecycle state machine, preferred-view note (`v_sales_summary`), and table-alias convention. Loaded raw and substituted at `{context_extra}` — this file has no format placeholders of its own.
+- `prompts/demo_01/sql_examples.md` (**new**) — the ~50 example Q→SQL pairs (including the visualization-targeted ones), split out of the monolith entirely since they're SQL-generation aids, not routing/greeting content.
+- `prompt_loader.get_system_prompt(system_prompt_path, schema_summary="")` — now loads `base_system_prompt.md`, substitutes the per-context fragment at `{context_extra}` and the caller-supplied summary at `{schema_summary}`, and still injects `{formatted_date}`. Backward-incompatible signature change was unavoidable: adding `{schema_summary}`/`{context_extra}` to the template meant every existing call site had to pass (or default) both in the same change, or `.format()` would `KeyError` immediately.
+- `router.py` passes the `schema_summary_text` it already computes for the router prompt's own `{schema_text}` placeholder into `get_system_prompt()` too (no duplicate computation) — keeps routing/greeting/clarification calls cheap (no SQL examples, no full column docs).
+- `generate_sql.py` loads `sql_examples.md` via the new `ctx.sql_examples_path` config field and injects it into its own prompt only (where `retrieved_tables` DDL already supplies precise column detail); does *not* pass `schema_summary` — the base template's placeholder just resolves to an empty string there, which is fine. Also dropped a hardcoded `— prefer v_sales_summary whenever it appears` clause from this node's own f-string in favor of the generic "prefer summary views" rule backed by the context fragment's note, removing a second, redundant hardcode the doc hadn't flagged.
+- `DbContextConfig` gained a new required field `sql_examples_path: str`; `config.yaml`'s `sales` context sets it to `src/ai_agentic_chatbot/prompts/demo_01/sql_examples.md`.
+
+**Verified live:** `get_system_prompt()` run end-to-end against the real `demo_01` files in both call shapes (with and without `schema_summary`) — no leftover `{...}` placeholders in the output, correct content substitution. `config.yaml` parses and `DbContextRegistry` picks up `sql_examples_path` correctly. Existing test suite (`test_router_node.py`, `test_agent_graph_e2e.py`) shows the same 6 pre-existing failures with and without this change (confirmed via `git stash` comparison) — unrelated stale mock (`patch("...router.SchemaLoader")` against a module that only exports `get_schema_loader`), not a regression from this work.
+
+**Net effect:** router/greeting/clarification turns now carry roughly 9.4 KB of prompt (base + context fragment + schema summary) instead of the full ~1410-line monolith — directly addresses the doc's token-cost warning above.
+
 ---
 
-### Phase 7 — Pre-launch Dead Code Cleanup (Optional but Recommended)
+### Phase 7 — Pre-launch Dead Code Cleanup (Optional but Recommended) ✅ COMPLETED
 
 Do this before starting Phase 1 to reduce noise during review:
 
@@ -5335,17 +5372,41 @@ Do this before starting Phase 1 to reduce noise during review:
 | `agent/subgraphs/sql_query/nodes/retrieve_schemas.py:58–186` | Commented-out `_semantic_search` function | Delete |
 | `schema_extractor/schema_loader.py:231–261` | Unused `_generate_ddl_from_doc` method | Delete |
 
+**Actually done well after Phase 1 (this was never executed pre-launch as recommended — the codebase moved through TODOs 14–20 with this dead code still present), and the scope turned out larger than documented:**
+
+- **`agent/graph.py`** — the three-column table undersold this. `_semantic_search`'s counterpart aside, this file actually had **seven** dead functions, not six: alongside the five listed here plus `format_sql_response_with_visualization`, there was also `create_clean_json_response` (~line 154) — never called anywhere, not flagged in this table, found only during the pre-deletion verification pass. All seven removed (~281 lines). No top-level imports were affected — each dead function had its own local `import json`/`import sqlparse`, which disappeared with the function bodies.
+- **`agent/subgraphs/sql_query/nodes/retrieve_schemas.py`** — the doc undersold this too. The "commented-out `_semantic_search` function" was actually two things: a small commented docstring stub *and*, immediately below it, a live, uncommented, fully unused duplicate `_semantic_search()` function (the real replacement, `_semantic_searchV2`, is what's actually called). Deleting it also orphaned `_cosine_similarity()` (its only caller) and the `get_azure_openai_embedding` import (used only inside the dead function — `_semantic_searchV2` gets its embedding indirectly via `PgVectorSchemaStore.search()` instead). All three plus the now-dead import removed (~151 lines total).
+- **`schema_extractor/schema_loader.py`** — matched the doc as described; `_generate_ddl_from_doc` removed cleanly (~33 lines), single-blank-line convention preserved between the surrounding methods.
+
+**Verification:** a researcher agent did a repo-wide reference check (not just `src/`) before any deletion — no test mocks, no dynamic/string references, no `__init__.py` re-exports, no LangGraph `add_node` wiring for any of the 8 removed symbols. After deletion: import sanity check passed for all three touched modules, and the full test suite showed zero new failures — same 6 pre-existing `test_router_node.py` failures and the same `test_db_connection.py`/`test_agent_graph_e2e.py` collection errors as on unmodified `main` (confirmed via `git stash` comparison both before and after this cleanup), all caused by a stale `patch("...router.SchemaLoader")` mock and an unrelated in-progress module path, neither connected to this cleanup.
+
+**Process note:** the code-writer agent that performed the deletion self-reported completing all four target removals, but its diff was missing `create_clean_json_response` — caught only by re-reading the file directly after the agent reported done, not by trusting the summary. Fixed by hand and re-verified (import check + full test suite) afterward.
+
+Net: 465 lines of dead code removed across 3 files, 0 lines added, 0 regressions.
+
 ---
 
 ### Phase 8 — Testing & Hardening
 
-#### TODO 21 — Write integration tests for context isolation
+#### TODO 21 — Write integration tests for context isolation ✅ COMPLETED
 
 - Verify a query from context A never touches context B's tables or vector collection.
 - Verify a user not assigned to any context gets `HTTP 422`, not `HTTP 500`.
 - Verify a user not assigned to a specific context gets `HTTP 403` when requesting that context.
 - Verify `SET LOCAL search_path` resets correctly between requests (pool connection reuse test) — connect to the same pooled connection twice and confirm the second query does not inherit the first request's search_path.
 - Verify context switching on the same `thread_id` returns `HTTP 400`.
+
+**Implemented in `tests/test_context_isolation.py` (new file) — one test method per bullet, in order:**
+
+1. `test_context_a_query_never_touches_context_b_tables_or_vectors` — real Postgres, covers both halves of this bullet in one method: (a) SQL isolation via two throwaway schemas (`test_iso_ctx_a`/`test_iso_ctx_b`), mirroring `execute_query.py`'s exact `SET LOCAL search_path` pattern, asserting an unqualified query under context A's search_path only ever sees A's row; (b) pgvector collection isolation via two throwaway `PgVectorSchemaStore` collections, with `get_azure_openai_embedding` patched to a deterministic fake `Embeddings` implementation (hash-derived vectors) so the test needs no real Azure credentials while still exercising real Postgres/pgvector storage and search. Both halves clean up via `try/finally` (drop schemas, `reset_collection()`) even on assertion failure.
+2. `test_zero_assigned_contexts_returns_422_not_500` — pure mock test against `_resolve_stream_context`, no infra.
+3. `test_unassigned_context_returns_403` — pure mock test.
+4. `test_search_path_resets_between_pooled_connections` — real Postgres, proves a `SET LOCAL` set in one connection/transaction doesn't leak into the next `engine.connect()` call, regardless of pool reuse.
+5. `test_context_switch_on_same_thread_returns_400` — pure mock test.
+
+**Infra-dependent tests skip, don't fail, when Postgres is unreachable:** Tests 1 and 4 attempt a genuine `engine.connect()` (via a shared `_get_pg_engine_or_skip()` helper that also calls `initialize_datasources()` first, since that registration normally only happens in FastAPI's `lifespan()`, which pytest never triggers) and call `pytest.skip(...)` on failure rather than hard-failing or being unconditionally skipped. In this environment `config.yaml`'s `postgresql.primary` has no configured host/username/password, so both currently skip — they have not yet been verified to pass against a real reachable Postgres instance with pgvector enabled. Tests 2, 3, 5 need no external infrastructure and always run.
+
+**Verified:** ran independently (not just trusting the implementing agent's self-report) — `pytest tests/test_context_isolation.py -v` → 3 passed, 2 skipped (expected, no reachable DB here); full suite (`pytest tests/ -q --continue-on-collection-errors`) → same pre-existing baseline (6 known `test_router_node.py` failures, `test_db_connection.py`/`test_agent_graph_e2e.py` collection errors) plus the 3 new passes, zero regressions.
 
 #### TODO 22 — Seed a second context end-to-end
 
@@ -5377,7 +5438,7 @@ Do this before starting Phase 1 to reduce noise during review:
 | Router node | `agent/router.py` | Use context-specific prompt + per-context `get_schema_loader()` call |
 | SQL nodes | `retrieve_schemas.py`, `generate_sql.py`, `execute_query.py`, `glossary_lookup.py` | Context-aware schema loader, vector store, `SET LOCAL` with `engine.begin()` |
 | API | `agent/schema.py`, `server.py` | Add `context_id` to `StreamRequest`; resolve + inject at `/stream`; handle zero-context user with 422 |
-| Admin routes | `auth/router.py` | Context-user assignment endpoints (no POST /admin/contexts) |
+| Admin routes | `context/router.py` (new, prefix `/context`) | Context-user assignment endpoints (no POST /context/admin); depends one-way on `auth.dependencies`/`auth.repository`, never the reverse |
 | System prompts | `prompts/context_{id}/system_prompt.md` | One prompt file per context |
 
 > **Key insight:** The `DataSourceFactory` infrastructure already supports multiple named datasources. Since all contexts share one PostgreSQL database, `get_engine("postgresql.primary")` remains unchanged in all nodes — only the `SET LOCAL search_path` injection in `execute_query.py` (using `engine.begin()`) changes how the engine resolves table names at runtime.
@@ -5595,4 +5656,348 @@ The following steps are all required. "No code changes" is accurate for Python a
 
 ---
 
-*Generated: 2026-05-29 | Updated: 2026-06-30 | Repository: `ai-agentic-chatbot` | Branch: `develop`*
+## 32. `config.yaml` vs `.env` — Ownership, Dead Variables & Cleanup Status
+
+> **Trigger:** After multi-context support (Section 30/31) moved several paths that used to live only in `.env` into `config.yaml`'s new `contexts.<id>.*` block, it was unclear whether the old top-level `.env` path keys were still load-bearing or now dead. This section is the audit + the resulting cleanup.
+
+### Ownership Split
+
+| File | Owns | Loaded by |
+|---|---|---|
+| `config.yaml` | Structural/topology config: which LLM providers/models exist, which datasources exist, which DB contexts exist and their per-context paths | Three independent Pydantic-settings singletons, each with its own `from_config_file()`: `infrastructure/llm/settings.py`, `infrastructure/datasource/datasource_settings.py`, `infrastructure/context/context_settings.py` (`DbContextRegistry`) |
+| `.env` | Secrets (API keys, DB password, JWT secret) + env-specific overrides merged **on top of** `config.yaml`'s structural entries | `load_dotenv()` — called in `server.py`, `alembic/env.py`, `auth/seed.py`, `utils/utils.py`, `embedding_connection.py`, `transform_schema_to_text.py` |
+
+`config.yaml`'s `datasources.postgresql.primary` block ships with blank `host`/`username`/`password` by design — those three fields are always supplied by `.env` via each settings class's `_apply_env_overrides` (e.g. `datasource_settings.py:85-97`, `llm/settings.py:136-153`).
+
+### DB Connection String Sourcing (confirmed)
+
+`POSTGRESQL_HOST/PORT/DB/USER/PASSWORD` (`.env`) → `DataSourceSettings._apply_env_overrides` → merged into the `postgresql.primary` entry parsed from `config.yaml` → `initialize_datasources()` registers it with `DataSourceFactory` → on first `get_engine("postgresql.primary")`, `PostgreSQLConfig.get_connection_string()` builds `postgresql+psycopg2://{user}:{password}@{host}:{port}/{database}?sslmode=...` and `factory.py` calls `create_engine(...)`.
+
+### Path-Variable Redundancy Audit
+
+Four `.env` keys were suspected redundant now that `config.yaml.contexts.<id>.*` carries per-context paths:
+
+| `.env` key | Verdict | Superseded by | Notes |
+|---|---|---|---|
+| `SCHEMA_PATH` | Fully dead — zero references in `src/` | `DbContextConfig.schema_dir` | `SchemaLoader` now takes `schema_dir` per context (`schema_loader.py`, called via `get_schema_loader(context_id, schema_dir)` in `router.py`/`retrieve_schemas.py`) |
+| `SCHEMA_SUMMARY_PATH` | Fully dead — zero references in `src/` | Same `schema_dir`-based loading | |
+| `VECTOR_COLLECTION_NAME` | Fully dead — zero references in `src/` | `DbContextConfig.vector_collection_name` | Found during this audit, not originally suspected |
+| `ROUTER_PROMPT_PATH` | **Unreachable fallback**, not literally dead code | `DbContextConfig.router_prompt_path` | `prompt_loader.py` still has `router_prompt_path or os.environ["ROUTER_PROMPT_PATH"]` (`get_router_prompt`), but every caller (`router.py`) now always passes `ctx.router_prompt_path`, a required field — the `or` short-circuits before the env lookup runs |
+| `SYSTEM_PROMPT_PATH` | **Unreachable fallback**, same pattern | `DbContextConfig.system_prompt_path` | `prompt_loader.py`'s `get_system_prompt`: `system_prompt_path or os.environ["SYSTEM_PROMPT_PATH"]`; callers (`router.py`, `generate_sql.py`) always pass `ctx.system_prompt_path` |
+| `MYSQL_*` (5 vars) | Fully dead | n/a | Leftover from the completed MySQL→PostgreSQL migration (see `project_mysql_to_postgres_migration.md` history); `config.yaml` no longer has a `mysql:` block either |
+| `LLM_SMITH_API_KEY` | Fully dead — zero references in `src/` | n/a | Found during this audit; blank in both `.env` and `.env.example`, unrelated to multi-context work |
+
+Precedence where it still theoretically matters: explicit per-context arg always wins over the env fallback — but since callers never pass `None`, `config.yaml` is the only value that's ever actually used for these four paths today.
+
+### JWT & AI/LLM API Keys (confirmed live)
+
+- `JWT_SECRET_KEY` / `JWT_ALGORITHM` / `JWT_ACCESS_TOKEN_EXPIRE_MINUTES` — `auth/jwt_utils.py`; `JWT_REFRESH_TOKEN_EXPIRE_DAYS` — `auth/router.py`. Sign/verify access + refresh tokens.
+- `AZURE_OPENAI_API_KEY/ENDPOINT/API_VERSION`, `AZURE_AI_FOUNDRY_API_KEY/ENDPOINT` — override the blank placeholder fields under `config.yaml.llm.*` (`llm/settings.py`), feed `get_llm()`.
+- `EMBEDDING_API_KEY/ENDPOINT/MODEL_NAME/API_VERSION` — read directly (not via `config.yaml`) in `infrastructure/embedding/embedding_connection.py`.
+
+### Cleanup Status (as of 2026-07-02)
+
+**Done** — removed from the live `.env`:
+- `MYSQL_*` (5 vars) ✅
+- `SCHEMA_PATH` ✅
+- `SCHEMA_SUMMARY_PATH` ✅
+- `VECTOR_COLLECTION_NAME` ✅
+
+**Outstanding** — deferred, not yet actioned:
+1. `ROUTER_PROMPT_PATH` / `SYSTEM_PROMPT_PATH` still present in `.env`. Removing them requires first dropping the `or os.environ[...]` fallback in `prompt_loader.py:58,81` (making the params required) — otherwise the app breaks the moment these env vars are absent, since the fallback path is still technically reachable code even though it's never hit today.
+2. `entrypoint.sh:39-40` — `check_var ROUTER_PROMPT_PATH` / `check_var SYSTEM_PROMPT_PATH` — will fail Docker startup on a missing var that nothing in the app actually reads. Needs to be removed in lockstep with (1).
+3. `.env.docker` (template) — still lists `SCHEMA_PATH`, `SCHEMA_SUMMARY_PATH`, `VECTOR_COLLECTION_NAME`, and the full `MYSQL_*` block, and marks `ROUTER_PROMPT_PATH`/`SYSTEM_PROMPT_PATH` as `REQUIRED`. Not yet mirrored to match the live `.env` cleanup.
+4. `.env.example` — still has `MYSQL_*` (6 vars). Also missing `EMBEDDING_*` and `AZURE_AI_FOUNDRY_*`, which are live and required — incomplete independent of this cleanup.
+5. `LLM_SMITH_API_KEY` — dead, not yet removed from `.env` / `.env.example`.
+
+---
+
+## 33. Bug Fix — `seed_contexts_from_config()` Never Wired Into Startup
+
+> **Trigger:** Added a second context (`sales_01`, schema `demo_02`) to `config.yaml`, restarted the service, and it never showed up in `app.db_contexts`.
+
+### Root Cause
+
+`seed_contexts_from_config()` (`context/repository.py:90`) — the function that upserts every context from `config.yaml` into `app.db_contexts` — was fully implemented and even referenced in `context/router.py`'s module docstring ("a DB mirror populated by `seed_contexts_from_config()` at startup"), but **it was never actually called anywhere in the app**. `server.py`'s `lifespan()` only called `initialize_datasources()`; nothing invoked the context registry or the seed function. This affected every context, not just the new one — `db_contexts` had never been auto-synced from `config.yaml`; the original `sales` row must have been inserted some other way (manual/one-off), independent of this code path.
+
+### Fix
+
+Wired the call into `lifespan()` in `src/ai_agentic_chatbot/server.py`, right after datasource initialization, using the same `get_session("postgresql.primary")` pattern as `get_auth_db()`:
+
+```python
+logger.info("Seeding contexts from config.yaml...")
+try:
+    db = get_session("postgresql.primary")
+    try:
+        seed_contexts_from_config(db, get_context_registry())
+        logger.info("Contexts synced to app.db_contexts")
+    finally:
+        db.close()
+except Exception as e:
+    logger.error(f"Failed to seed contexts: {e}", exc_info=True)
+```
+
+Failure is logged, not raised — mirrors the existing `initialize_datasources()` error-handling style in the same function, so a seeding failure doesn't crash app startup.
+
+### Verification
+
+Ran `initialize_datasources()` + `seed_contexts_from_config(db, get_context_registry())` directly against the live Postgres instance and queried `app.db_contexts`:
+
+```
+('sales', 'Sales', 'demo_01')
+('sales_01', 'Sales v2', 'demo_02')
+```
+
+Both contexts present — confirms the fix and unblocks TODO 22's step 4 for the `sales_01` context.
+
+### Follow-up — Hot-Reload Endpoint (Avoid Restarting for Every Context Change)
+
+A full process restart to pick up a `config.yaml` context change is heavyweight — it drops all in-flight SSE streams. `POST /context/admin/reload` was added to do in-process what a restart does for contexts only: call `reload_context_registry()` (re-reads `config.yaml` into the module-level `DbContextRegistry` singleton) then `seed_contexts_from_config()` (upserts into `app.db_contexts`), and return the synced list. Superuser-only, same guard pattern as the other `/context/admin/*` routes. It does **not** create PostgreSQL schemas/tables/grants or run the schema pipeline (`/schemaJson`/`/schemaText`/`/ingest`) — those remain separate manual steps for a brand-new context.
+
+Verified with `TestClient` + an overridden `get_current_user` dependency (no real credentials needed): superuser call returns `200` with both `sales` and `sales_01`; non-superuser call returns `403`.
+
+### Files Changed
+
+| File | Change |
+|---|---|
+| `src/ai_agentic_chatbot/server.py` | Import `get_session` (factory) and `seed_contexts_from_config` (context repository); call both in `lifespan()` after datasource init |
+| `src/ai_agentic_chatbot/context/router.py` | Add `POST /context/admin/reload` (superuser-only) calling `reload_context_registry()` + `seed_contexts_from_config()`; update `list_admin_contexts` docstring to mention it |
+
+---
+
+## 34. Bug Fix — `/ingest` Crashes on Tables With No Date Fields (`important_dates: null`)
+
+> **Trigger:** `GET /ingest?context_id=sales_01` returned `500 Internal Server Error`: `TypeError: 'NoneType' object is not iterable` in `vector_schema_builder.py:36`, inside `for field in table.get("important_dates", []):`.
+
+### Root Cause
+
+`TableSchemaDocumentation.important_dates` (`schema_extractor/table_schema_documentation.py:64`) is deliberately typed `Optional[List[ImportantDate]] = None` — "Null if the table has no major date-related fields" — and the LLM prompt (`prompts/user_schema_to_text_prompt.md:9`) explicitly tells the model to emit `null` in that case. That's correct, intended behavior for `schema_documentation.yaml`.
+
+The bug: `dict.get(key, default)` only returns `default` when `key` is **absent**. When the key is present with an explicit value of `None` — exactly what happens here — `.get()` returns `None`, not the default. Four call sites did `table.get("important_dates", [])` and then iterated the result directly (`for date_field in ...`), so any table with `important_dates: null` crashed the whole ingest request.
+
+`demo_01`'s tables all happen to have date columns, so this path was never exercised. `demo_02`'s `brand_mst` (a lookup/dimension table with no dates) was the first table without one, and being first in `schema_documentation.yaml`, it crashed the ingest immediately — see `temp/demo_02/schema_documentation.yaml`, where `brand_mst`, `customer_mst`, `region_mst`, `sales_comparison`, and `sub_brand_mst` all have `important_dates: null`.
+
+`retrieve_schemas.py:117` already had the correct guard (`table_doc.get("relationships") or []`) — this fix brings the other call sites in line with that pattern.
+
+### Fix
+
+Changed `table.get(key, [])` → `(table.get(key) or [])` at every site iterating an `Optional[List]` field, so both a missing key and an explicit `null` fall back to an empty list:
+
+| File | Line(s) | Field |
+|---|---|---|
+| `schema_extractor/vector_schema_builder.py` | 36 | `important_dates` |
+| `schema_extractor/schema_loader.py` | 68, 89, 181 | `important_dates` |
+| `schema_extractor/schema_loader.py` | 102 | `relationships` (same `Optional[List]` pattern, fixed for consistency) |
+
+`key_fields` and `example_questions` were left untouched — both are required (non-`Optional`) fields on `TableSchemaDocumentation`, so `None` is not a valid value for them.
+
+### Verification
+
+Re-ran `GET /ingest?context_id=sales_01&force_reset=true` via `TestClient` after the fix — `200 OK`, `{"status":"ingested","force_reset":true,"context_id":"sales_01"}`, 6 schema chunks upserted into `demo_02_vectors`.
+
+---
+
+## 35. Bug Fix — Hardcoded Out-of-Scope Refusal Message Leaked demo_01's Domain Into Every Context
+
+> **Trigger:** While generating `sales_01`'s (`demo_02`) `router_prompt.md`, confirmed that file is a fully generic, schema-agnostic template — but noticed `RouterNode.classify()` builds its `out_of_scope` refusal message from a hardcoded string instead, unrelated to `router_prompt.md`.
+
+### Root Cause
+
+`agent/router.py` (previously lines 120-123) hardcoded the `out_of_scope` refusal message:
+
+```python
+response_msg = (
+    "I'm sorry, I can't help with that. "
+    "I can only assist with questions related to sales, orders, inventory, products, and customers."
+)
+```
+
+This text describes `demo_01`'s domain (orders/customer/sales/product/inventory) and was returned to **every** context's users, including `sales_01`/`demo_02` — whose actual domain (brand/sub-brand/region/customer master data, material consumption, sales comparison) has no `orders` or `inventory` tables at all. A `demo_02` user asking an out-of-scope question would get told the system handles "orders" and "inventory" (false) while never being told it handles "brands," "regions," or "consumption" (true).
+
+Confirmed via research that `router_prompt.md` itself needed no change — it's already a `{schema_text}`-templated, domain-agnostic file (same content for both contexts, correctly). The bug was isolated entirely to this one hardcoded string in `router.py`.
+
+### Fix
+
+Added a new required, registry-only field to `DbContextConfig` (`infrastructure/context/context_settings.py`) — `out_of_scope_message: str` — following the exact precedent already set by `sql_examples_path` (added in the previous multi-context wiring pass): a plain required string, populated from `config.yaml`, consumed straight off the registry at request time, and **not** mirrored into the `app.db_contexts` ORM model, any Alembic migration, or `seed_contexts_from_config()`. Structural fields (`schema_name`, `include_tables`, `vector_collection_name`, `schema_dir`) are DB-mirrored because the admin API and cross-cutting DB queries need them; prompt/message-only fields consumed solely at LLM-prompt-build time are registry-only — `out_of_scope_message` fits the latter.
+
+`config.yaml` now defines a context-accurate message for each context:
+
+```yaml
+contexts:
+  sales:
+    ...
+    out_of_scope_message: "I'm sorry, I can't help with that. I can only assist with questions related to sales, orders, inventory, products, and customers."
+  sales_01:
+    ...
+    out_of_scope_message: "I'm sorry, I can't help with that. I can only assist with questions related to brands, sub-brands, regions, customers, material consumption, and sales comparisons."
+```
+
+`router.py`'s `out_of_scope` branch now reads:
+
+```python
+if decision.intent == "out_of_scope":
+    response_msg = ctx.out_of_scope_message
+```
+
+reusing the `ctx` already resolved earlier in `RouterNode.classify()` (`ctx = get_context_registry().get_context(db_context_id)`) — no re-fetch needed.
+
+### Verification
+
+- `DbContextRegistry.from_config_file()` loads both contexts and prints both messages with no pydantic validation error.
+- `pytest tests/test_context_isolation.py -v` — 3 passed, 2 skipped (DB-reachability-gated tests), no new failures.
+- `python -c "import ai_agentic_chatbot.agent.router"` — imports cleanly.
+
+### Files Changed
+
+| File | Change |
+|---|---|
+| `src/ai_agentic_chatbot/infrastructure/context/context_settings.py` | Add required `out_of_scope_message: str` to `DbContextConfig`, positioned between `router_prompt_path` and `schema_dir` |
+| `config.yaml` | Add `out_of_scope_message` to both `sales` and `sales_01` context blocks, each describing its own actual domain |
+| `src/ai_agentic_chatbot/agent/router.py` | Replace hardcoded refusal string with `ctx.out_of_scope_message` in the `out_of_scope` branch of `RouterNode.classify()` |
+
+---
+
+---
+
+## 36. `v_sales_summary` Materialized View — Query Performance Analysis & Runbook (Pending)
+
+> **Trigger:** Explored whether the `sales` context (schema `demo_01`) should be redesigned as a star schema to speed up SQL execution for the chatbot's analytical query workload (revenue rollups, top-N, YoY/MoM trends — see `prompts/demo_01/sql_examples.md`). Two research passes (via the `researcher` agent) produced (1) a full star-schema feasibility analysis and (2) a decision to instead pursue a lighter materialized-view approach, plus a concrete implementation runbook. **No code has been changed yet — this section exists so the work can be picked up later.**
+
+### Why Not a Full Star Schema
+
+`demo_01` is a normalized OLTP schema (`customer`, `product`, `orders`, `sales`, `inventory`) owned by an external application; this chatbot only reads it. `v_sales_summary` is a plain (non-materialized) view that LEFT JOINs all five tables **on unindexed VARCHAR business keys** (`s.customer_code = c.code`, `s.reference_no = o.order_no`, `s.product_code = p.product_code`/`i.product_code`) — there are **zero non-PK indexes anywhere in the schema**, and the view re-executes its full join on every chatbot query.
+
+A full dimensional redesign (`fact_sales` + `dim_customer`/`dim_product`/`dim_order`/`dim_date`, surrogate integer keys, SCD handling) was analyzed and rejected for now:
+- **Codebase risk is low either way** — `config.yaml`'s per-context `include_tables`/`schema_dir`/`vector_collection_name` model, `SchemaLoader`, `retrieve_schemas.py`, and `generate_sql.py` are already fully config-driven with zero hardcoded references to `demo_01`'s table/column names (confirmed by grep). A star schema would still mean a from-scratch rewrite of ~95% of `sql_examples.md`'s ~60 examples and a new multi-table nightly upsert ETL job (no CDC/trigger infrastructure currently exists on the source tables) — multi-week effort.
+- **The workload doesn't need conformed dimensions across multiple fact tables** (only one fact table in scope today), which is where star schemas earn their complexity.
+- **An LLM writing ad-hoc SQL is arguably worse served by 5-6 normalized dimension tables** than by the current flat, wide, pre-joined `v_sales_summary` shape it already generates correct SQL against.
+- Most of the actual execution-time problem (varchar-key hash joins, no indexes, live-recomputed join on every call, per-row `date_trunc()`/`quantity * unit_price` math) is fixable by materializing + indexing the existing view, at a fraction of the cost and risk.
+
+**Decision: materialize `v_sales_summary` in place (same name/schema/columns) + add indexes**, and revisit a full star schema only if a second fact-worthy dataset (returns, deliveries) needs to share dimensions with sales, or if the materialized-view approach proves insufficient once measured against real data volumes (row counts for `sales`/`orders` were not available at analysis time — assumed "reporting scale," hundreds of thousands to low millions of rows).
+
+### Implementation Runbook (Deferred)
+
+**Step 0 — Pre-flight verification**
+- Check whether `sales → inventory` (`ON product_code`) or any other join can fan out (multiple `inventory` lots per `product_code` would already be silently duplicating rows in the *current live* view — a pre-existing bug independent of this work):
+  ```sql
+  SELECT product_code, COUNT(*) FROM demo_01.inventory GROUP BY product_code HAVING COUNT(*) > 1;
+  SELECT code, COUNT(*) FROM demo_01.customer GROUP BY code HAVING COUNT(*) > 1;
+  SELECT order_no, COUNT(*) FROM demo_01.orders GROUP BY order_no HAVING COUNT(*) > 1;
+  SELECT product_code, COUNT(*) FROM demo_01.product GROUP BY product_code HAVING COUNT(*) > 1;
+  ```
+- Confirm the app/Alembic DB role has `CREATE` on schema `demo_01` (externally owned — may need a grant from `demo_01`'s owning team): `SELECT has_schema_privilege('<role>', 'demo_01', 'CREATE');`
+
+**Step 1 — DDL** (replace `v_sales_summary` in place, not a renamed object — keeps `config.yaml`, `sql_examples.md`, `system_prompt.md` untouched)
+- `DROP VIEW demo_01.v_sales_summary` → `CREATE MATERIALIZED VIEW demo_01.v_sales_summary AS <same 4-way LEFT JOIN> WITH DATA`, with the `sales → inventory` join rewritten as `LEFT JOIN (SELECT DISTINCT ON (product_code) ... ORDER BY product_code, receive_date DESC NULLS LAST, id DESC) i` to fix the fan-out from Step 0 (confirm with the data owner whether "latest lot" or "sum across lots" is the correct semantic first).
+- Required unique index for `REFRESH CONCURRENTLY`: `CREATE UNIQUE INDEX ux_mv_v_sales_summary_sales_id ON demo_01.v_sales_summary (sales_id);`
+- Secondary btree indexes matching `sql_examples.md`'s actual predicates: `order_date`, `customer_code`, `customer_name`, `product_code`, `product_name`, `brand`, `origin`, `order_status`, `delivery_method`, `credit_status`.
+- Re-grant `SELECT` to the app role — a materialized view is a distinct relation from the dropped view, so prior grants don't carry over.
+
+**Step 2 — Alembic migration**
+- Hand-written revision (matviews have no native Alembic `op.*` helper) using `op.execute()`, following the raw-DDL convention already used in `alembic/versions/c7b3a9f2e1d4_add_app_schema_and_context_tables.py`. `downgrade()` recreates the original plain view verbatim. `CREATE INDEX CONCURRENTLY` cannot run inside Alembic's transaction — plain `CREATE INDEX` is fine here (fresh matview, no concurrent readers yet).
+
+**Step 3 — Refresh strategy**
+- No `pg_cron`/APScheduler/celery exists in this repo today (confirmed by grep) and `pg_cron` may not be available on a managed Postgres instance without support — don't take that dependency for one materialized view.
+- Add a new authenticated endpoint (`POST /admin/refreshMaterializedView?context_id=sales` in `server.py`, next to the existing `/schemaJson`/`/schemaText`/`/ingest` pipeline endpoints) that runs `REFRESH MATERIALIZED VIEW CONCURRENTLY demo_01.v_sales_summary` in autocommit mode. Trigger it from external cron/Windows Task Scheduler every 15–30 minutes.
+
+**Step 4 — Schema re-extraction (the risky / verify-first step)**
+- **Confirmed bug-in-waiting:** `SchemaExtractor.py`'s `extract_database_schema()` only calls `inspector.get_table_names()` and `inspector.get_view_names()` — it never calls SQLAlchemy's separate `inspector.get_materialized_view_names()` method. Postgres materialized views (`relkind='m'`) are **not** returned by `get_view_names()` (`relkind='v'` only). **Re-running `/schemaJson` unmodified after Step 1 will silently drop `v_sales_summary` from `db_schema.json`/`schema_documentation.yaml`**, exactly reproducing the bug class already fixed once in [§34](#34-bug-fix--ingest-crashes-on-tables-with-no-date-fields-important_dates-null).
+- Fix: add a loop calling `self.inspector.get_materialized_view_names(schema=schema_name)` alongside the existing `get_view_names()` loop, reusing `_extract_view_schema()` unchanged (its `get_view_definition()`/`get_columns()` calls already work correctly against matviews — only *discovery* is missing). Optionally give `_extract_view_schema` an `object_type` parameter to record `"materialized_view"` instead of hardcoded `"view"` — confirmed nothing downstream currently branches on `object_type`, so this is documentation value only, not required for correctness.
+- Re-run `GET /schemaJson?context_id=sales` then `GET /schemaText?context_id=sales`; confirm `v_sales_summary` is still present in `temp/demo_01/db_schema.json`.
+
+**Step 5 — Vector re-ingestion**
+- `GET /ingest?context_id=sales` — the vector row id is a deterministic `uuid5` keyed on `f"{context_id}:{table_name}"`, so this upserts in place; no `force_reset` needed since the table name is unchanged.
+
+**Step 6 — Prompt updates**
+- Column names and the table name are unchanged, so `sql_examples.md`/`system_prompt.md` need effectively **zero edits**. Recommended addition to `system_prompt.md`: a one-line data-freshness caveat noting `v_sales_summary` now refreshes every ~15–30 minutes rather than live, since several examples filter `WHERE order_date >= CURRENT_DATE` / "today" and would now lag slightly behind `sales`/`orders` queried directly.
+
+**Step 7 — Validation**
+- `EXPLAIN (ANALYZE, BUFFERS)` on a representative query (e.g. "Top 10 customers by revenue this year") captured before (live 4-way join) and after (matview) — confirm no nested-loop joins across `customer`/`orders`/`product`/`inventory` remain in the "after" plan.
+- Confirm `REFRESH MATERIALIZED VIEW CONCURRENTLY` succeeds (validates the unique index).
+- Row-count parity check (`COUNT(*)` on the matview should now equal `COUNT(*)` on `sales` once the inventory fan-out fix is in place).
+- Confirm the refresh job runs on schedule.
+- `pytest tests/test_context_isolation.py -v` — this suite uses its own throwaway schemas/mocks and doesn't touch `v_sales_summary`, so it needs no changes, but should still pass as a regression check.
+- Manual `/stream` smoke test with `context_id=sales` against a query that hits `v_sales_summary`.
+
+### What Does NOT Need To Change
+
+`agent/router.py`, `context/router.py`, `infrastructure/context/context_settings.py`, `server.py`'s `/stream` handling, `config.yaml`, `sql_examples.md`, `app.db_contexts`/`app.user_contexts` ORM tables — none of them know or care whether `v_sales_summary` is a view or a materialized view. This is the entire point of choosing this approach over a full star-schema redesign.
+
+### Status
+
+**Pending — analysis and runbook recorded 2026-07-03. No code changes made yet.** Follow the seven steps above in order when picked up; Step 4 (patching `SchemaExtractor.py` for materialized-view discovery) must not be skipped or a future `/schemaJson` re-run will silently break the `sales` context's schema retrieval for this table.
+
+---
+
+---
+
+## 37. Follow-Up Question Suggestions After Each Answer (Pending)
+
+> **Trigger:** User wants suggested follow-up questions (like ChatGPT's "next question" chips) shown after each agent answer, e.g. after "What were Q1 sales?" suggest "Break this down by region?" / "How does this compare to Q4?". A `researcher` agent pass mapped the current graph/state/response architecture and produced the implementation plan below. **No code has been changed yet — this section exists so the work can be picked up later.**
+
+### Current Architecture (relevant parts)
+
+- **Graph shape** — `agent/graph.py:176` `build_graph()`. Router → 4 leaf nodes (`greeting_node`, `sql_query_node`, `fallback_node`, `clarification_node`), all currently edging directly to `END` (graph.py:179-204). `sql_query_node` (line 48) invokes the SQL subgraph (`agent/subgraphs/sql_query/graph.py`: `retrieve_schemas` → `generate_sql` → `validate_query` → `execute_query`, retry loop), then calls `visualizer_node` and assembles the final answer itself — there is no separate "respond" node.
+- **Answer assembly** — inline inside `sql_query_node` (graph.py:106-140): rule-based `_generate_brief_content()` (lines 154-170) plus an LLM-generated `analysis` field (lines 117-133) via `fast_llm.invoke([SystemMessage(...)])` using `prompts/analysis_prompt.md`. `greeting_node` (lines 28-33) calls `fast_llm.invoke([prompt, *messages])` directly. `fallback_node`/`clarification_node` deliberately return `{}` with no LLM call (comment at graph.py:37-40) to avoid extra cost.
+- **Client response** — `server.py` `build_stream_response_data()` (lines 296-313) builds `{"content", "visualization", "analysis"}` per `AIMessage`; `/stream` (lines 338-422) streams via `graph.astream(..., stream_mode="values")` and yields the whole JSON object once per turn (not token-by-token; success path isn't real `data:`-framed SSE, only the error path is).
+- **Prompts** — `src/ai_agentic_chatbot/prompts/` (`base_system_prompt.md`, `analysis_prompt.md`, `router_prompts.md`, per-context `demo_01/`, `demo_02/`, `real_estate_mls/` subfolders), loaded via `utils/prompt_loader.py` (`load_file_content()`, `get_system_prompt()`, `get_router_prompt()`).
+- **State/session** — LangGraph `MemorySaver` checkpointer (graph.py:173, in-process/non-persistent), keyed by `thread_id` (server.py:351). `AgentState(MessagesState)` (`agent/state.py:6-15`): `messages`, `next_step`, `relevant_tables`, `visualization`, `analysis`, `db_context_id`. SQL subgraph's own state (`subgraphs/sql_query/state.py:17,23`) carries `retrieved_tables`/`tables_used`, which reach the parent via `state.update(subgraph_result)` in `sql_query_node` but are **not currently persisted in `AgentState`** or returned to the caller.
+- **LLM provider** — despite an unused `LLMProvider.ANTHROPIC` enum value (`infrastructure/llm/types.py:11`), the actual provider is **Azure OpenAI** via `langchain_openai.AzureChatOpenAI` (`gpt-4o-mini` "fast" / `gpt-4.1` "smart", `config.yaml`), accessed via `get_llm(provider=LLMProvider.AZURE_OPENAI, model=ModelType.FAST)`. `generate_sql.py` already uses `.with_structured_output()` with a Pydantic model (`SQLGeneration`, lines 27-34, used at 66-67) plus a JSON-fallback parser (`_extract_json_block`, lines 192-201) — this is the pattern to mirror for follow-ups.
+
+### Decision: New Terminal Node + Piggybacked Structured Output (No Extra LLM Round Trip)
+
+Rejected alternatives and why:
+- **Inline in each terminal node** — duplicates prompt/LLM-call logic across 4 nodes, and reintroduces the exact "extra LLM call for a nice-to-have" cost that `fallback_node`/`clarification_node` were deliberately written to avoid.
+- **Post-hoc wrapper in `server.py` after `graph.astream`** — loses clean access to `AgentState` fields, bypasses the checkpointer (follow-ups wouldn't persist via `graph.get_state()`), duplicates state-reading logic already in `build_stream_response_data`.
+- **A dedicated separate follow-up LLM call** — adds a second sequential hop after an already multi-hop SQL pipeline (retrieve→generate→validate→execute with retries), stacking latency for a secondary feature.
+
+**Chosen approach:**
+1. Add a new node `suggest_followups_node`, inserted before `END` for all four leaf branches (replace `add_edge(X, END)` at graph.py:179-204 with `add_edge(X, "suggest_followups_node")` + one `add_edge("suggest_followups_node", END)`). Can no-op (return `{}`) for `greeting_node`/`fallback_node`/`clarification_node` if follow-ups are decided to be SQL-answer-only.
+2. For the SQL path, **extend the existing analysis LLM call** (graph.py:117-133) into one `with_structured_output()` call returning both `analysis` and `follow_up_questions` together (mirror `SQLGeneration` in `generate_sql.py:27-34`) — zero additional LLM round trips, only extra output tokens.
+3. Ground the prompt in **actual columns used**, not just table names — pass `tables_used`/`retrieved_tables` (DDL or at least column list) already available in `subgraph_result`, the same schema text `generate_sql.py:48-53` builds — to stop the model suggesting follow-ups referencing nonexistent fields.
+
+### Implementation Steps (Deferred)
+
+| File | Change |
+|---|---|
+| `agent/state.py:6-15` | Add `follow_up_questions: Optional[list[str]]` to `AgentState`; add a passthrough field for `tables_used`/schema-column context if not already reliably surfaced there |
+| `agent/graph.py:179-204` | Redirect all 4 leaf-node edges through a new `suggest_followups_node` before `END` |
+| `agent/graph.py:117-133` | Extend the analysis `with_structured_output()` call (or add one) to also emit `follow_up_questions`, reusing the `_extract_json_block`-style fallback from `generate_sql.py:192-201` |
+| `agent/graph.py` return blocks (lines 87-93, 97-104, 135-140, 144-151) | Populate `follow_up_questions` (or `None` on error paths) |
+| `prompts/followup_prompt.md` (new) | Prompt requesting 2-3 schema-grounded, non-duplicate follow-ups as JSON; load via `load_file_content()` like `analysis_prompt.md` |
+| `server.py:296-313` (`build_stream_response_data`) | Add `follow_up_questions` to the response JSON dict alongside `content`/`visualization`/`analysis` |
+
+Prompt sketch for `followup_prompt.md`:
+```
+Given the question just answered and the result, suggest 2-3 natural
+follow-up questions this SAME agent could answer using ONLY the tables/columns below.
+
+User question: {user_query}
+Analysis: {analysis}
+Tables/columns available: {tables_used_or_ddl_summary}
+Chart type shown: {viz_type}
+
+Rules:
+- Only reference columns/tables listed above — never invent fields.
+- No duplicates of the question just asked.
+- Keep each under 12 words, phrased as a question.
+- Prefer drill-down (by region/time/segment), comparison (vs. prior period), or trend follow-ups.
+Return JSON: {"follow_up_questions": ["...", "...", "..."]}
+```
+
+### Pitfalls To Watch
+
+1. **Latency stacking** — avoided by combining with the existing analysis call rather than adding a new one; don't regress this later by splitting them back out.
+2. **Schema drift/hallucinated columns** — must ground in actual DDL/column lists, not just table names, or the model will confidently suggest breakdowns by fields that don't exist.
+3. **Structured-output parse failures** — reuse the existing `_extract_json_block` fallback; don't assume `with_structured_output()` never throws.
+4. **Frontend contract** — suggestions are inert strings until the frontend renders them as clickable chips that resubmit as a new message via `/stream`; this is a frontend change to flag explicitly, not implied by the backend work alone.
+5. **Non-SQL branches** — explicitly decide whether `greeting_node`/`fallback_node`/`clarification_node` get follow-ups; doing so naively reintroduces the "extra LLM call for every reply" cost those nodes were written to avoid.
+6. **Streaming shape** — `/stream`'s success path isn't real SSE-framed today; keep `follow_up_questions` in the same one-shot JSON blob (`build_stream_response_data`), don't add it as a separate un-framed event.
+
+### Status
+
+**Pending — architecture mapped and plan recorded 2026-07-07. No code changes made yet.** Pick up at "Implementation Steps" above when ready; the state-field addition (`agent/state.py`) and graph-edge rewiring (`agent/graph.py:179-204`) should land together since the new node is meaningless without state to write into.
+
+---
+
+*Generated: 2026-05-29 | Updated: 2026-07-03 | Repository: `ai-agentic-chatbot` | Branch: `27-feature-multi-database-context-support`*
