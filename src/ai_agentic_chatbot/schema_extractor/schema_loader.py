@@ -65,7 +65,7 @@ class SchemaLoader:
                     field_desc = f"Field {field.get('field_name', '')}: {field.get('meaning', '')}"
                     search_text_parts.append(field_desc)
 
-                for date_field in table.get("important_dates", []):
+                for date_field in (table.get("important_dates") or []):
                     date_desc = f"Date {date_field.get('field_name', '')}: {date_field.get('meaning', '')}"
                     search_text_parts.append(date_desc)
 
@@ -86,7 +86,7 @@ class SchemaLoader:
                 columns = []
                 for field in table.get("key_fields", []):
                     columns.append(field.get("field_name", ""))
-                for date_field in table.get("important_dates", []):
+                for date_field in (table.get("important_dates") or []):
                     columns.append(date_field.get("field_name", ""))
 
                 table_docs.append(
@@ -99,7 +99,7 @@ class SchemaLoader:
                         "business_purpose": table.get("business_purpose", ""),
                         "example_questions": table.get("example_questions", []),
                         "key_fields": table.get("key_fields", []),
-                        "relationships": table.get("relationships", []),
+                        "relationships": table.get("relationships") or [],
                         "operational_notes": table.get("operational_notes", ""),
                     }
                 )
@@ -178,7 +178,7 @@ class SchemaLoader:
             col_line = f"  {field_name} {data_type}"
             col_lines.append(col_line)
 
-        for date_field in table.get("important_dates", []):
+        for date_field in (table.get("important_dates") or []):
             field_name = date_field.get("field_name", "")
             col_line = f"  {field_name} TIMESTAMP"
             col_lines.append(col_line)

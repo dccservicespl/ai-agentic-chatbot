@@ -15,6 +15,7 @@ class DbContextConfig(BaseModel):
     system_prompt_path: str
     sql_examples_path: str
     router_prompt_path: str
+    out_of_scope_message: str
     schema_dir: str
     vector_collection_name: str
     display_name: Optional[str] = None

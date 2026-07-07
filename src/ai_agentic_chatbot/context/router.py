@@ -21,8 +21,10 @@ from ai_agentic_chatbot.context.repository import (
     get_default_context,
     list_active_contexts,
     remove_context_assignment,
+    seed_contexts_from_config,
 )
 from ai_agentic_chatbot.context.schemas import ContextAdminResponse, UserContextResponse
+from ai_agentic_chatbot.infrastructure.context.context_settings import reload_context_registry
 
 router = APIRouter(prefix="/context", tags=["Context"])
 
@@ -34,7 +36,8 @@ router = APIRouter(prefix="/context", tags=["Context"])
     description=(
         "Superuser-only. Lists all active contexts mirrored from config.yaml "
         "into app.db_contexts. To add a new context, add it to config.yaml and "
-        "restart the service — this endpoint does not create contexts."
+        "call POST /context/admin/reload (or restart the service) — this "
+        "endpoint does not create contexts."
     ),
 )
 def list_admin_contexts(
@@ -43,6 +46,30 @@ def list_admin_contexts(
 ):
     if not current_user.is_superuser:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Superuser access required")
+    return [ContextAdminResponse.model_validate(c) for c in list_active_contexts(db)]
+
+
+@router.post(
+    "/admin/reload",
+    response_model=list[ContextAdminResponse],
+    summary="Reload contexts from config.yaml without restarting the service",
+    description=(
+        "Superuser-only. Re-reads config.yaml from disk into the in-process "
+        "DbContextRegistry, then upserts the result into app.db_contexts — the "
+        "same two steps that normally only happen once, at process startup. "
+        "Does not create PostgreSQL schemas/tables/grants or run the schema "
+        "pipeline (/schemaJson, /schemaText, /ingest) — those are still "
+        "separate manual steps for a brand-new context."
+    ),
+)
+def reload_contexts(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_auth_db),
+):
+    if not current_user.is_superuser:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Superuser access required")
+    registry = reload_context_registry()
+    seed_contexts_from_config(db, registry)
     return [ContextAdminResponse.model_validate(c) for c in list_active_contexts(db)]
 
 

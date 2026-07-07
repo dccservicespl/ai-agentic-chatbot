@@ -33,7 +33,7 @@ class VectorSchemaBuilder:
             lines.append(f"- {field['field_name']}: {field['meaning']}")
 
         lines.append("\nImportant Dates:")
-        for field in table.get("important_dates", []):
+        for field in (table.get("important_dates") or []):
             lines.append(f"- {field['field_name']}: {field['meaning']}")
 
         if table.get("relationships"):

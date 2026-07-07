@@ -117,10 +117,7 @@ class RouterNode:
             }
 
         if decision.intent == "out_of_scope":
-            response_msg = (
-                "I'm sorry, I can't help with that. "
-                "I can only assist with questions related to sales, orders, inventory, products, and customers."
-            )
+            response_msg = ctx.out_of_scope_message
             return {
                 **reset_state,
                 "next_step": "nonsense",

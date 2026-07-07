@@ -21,6 +21,7 @@ from ai_agentic_chatbot.infrastructure.datasource.datasource_init import (
 from ai_agentic_chatbot.infrastructure.datasource.factory import (
     get_datasource_factory,
     get_engine,
+    get_session,
 )
 from ai_agentic_chatbot.infrastructure.db_depency import get_db_session
 from ai_agentic_chatbot.infrastructure.context.context_settings import (
@@ -46,6 +47,7 @@ from ai_agentic_chatbot.context.repository import (
     get_context_by_slug,
     get_default_context,
     is_user_assigned_to_context,
+    seed_contexts_from_config,
 )
 
 load_dotenv()
@@ -114,6 +116,17 @@ async def lifespan(api: FastAPI):
         logger.info(f"Datasources initialized successfully: {datasources}")
     except Exception as e:
         logger.error(f"Failed to initialize datasources: {e}", exc_info=True)
+
+    logger.info("Seeding contexts from config.yaml...")
+    try:
+        db = get_session("postgresql.primary")
+        try:
+            seed_contexts_from_config(db, get_context_registry())
+            logger.info("Contexts synced to app.db_contexts")
+        finally:
+            db.close()
+    except Exception as e:
+        logger.error(f"Failed to seed contexts: {e}", exc_info=True)
 
     yield
 
