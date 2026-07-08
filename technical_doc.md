@@ -44,6 +44,7 @@
 36. [`v_sales_summary` Materialized View — Query Performance Analysis & Runbook (Pending)](#36-v_sales_summary-materialized-view--query-performance-analysis--runbook-pending)
 37. [Follow-Up Question Suggestions After Each Answer (Pending)](#37-follow-up-question-suggestions-after-each-answer-pending)
 38. [Prompt History + NL→SQL Caching — Analysis & Implementation Plan (Pending)](#38-prompt-history--nlsql-caching--analysis--implementation-plan-pending)
+39. [Schema Version Tracking — Analysis & Implementation Plan ✅ COMPLETED](#39-schema-version-tracking--analysis--implementation-plan-completed)
 
 ---
 
@@ -6245,6 +6246,175 @@ Optional: a migration smoke test running `alembic upgrade head` against a throwa
 ### Status
 
 **Pending — design and full implementation plan recorded 2026-07-08 across four research passes. No code changes made yet.** Pick up at Phase 1 (Alembic migration) when ready; Phases 1–3 (schema, hash computation, graph wiring) should land together since the cache read/write path is meaningless without the table and invalidation key it depends on. Phases 4–5 (endpoints, prompt fix) can follow independently.
+
+---
+
+## 39. Schema Version Tracking — Analysis & Implementation Plan ✅ COMPLETED
+
+> **Trigger:** While reviewing [Section 38](#38-prompt-history--nlsql-caching--analysis--implementation-plan-pending)'s `schema_hash` invalidation-signal design, the project owner pushed back: instead of treating schema versioning as a narrow side-effect of the caching feature (two mutable columns on `db_contexts`), the codebase should have proper, general-purpose schema version tracking as its own piece of infrastructure — and asked whether that should be built *before* Section 38. A `researcher` agent pass was run on 2026-07-08 to verify Section 38's "no versioning infrastructure exists" claim independently, weigh a minimal audit-history table against both Section 38's bare-columns approach and a full versioned-registry-with-diffing approach, and produce a concrete plan.
+
+### Analysis Process (chronological)
+
+1. **Re-audit of Section 38's claim** — rather than trusting the prior finding that "no schema/glossary versioning infrastructure exists," independently re-verified it by reading `schema_extractor/SaveSchemaJson.py`, `context/models.py`, `context/repository.py`, and grepping the full `src/ai_agentic_chatbot` tree for `version|hash|history|snapshot|diff|audit`.
+2. **Option comparison** — weighed Section 38's original two-column design (Option A) against a full versioned-registry-with-diffing-and-rollback design (Option B taken to its maximum), checking Section 30/31's roadmap for anything that would actually justify Option B's extra complexity.
+3. **Middle-ground design** — since neither extreme fit, designed a minimal append-only history table sized to what this codebase's actual near-term consumers need, not hypothetical future ones.
+4. **Integration plan** — worked out how the new table folds into Section 38's existing Phase 1/2 without changing its Phase 3-6 (cache read/write wiring, `prompt_history`, endpoints, tests) at all.
+
+### What Exists Today (re-audit findings)
+
+Section 38's claim held up under independent re-verification — nothing was missed:
+
+- `schema_extractor/SaveSchemaJson.py` (`save_schema_temp_file`) writes `db_schema.json` via an **atomic replace** (`os.replace`) — every `/schemaJson` call silently destroys the previous snapshot on disk. No prior version is ever kept, not even a `.bak`.
+- `application/transform_schema_to_text.py:57,86` — `"version": "v1"` is confirmed still a hardcoded literal that never changes (dead signal, not a real one).
+- `context/models.py`'s `DbContext` has `created_at` only — **no `updated_at`**. `seed_contexts_from_config()` (`context/repository.py`) silently overwrites `schema_name`, `include_tables`, etc. on every app startup with no record of previous values or when they last changed.
+- `business_glossary` / `schema_metadata` are **not ORM-managed** — `alembic/env.py`'s `include_object` comment explicitly notes these are pre-existing business tables with no ORM model, living per-context in each business PostgreSQL schema, entirely outside Alembic's control and with no timestamp/version column.
+- Full-tree grep for version/history/snapshot/diff/audit terms surfaced nothing beyond the already-identified `"v1"` red herring and unrelated matches (JWT/auth wording, FastAPI's own `version="1.0.0"` app metadata in `server.py`).
+
+**Conclusion:** there is genuinely zero notion anywhere in this codebase today of "this schema snapshot vs. that one" — not in the DB, not on disk, not in any table.
+
+### Option A vs. Option B
+
+**Option A — Section 38 as originally designed:** `schema_hash`/`schema_updated_at` as plain columns on `db_contexts`, single current value, overwritten on every `/schemaJson` call.
+- Pro: minimal, matches the one real consumer (`prompt_cache`'s invalidation key) exactly, ships fast.
+- Con: no audit trail. Cannot answer "what did the schema look like when this cached SQL was generated," "when did this context's schema last actually change," or "who ran `/schemaJson` and how often" — real debugging questions given `config.yaml` already defines multiple independently-evolving contexts (`demo_01`, `demo_02`, `real_estate_mls`). Section 38's own Open Decision #1 ("`prompt_cache` rows accumulate silently with no cleanup mechanism") is itself a symptom of having no history to reason from.
+
+**Option B — a full versioned registry** (diffing, rollback references, full schema snapshot storage): checked Section 30/31 (Multi-Database Context Support, Database Structure for Multi-Context) specifically for anything that would justify this. Nothing does — that roadmap's actual concerns are isolation (`SET LOCAL search_path` per context) and connection pooling, not schema history or rollback. Building diff/rollback machinery now would solve a problem nobody has asked for.
+
+**The middle ground:** an append-only `schema_versions` table — no diffing, no rollback logic, just which context, what hash, when, by whom, basic size stats. Small enough not to justify blocking Section 38, but real enough to satisfy "its own piece of infrastructure" rather than a caching side-effect. It directly benefits Section 38's own `prompt_history` "View" feature (can show *when* the schema behind a historical answer was captured) and closes Section 38's own flagged residual gap (no way to tell, after the fact, whether `/schemaJson` was re-run after a given DB migration).
+
+### Verdict
+
+Do not build a general-purpose versioning registry as a standalone prerequisite project — nothing in the current roadmap needs diffing or rollback. Do not ship Section 38's bare two-column version either — it discards an audit trail for free, at essentially zero savings. **Fold a small `app.schema_versions` table into Section 38's existing Phase 1/2**, as an amendment to that plan rather than a project that blocks it. Section 38's Phases 3-6 are completely unaffected: `cache_lookup_node` still reads `db_contexts.schema_hash` directly with zero added latency versus the original design; only the *write* side of Section 38's Phase 1a/Phase 2 changes.
+
+### Design Note — Denormalizing `schema_name` for Multi-Context-per-Schema Safety
+
+Follow-up question during review: since this project already has multiple schemas (`demo_01`, `demo_02`, `real_estate_mls` per `config.yaml`) and may in the future have **many contexts linked to the same physical schema**, should `schema_versions` capture `schema_name` directly rather than relying on a join to `db_contexts`?
+
+Checked and confirmed: `db_contexts.schema_name` (`alembic/versions/c7b3a9f2e1d4_add_app_schema_and_context_tables.py:36,50`) carries **no unique constraint** — only `context_id` does. Nothing in the DB today prevents two different contexts from pointing at the same physical Postgres schema, so this is a real, not hypothetical, future shape. Two consequences:
+
+1. `schema_versions` must not rely on joining back to `db_contexts.schema_name` to know which physical schema a version row describes — `seed_contexts_from_config()` (`context/repository.py`) overwrites `schema_name` on `db_contexts` in place on every app startup with no history of its own, so a later join could silently misattribute old rows if a context's `schema_name` is ever repointed.
+2. **Add `schema_name` as its own column on `schema_versions`, captured at write time** from `db_row.schema_name`, not derived later via join. This keeps every row self-describing and permanent, and enables "all version history for schema X across every context that ever pointed at it" as a direct query once multiple contexts can share one schema — without changing `db_context_id`'s role as the FK/ownership key. Reflected in Steps 1, 5, and 6 below.
+
+### Step-by-Step Implementation Plan
+
+**Step 1 — Write the Alembic migration.** New file `alembic/versions/<hash>_add_schema_versions_table.py`, hand-written (this project's migrations are never `--autogenerate`d for schema-qualified tables — see `alembic/versions/c7b3a9f2e1d4_add_app_schema_and_context_tables.py` for the pattern `alembic/env.py`'s `include_object` requires). Set `down_revision = "c7b3a9f2e1d4"` (it must land *before* Section 38's `prompt_cache`/`prompt_history` migration, whose `down_revision` should then point at this new revision instead of `c7b3a9f2e1d4` directly).
+
+```python
+def upgrade() -> None:
+    # db_contexts: denormalized "current" pointer, fed by schema_versions
+    op.add_column("db_contexts", sa.Column("schema_hash", sa.String(length=64), nullable=True), schema="app")
+    op.add_column("db_contexts", sa.Column("schema_updated_at", sa.DateTime(timezone=True), nullable=True), schema="app")
+
+    # schema_versions: append-only audit history
+    op.create_table(
+        "schema_versions",
+        sa.Column("id", sa.BigInteger(), autoincrement=True, nullable=False),
+        sa.Column("db_context_id", sa.BigInteger(), nullable=False),
+        sa.Column("schema_name", sa.String(length=100), nullable=False),
+        sa.Column("schema_hash", sa.String(length=64), nullable=False),
+        sa.Column("captured_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
+        sa.Column("captured_by_user_id", sa.BigInteger(), nullable=True),
+        sa.Column("table_count", sa.Integer(), nullable=True),
+        sa.Column("column_count", sa.Integer(), nullable=True),
+        sa.ForeignKeyConstraint(["db_context_id"], ["app.db_contexts.id"], ondelete="CASCADE", name="fk_schema_versions_context_id"),
+        sa.ForeignKeyConstraint(["captured_by_user_id"], ["public.users.id"], ondelete="SET NULL", name="fk_schema_versions_captured_by"),
+        sa.PrimaryKeyConstraint("id"),
+        schema="app",
+    )
+    op.create_index("ix_schema_versions_context_captured", "schema_versions", ["db_context_id", "captured_at"], schema="app")
+    op.create_index("ix_schema_versions_schema_name", "schema_versions", ["schema_name", "captured_at"], schema="app")
+
+def downgrade() -> None:
+    op.drop_index("ix_schema_versions_schema_name", table_name="schema_versions", schema="app")
+    op.drop_index("ix_schema_versions_context_captured", table_name="schema_versions", schema="app")
+    op.drop_table("schema_versions", schema="app")
+    op.drop_column("db_contexts", "schema_updated_at", schema="app")
+    op.drop_column("db_contexts", "schema_hash", schema="app")
+```
+
+Deliberately **no `version_number` column** (a manually-incremented per-context counter is a concurrency footgun, redundant with `id`/`captured_at` ordering — compute a display number at query time with `ROW_NUMBER() OVER (PARTITION BY db_context_id ORDER BY id)` if ever needed). Deliberately **no full canonical-JSON snapshot column** either — purely additive to add later (`op.add_column(..., "canonical_schema", JSONB(), nullable=True)`) if a diff UI is ever actually requested; not paid for now.
+
+**Step 2 — Add the `SchemaVersion` model.** New file `context/schema_version_models.py`, mirroring the existing `DbContext` model style (SQLAlchemy 2.0 `Mapped`/`mapped_column`, `schema="app"`) and Section 38's own precedent of placing `PromptCache` next to `DbContext`.
+
+**Step 3 — Add matching columns to `DbContext`.** In `context/models.py`, add `schema_hash: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)` and `schema_updated_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)` to the existing `DbContext` class.
+
+**Step 4 — Register the model with Alembic.** Add `import ai_agentic_chatbot.context.schema_version_models  # noqa: F401` to `alembic/env.py`, alongside the existing `context.models` import (and Section 38's own planned `prompt_cache_models` import), so `Base.metadata` sees the new table for future autogenerate diffing/sanity checks.
+
+**Step 5 — Add the repository function.** In `context/repository.py`, add:
+
+```python
+def record_schema_version(
+    db: Session, *, context_db_id: int, schema_name: str, schema_hash: str,
+    captured_by_user_id: int, table_count: int, column_count: int,
+) -> SchemaVersion:
+    """Appends an audit row AND updates db_contexts' current-value pointer, in one transaction.
+    schema_name is captured here (not joined later) so history rows stay correct even if a
+    context's db_contexts.schema_name is ever repointed."""
+    version = SchemaVersion(
+        db_context_id=context_db_id, schema_name=schema_name, schema_hash=schema_hash,
+        captured_by_user_id=captured_by_user_id,
+        table_count=table_count, column_count=column_count,
+    )
+    db.add(version)
+    db.execute(
+        update(DbContext).where(DbContext.id == context_db_id)
+        .values(schema_hash=schema_hash, schema_updated_at=func.now())
+    )
+    db.commit()
+    db.refresh(version)
+    return version
+```
+
+This directly replaces the bare `update_schema_hash(db, *, context_id, schema_hash)` that Section 38 originally planned for the same call site.
+
+**Step 6 — Wire it into `/schemaJson`.** In `server.py`'s `/schemaJson` handler, add a `db: Session = Depends(get_auth_db)` parameter (as Section 38 already planned) and, right after `extractor.extract_database_schema()`, call:
+
+```python
+schema_hash = compute_schema_hash(schema)  # from schema_extractor/schema_hash.py, per Section 38 Phase 2
+record_schema_version(
+    db, context_db_id=db_row.id, schema_name=db_row.schema_name, schema_hash=schema_hash,
+    captured_by_user_id=current_user.id,
+    table_count=len(schema.tables),
+    column_count=sum(len(t.columns) for t in schema.tables),
+)
+```
+
+Add `schema_hash`, `schema_version_id`, and `captured_at` to the endpoint's response payload for observability.
+
+**Step 7 — Test.** New `tests/test_schema_versions.py::test_record_schema_version_appends_history_and_updates_pointer` — asserts one `INSERT` and one `UPDATE` happen together in the same transaction, and that `db_contexts.schema_hash` always matches the most recent `schema_versions` row for that context after the call. Add a second case, `test_record_schema_version_two_contexts_same_schema_name` — inserts version rows for two different `db_context_id`s sharing one `schema_name` and asserts querying by `schema_name` alone returns both, independent of `db_contexts.schema_name`'s current value. This folds into Section 38's own Phase 6 testing plan alongside its `compute_schema_hash` determinism test.
+
+**Step 8 — Smoke-verify before starting Section 38.** Run `alembic upgrade head`, call `/schemaJson` for a real context, and confirm both a new `schema_versions` row and updated `db_contexts.schema_hash`/`schema_updated_at` exist — matching the seriousness with which `c7b3a9f2e1d4` was hand-verified. Only after this passes should Section 38's Phase 1b (`prompt_cache`/`prompt_history` tables) begin.
+
+### Interaction With Section 38
+
+Section 38 is **not blocked** by this section — it is amended by it:
+- Section 38's old Phase 1a (two bare columns) → superseded by Steps 1-3 above (same columns, plus the history table).
+- Section 38's old Phase 2 `update_schema_hash()` → superseded by Step 5's `record_schema_version()`.
+- Section 38's Phases 3-6 (cache node wiring, `prompt_history`/View/Refresh/Regenerate endpoints, relative-date fix, tests) are **unchanged** — they only ever needed a fast "current hash" read off `db_contexts`, which this design still provides at the same cost.
+- Optional Phase-4 polish (not a blocker): add a nullable `schema_version_id BIGINT FK -> app.schema_versions.id` to Section 38's `prompt_history` table so "View" can show which schema capture a historical answer was generated against.
+
+### Files To Add / Modify
+
+| Action | File |
+|---|---|
+| Add | `alembic/versions/<hash>_add_schema_versions_table.py` |
+| Add | `context/schema_version_models.py` (`SchemaVersion`) |
+| Add | `tests/test_schema_versions.py` |
+| Modify | `context/models.py` — `schema_hash`, `schema_updated_at` on `DbContext` |
+| Modify | `context/repository.py` — `record_schema_version()` |
+| Modify | `alembic/env.py` — import `context.schema_version_models` |
+| Modify | `server.py` — `/schemaJson` calls `record_schema_version`, response gains `schema_hash`/`schema_version_id`/`captured_at` |
+
+Note: Section 38's own "Files To Add / Modify" table (`context/prompt_cache_models.py`, `schema_extractor/schema_hash.py`, etc.) is otherwise unaffected — its `down_revision` for the `prompt_cache`/`prompt_history` migration should be repointed at this section's new revision hash once it exists.
+
+### Open Decisions Requiring a Human Call
+
+1. **Retention of `schema_versions` rows** — like Section 38's own Open Decision #1 for `prompt_cache`, this history table has no specified cleanup policy. Given it's small (one row per `/schemaJson` call, not per query), unbounded retention is likely fine indefinitely, but worth revisiting if `/schemaJson` is ever automated to run on a schedule rather than manually.
+2. **`canonical_schema` snapshot column** — deliberately deferred (see Step 1). Add only if a future "diff this schema version against that one" UI is actually requested.
+
+### Status
+
+**✅ COMPLETED — implemented and live-verified 2026-07-08.** Steps 1-8 all landed: migration `98a43e44f4e9_add_schema_versions_table.py` applied to the live database (`alembic current` confirms head), `SchemaVersion` model + `db_contexts.schema_hash`/`schema_updated_at` columns wired through `alembic/env.py`, `record_schema_version()` added to `context/repository.py`, and `/schemaJson` in `server.py` now computes `compute_schema_hash()` (new prerequisite module `schema_extractor/schema_hash.py`, approved as an early minimal slice of Section 38 Phase 2) and calls `record_schema_version()` on every extraction. Verified twice against the live DB for context `sales` (schema `demo_01`, 6 tables / 138 columns): first via a direct in-process call (`schema_versions.id = 1`), then via the actual running `/schemaJson` HTTP endpoint (`schema_versions.id = 2`, same `schema_hash` both times since the schema hasn't changed — confirming determinism end-to-end through real auth/DI, not just the underlying function). Section 38's `prompt_cache`/`prompt_history` migration should now set `down_revision = "98a43e44f4e9"` instead of `"c7b3a9f2e1d4"` when that work starts, and its Phase 2 no longer needs to implement `compute_schema_hash`/`schema_hash.py` — both already exist.
 
 ---
 

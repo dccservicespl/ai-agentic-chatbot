@@ -6,10 +6,11 @@ is a distinct domain.
 """
 from typing import Optional
 
-from sqlalchemy import select, update
+from sqlalchemy import select, update, func
 from sqlalchemy.orm import Session
 
 from ai_agentic_chatbot.context.models import DbContext, UserContext
+from ai_agentic_chatbot.context.schema_version_models import SchemaVersion
 from ai_agentic_chatbot.infrastructure.context.context_settings import DbContextRegistry
 
 
@@ -85,6 +86,40 @@ def assign_context_to_user(
     db.commit()
     db.refresh(assignment)
     return assignment
+
+
+def record_schema_version(
+    db: Session,
+    *,
+    context_db_id: int,
+    schema_name: str,
+    schema_hash: str,
+    captured_by_user_id: int,
+    table_count: int,
+    column_count: int,
+) -> SchemaVersion:
+    """Appends an audit row AND updates db_contexts' current-value pointer, in one transaction.
+
+    schema_name is captured here (not joined later) so history rows stay correct even if a
+    context's db_contexts.schema_name is ever repointed.
+    """
+    version = SchemaVersion(
+        db_context_id=context_db_id,
+        schema_name=schema_name,
+        schema_hash=schema_hash,
+        captured_by_user_id=captured_by_user_id,
+        table_count=table_count,
+        column_count=column_count,
+    )
+    db.add(version)
+    db.execute(
+        update(DbContext)
+        .where(DbContext.id == context_db_id)
+        .values(schema_hash=schema_hash, schema_updated_at=func.now())
+    )
+    db.commit()
+    db.refresh(version)
+    return version
 
 
 def seed_contexts_from_config(db: Session, registry: DbContextRegistry) -> None:

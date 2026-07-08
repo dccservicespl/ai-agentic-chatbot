@@ -49,8 +49,10 @@ from ai_agentic_chatbot.context.repository import (
     get_context_by_slug,
     get_default_context,
     is_user_assigned_to_context,
+    record_schema_version,
     seed_contexts_from_config,
 )
+from ai_agentic_chatbot.schema_extractor.schema_hash import compute_schema_hash
 
 load_dotenv()
 
@@ -203,6 +205,7 @@ graph = build_graph()
             "(tables, columns, primary keys, foreign keys) for the given context's PostgreSQL schema "
             "and table whitelist (both defined in config.yaml under `contexts.<context_id>`). "
             "The result is serialised to `<context.schema_dir>/db_schema.json` and the file path is returned. "
+            "It also records a `schema_versions` audit row and updates `db_contexts.schema_hash`. "
             "\n\n**Run this as Step 1 of the schema setup pipeline** before calling `/schemaText` or `/ingest`."
     ),
     responses={
@@ -214,8 +217,15 @@ graph = build_graph()
 def schema_json(
     context_id: str = Query(..., description="Context slug from config.yaml's contexts: block"),
     current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_auth_db),
 ):
     ctx = _resolve_context(context_id)
+    db_row = get_context_by_slug(db, context_id)
+    if db_row is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Context {context_id!r} not found in db_contexts — has seed_contexts_from_config run for it?",
+        )
     try:
         db_engine = get_engine("postgresql.primary")
         config = SchemaExtractionConfig(
@@ -225,9 +235,26 @@ def schema_json(
 
         extractor = SchemaExtractor(db_engine, config)
         schema = extractor.extract_database_schema()
+
+        schema_hash = compute_schema_hash(schema)
+        version = record_schema_version(
+            db,
+            context_db_id=db_row.id,
+            schema_name=db_row.schema_name,
+            schema_hash=schema_hash,
+            captured_by_user_id=current_user.id,
+            table_count=len(schema.tables),
+            column_count=sum(len(t.columns) for t in schema.tables),
+        )
+
         schema_file_path = save_schema_temp_file(schema, PROJECT_ROOT / ctx.schema_dir)
 
-        return {"SchemaPath": schema_file_path}
+        return {
+            "SchemaPath": schema_file_path,
+            "schema_hash": schema_hash,
+            "schema_version_id": version.id,
+            "captured_at": version.captured_at.isoformat(),
+        }
     except Exception as exc:
         raise HTTPException(status_code=503, detail=str(exc))
 
