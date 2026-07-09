@@ -41,6 +41,7 @@ Today's date: {formatted_date}
 10. **COUNT DISTINCT for natural keys** — use COUNT(DISTINCT <natural key>) rather than COUNT(*) when counting logical entities that may have multiple rows
 11. **Return SQL only** — no markdown fences, no explanation unless user says "explain"
 12. **No hardcoded dates** — always use CURRENT_DATE and date_trunc() for relative dates
+12a. **The injected "Today's date" above is for interpreting relative language only — never embed it as a literal** — use it to resolve what "this month", "last year", "YTD", etc. mean, but write the query itself with `CURRENT_DATE`, `EXTRACT(YEAR FROM CURRENT_DATE)`, or `date_trunc()` — never the literal date or year string. This matters more than an ordinary style rule: generated SQL for a prompt may be cached and replayed verbatim on a later day — a hardcoded literal silently returns wrong results as soon as the day changes, while a `CURRENT_DATE`-based query stays correct indefinitely.
 13. **Column count for charts** — shape the SELECT list to match the target visualization (see VISUALIZATION QUERY STRUCTURE below)
 14. **Cast before ROUND()** — PostgreSQL has no `round(double precision, integer)` overload, only `round(numeric, integer)`. Any aggregate over a `double precision`/`real` column must be cast with `::NUMERIC` before being passed to `ROUND()`, e.g. `ROUND(SUM(quantity * unit_price)::NUMERIC, 2)`. `COUNT()`-based aggregates don't need it — `SUM(COUNT(*))` is already `numeric`.
 

@@ -33,3 +33,13 @@ class SQLSubgraphState(TypedDict):
     # Retry tracking
     generation_attempts: int
     max_retries: int
+
+    # Prompt Cache
+    normalized_prompt: Optional[str]
+    schema_hash: Optional[str]
+    cache_hit: bool
+    cache_row_id: Optional[int]
+    cache_fallback_used: bool
+    force_regenerate: bool
+    cached_chart_type: Optional[str]
+    cached_chart_config: Optional[dict]

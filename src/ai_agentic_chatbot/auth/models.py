@@ -3,7 +3,7 @@ from datetime import datetime
 from typing import Optional
 
 from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, Integer, String, Text, func
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from ai_agentic_chatbot.infrastructure.database import Base
@@ -56,5 +56,29 @@ class PromptLog(Base):
     thread_id: Mapped[str] = mapped_column(String(255), nullable=False)
     prompt_text: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class PromptHistory(Base):
+    __tablename__ = "prompt_history"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    thread_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    db_context_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("app.db_contexts.id", ondelete="CASCADE"), nullable=False
+    )
+    raw_prompt: Mapped[str] = mapped_column(Text, nullable=False)
+    prompt_cache_id: Mapped[Optional[int]] = mapped_column(
+        BigInteger, ForeignKey("app.prompt_cache.id", ondelete="SET NULL"), nullable=True
+    )
+    generated_sql: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    was_cache_hit: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
+    chart_type: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    result_snapshot: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    executed_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )

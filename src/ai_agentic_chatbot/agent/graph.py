@@ -11,6 +11,7 @@ from ai_agentic_chatbot.agent.state import AgentState
 from ai_agentic_chatbot.infrastructure.llm import get_llm
 from ai_agentic_chatbot.infrastructure.llm.types import LLMProvider, ModelType
 from ai_agentic_chatbot.agent.subgraphs.sql_query.graph import sql_subgraph
+from ai_agentic_chatbot.agent.subgraphs.sql_query.cache_sync import sync_prompt_cache
 from ai_agentic_chatbot.agent.nodes.visualizer import visualizer_node
 from ai_agentic_chatbot.utils.prompt_loader import load_file_content
 
@@ -74,6 +75,7 @@ def sql_query_node(state: AgentState) -> dict:
         "tables_used": [],
         "query_result": None,
         "execution_error": None,
+        "force_regenerate": False,
     }
 
     try:
@@ -111,6 +113,12 @@ def sql_query_node(state: AgentState) -> dict:
 
         # Create structured response data
         visualization = viz_result.get("visualization", {})
+
+        try:
+            sync_prompt_cache(subgraph_result, visualization)
+        except Exception as exc:
+            logger.warning(f"Prompt cache sync failed (non-fatal): {exc}")
+
         content = _generate_brief_content(visualization)
 
         # Generate LLM analysis of the result
@@ -137,6 +145,9 @@ def sql_query_node(state: AgentState) -> dict:
             "visualization": visualization,
             "analysis": analysis,
             "next_step": "end",
+            "generated_sql": subgraph_result.get("generated_sql"),
+            "was_cache_hit": subgraph_result.get("cache_hit", False),
+            "cache_row_id": subgraph_result.get("cache_row_id"),
         }
 
     except Exception as e:

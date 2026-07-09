@@ -52,6 +52,8 @@ from ai_agentic_chatbot.context.repository import (
     record_schema_version,
     seed_contexts_from_config,
 )
+from ai_agentic_chatbot.history.router import router as history_router
+from ai_agentic_chatbot.history.repository import write_prompt_history
 from ai_agentic_chatbot.schema_extractor.schema_hash import compute_schema_hash
 
 load_dotenv()
@@ -153,6 +155,7 @@ app = FastAPI(
 
 app.include_router(auth_router)
 app.include_router(context_router)
+app.include_router(history_router)
 
 app.add_middleware(
     CORSMiddleware,
@@ -451,6 +454,41 @@ async def stream_endpoint(
                                 import json
 
                                 yield json.dumps(response_data).encode("utf-8")
+
+                # Persist prompt_history for this turn, once, after the stream
+                # has fully drained. Cannot reuse the Depends(get_auth_db)
+                # session injected into stream_endpoint — by the time this
+                # generator resumes past its first yield, that endpoint has
+                # already returned its StreamingResponse and the session is no
+                # longer safe to use. Open a fresh one instead, matching
+                # lifespan()'s pattern. went_through_sql_node/generated_sql
+                # gating mirrors build_stream_response_data's own gating —
+                # skips greeting/fallback/clarification turns for free.
+                went_through_sql_node = accumulated_state.get("next_step") == "end"
+                if went_through_sql_node and accumulated_state.get("generated_sql"):
+                    history_db = get_session("postgresql.primary")
+                    try:
+                        ctx_row = get_context_by_slug(history_db, db_context_id)
+                        if ctx_row is not None:
+                            write_prompt_history(
+                                history_db,
+                                user_id=current_user.id,
+                                thread_id=thread_id,
+                                db_context_id=ctx_row.id,
+                                raw_prompt=messages[-1].content,
+                                prompt_cache_id=accumulated_state.get("cache_row_id"),
+                                generated_sql=accumulated_state.get("generated_sql"),
+                                was_cache_hit=accumulated_state.get("was_cache_hit", False),
+                                chart_type=(accumulated_state.get("visualization") or {}).get("type"),
+                                result_snapshot={
+                                    **(accumulated_state.get("visualization") or {}),
+                                    "analysis": accumulated_state.get("analysis"),
+                                },
+                            )
+                    except Exception as exc:
+                        logger.warning(f"Prompt history write failed (non-fatal): {exc}")
+                    finally:
+                        history_db.close()
 
             except Exception as e:
                 logger.error(f"[STREAM ERROR] {e}")

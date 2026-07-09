@@ -6,6 +6,14 @@ from ai_agentic_chatbot.logging_config import get_logger
 logger = get_logger(__name__)
 
 
+def route_after_cache_lookup(state: dict) -> Literal["execute_query", "retrieve_schemas"]:
+    """Route after cache lookup — hit skips straight to execution, miss falls through to normal retrieval."""
+    if state.get("cache_hit"):
+        logger.info("Cache hit - skipping retrieval/generation/validation")
+        return "execute_query"
+    return "retrieve_schemas"
+
+
 def route_after_retrieval(state: dict) -> Literal["generate_sql", "END"]:
     """Route after schema retrieval."""
     retrieved_tables = state.get("retrieved_tables", [])
@@ -48,7 +56,7 @@ def route_after_validation(state: dict) -> Literal["execute_query", "END"]:
     return "execute_query"
 
 
-def route_after_execution(state: dict) -> Literal["generate_sql", "END"]:
+def route_after_execution(state: dict) -> Literal["generate_sql", "retrieve_schemas", "END"]:
     """Route after execution - implements retry logic."""
     execution_error = state.get("execution_error")
     generation_attempts = state.get("generation_attempts", 0)
@@ -58,6 +66,20 @@ def route_after_execution(state: dict) -> Literal["generate_sql", "END"]:
     if not execution_error:
         logger.info("✅ Execution successful - ending subgraph")
         return "END"
+
+    # A cache-hit that fails execution with a schema-related error is treated as a
+    # stale hit (schema drifted since the row was cached) and falls through to full
+    # regeneration exactly once. Guard: generation_attempts is still 0 here because
+    # generate_sql_node never ran on the cache-hit path (retrieve_schemas was
+    # skipped) — after this fallback runs once, generation_attempts becomes >=1,
+    # so this branch can never fire twice for the same request (no loop risk).
+    if (
+        state.get("cache_hit")
+        and error_category == "not_found"
+        and generation_attempts == 0
+    ):
+        logger.warning("Cache hit failed with not_found error - falling back to full regeneration")
+        return "retrieve_schemas"
 
     if generation_attempts >= max_retries:
         logger.warning(f"Max retries ({max_retries}) exceeded - ending subgraph")

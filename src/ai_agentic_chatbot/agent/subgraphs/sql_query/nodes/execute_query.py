@@ -107,11 +107,18 @@ def execute_query_node(state: dict) -> dict:
         error_msg = str(e)
         logger.error(f"❌ Query execution failed: {error_msg}")
         error_category = _categorize_error(error_msg)
-        return {
+        result = {
             "query_result": None,
             "execution_error": error_msg,
             "error_category": error_category,
         }
+        if (
+            state.get("cache_hit")
+            and not state.get("cache_fallback_used")
+            and error_category == "not_found"
+        ):
+            result["cache_fallback_used"] = True
+        return result
 
 
 def _serialize_value(value):

@@ -20,6 +20,7 @@ from ai_agentic_chatbot.infrastructure.database import Base
 import ai_agentic_chatbot.auth.models  # noqa: F401 — registers User with Base.metadata
 import ai_agentic_chatbot.context.models  # noqa: F401 — registers DbContext/UserContext with Base.metadata
 import ai_agentic_chatbot.context.schema_version_models  # noqa: F401 — registers SchemaVersion with Base.metadata
+import ai_agentic_chatbot.context.prompt_cache_models  # noqa: F401 — registers PromptCache with Base.metadata
 from pgvector.sqlalchemy import Vector  # noqa: F401 — registers vector type so Alembic does not warn on pgvector columns
 
 target_metadata = Base.metadata
