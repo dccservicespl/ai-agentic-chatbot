@@ -31,6 +31,7 @@ from ai_agentic_chatbot.agent.nodes.visualizer import VisualizationNode
 from ai_agentic_chatbot.agent.subgraphs.sql_query.nodes.execute_query import execute_query_node
 from ai_agentic_chatbot.agent.subgraphs.sql_query.graph import sql_subgraph
 from ai_agentic_chatbot.agent.subgraphs.sql_query.cache_sync import sync_prompt_cache
+from ai_agentic_chatbot.agent.graph import generate_analysis
 from ai_agentic_chatbot.logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -133,7 +134,12 @@ def refresh_prompt(
         {"query_result": exec_result.get("query_result", []), "generated_sql": row.generated_sql, "explanation": ""},
         forced_type=row.chart_type,
     )
-    return RefreshResponse(visualization=viz_result["visualization"], generated_sql=row.generated_sql)
+    # Refresh does zero LLM calls, so analysis isn't regenerated — just surface
+    # whatever was already stored from the original turn.
+    stored_analysis = row.result_snapshot.get("analysis") if row.result_snapshot else None
+    return RefreshResponse(
+        visualization=viz_result["visualization"], generated_sql=row.generated_sql, analysis=stored_analysis
+    )
 
 
 @router.post("/{history_id}/regenerate", response_model=RegenerateResponse)
@@ -177,6 +183,11 @@ def regenerate_prompt(
     viz_result = VisualizationNode().determine_visualization(subgraph_result)
     visualization = viz_result["visualization"]
 
+    # Regenerate re-runs the full SQL subgraph (fresh SQL + results), so the
+    # prior analysis text may no longer describe the new data — generate a
+    # fresh one rather than carrying the stale value forward or dropping it.
+    analysis = generate_analysis(row.raw_prompt, visualization, subgraph_result)
+
     try:
         sync_prompt_cache(subgraph_result, visualization)
     except Exception as exc:
@@ -187,7 +198,7 @@ def regenerate_prompt(
             db, row,
             generated_sql=subgraph_result.get("generated_sql", ""),
             chart_type=visualization.get("type"),
-            result_snapshot=visualization,
+            result_snapshot={**visualization, "analysis": analysis},
         )
     except Exception as exc:
         logger.warning(f"Prompt history update failed during regenerate (non-fatal): {exc}")
@@ -196,4 +207,5 @@ def regenerate_prompt(
         visualization=visualization,
         generated_sql=subgraph_result.get("generated_sql", ""),
         explanation=subgraph_result.get("explanation"),
+        analysis=analysis,
     )

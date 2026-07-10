@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+from typing import Optional
 
 from langchain_core.messages import SystemMessage
 from langgraph.constants import START, END
@@ -14,12 +15,39 @@ from ai_agentic_chatbot.agent.subgraphs.sql_query.graph import sql_subgraph
 from ai_agentic_chatbot.agent.subgraphs.sql_query.cache_sync import sync_prompt_cache
 from ai_agentic_chatbot.agent.nodes.visualizer import visualizer_node
 from ai_agentic_chatbot.utils.prompt_loader import load_file_content
+from ai_agentic_chatbot.logging_config import get_logger
+
+logger = get_logger(__name__)
 
 fast_llm = get_llm(provider=LLMProvider.AZURE_OPENAI, model=ModelType.FAST)
 
 _ANALYSIS_PROMPT_PATH = (
         Path(__file__).resolve().parent.parent / "prompts" / "analysis_prompt.md"
 )
+
+
+def generate_analysis(user_query: str, visualization: dict, subgraph_result: dict) -> Optional[str]:
+    """LLM analysis of query results; falls back to the SQL generator's explanation on failure.
+
+    Shared by sql_query_node (parent-graph turn) and history/router.py's regenerate
+    endpoint, which re-runs sql_subgraph directly and needs the same analysis step.
+    """
+    try:
+        prompt_template = load_file_content(_ANALYSIS_PROMPT_PATH)
+        analysis_prompt = prompt_template.format(
+            user_query=user_query,
+            viz_type=visualization.get("type", ""),
+            viz_title=visualization.get("title", ""),
+            row_count=visualization.get("row_count", 0),
+            first_3_rows_as_json=json.dumps(
+                visualization.get("data", [])[:3], indent=2, default=str
+            ),
+        )
+        response = fast_llm.invoke([SystemMessage(content=analysis_prompt)])
+        return response.content
+    except Exception as exc:
+        logger.warning(f"Analysis generation failed, falling back to explanation: {exc}")
+        return subgraph_result.get("explanation", "")
 
 
 def router(state: AgentState) -> dict:
@@ -51,9 +79,6 @@ def sql_query_node(state: AgentState) -> dict:
     Adapter node that invokes the SQL subgraph.
     Maps parent state to subgraph input, runs subgraph, maps output back.
     """
-    from ai_agentic_chatbot.logging_config import get_logger
-
-    logger = get_logger(__name__)
     logger.info("[Parent] Invoking SQL subgraph")
 
     # Map parent state to subgraph input
@@ -122,23 +147,7 @@ def sql_query_node(state: AgentState) -> dict:
         content = _generate_brief_content(visualization)
 
         # Generate LLM analysis of the result
-        analysis = None
-        try:
-            prompt_template = load_file_content(_ANALYSIS_PROMPT_PATH)
-            analysis_prompt = prompt_template.format(
-                user_query=state["messages"][-1].content,
-                viz_type=visualization.get("type", ""),
-                viz_title=visualization.get("title", ""),
-                row_count=visualization.get("row_count", 0),
-                first_3_rows_as_json=json.dumps(
-                    visualization.get("data", [])[:3], indent=2, default=str
-                ),
-            )
-            response = fast_llm.invoke([SystemMessage(content=analysis_prompt)])
-            analysis = response.content
-        except Exception as exc:
-            logger.warning(f"Analysis generation failed, falling back to explanation: {exc}")
-            analysis = subgraph_result.get("explanation", "")
+        analysis = generate_analysis(state["messages"][-1].content, visualization, subgraph_result)
 
         return {
             "messages": [AIMessage(content=content)],

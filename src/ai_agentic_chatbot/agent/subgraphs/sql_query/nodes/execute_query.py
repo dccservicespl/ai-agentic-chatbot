@@ -1,5 +1,6 @@
 """Query execution node for database operations."""
 
+import math
 import re
 
 from sqlalchemy import text
@@ -131,7 +132,11 @@ def _serialize_value(value):
 
     if hasattr(value, "__float__"):
         try:
-            return float(value)
+            f = float(value)
+            # Postgres NUMERIC can itself hold NaN/Infinity (unlike strict
+            # JSON) — json.dumps emits them as bare NaN/Infinity tokens,
+            # which the DB's own JSONB parser then rejects on insert.
+            return f if math.isfinite(f) else None
         except (ValueError, TypeError):
             pass
 

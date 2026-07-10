@@ -30,9 +30,11 @@ class PromptHistoryDetail(BaseModel):
 class RefreshResponse(BaseModel):
     visualization: dict
     generated_sql: str
+    analysis: Optional[str] = None
 
 
 class RegenerateResponse(BaseModel):
     visualization: dict
     generated_sql: str
     explanation: Optional[str] = None
+    analysis: Optional[str] = None
